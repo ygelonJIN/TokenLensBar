@@ -211,7 +211,7 @@ func logLine(_ message: String) {
     }
 }
 
-let kPanelHeight: CGFloat = 460
+let kPanelHeight: CGFloat = 490
 
 func shortDate(_ text: String) -> String {
     let parts = text.split(separator: "-")
@@ -333,10 +333,11 @@ struct PanelView: View {
                 topBar
                 if model.snapshot?.ok == true {
                     if tab == .overview {
-                        OverviewSections(model: model)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity,
-                                   alignment: .top)
-                            .padding(.bottom, 62)
+                        ScrollView {
+                            OverviewSections(model: model)
+                                .padding(.bottom, 62)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         ScrollView {
                             HistorySections(model: model)
@@ -359,49 +360,16 @@ struct PanelView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .top, spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("TokenLensBar").font(.headline)
-                Text("本地 token 用量")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 8)
-            balanceHeader
+        VStack(alignment: .leading, spacing: 1) {
+            Text("TokenLensBar").font(.headline)
+            Text("本地 token 用量")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
         .padding(.top, 10)
         .padding(.bottom, 8)
-    }
-
-    /// 右上角余额：写清楚是哪家的钱（DeepSeek: ¥9.17）。
-    /// 单个 provider 一行；多个时纵向排列，正好占住左侧副标题那一行。
-    @ViewBuilder private var balanceHeader: some View {
-        if let balances = model.snapshot?.balances, balances.configured == true,
-           let providers = balances.providers, !providers.isEmpty {
-            VStack(alignment: .trailing, spacing: 1) {
-                ForEach(Array(providers.enumerated()), id: \.offset) { _, provider in
-                    HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text("\(provider.name ?? provider.id ?? "?"):")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        Text(providerBalanceText(provider))
-                            .font(.headline)
-                            .monospacedDigit()
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.7)
-                            .help(provider.error ?? "")
-                    }
-                }
-            }
-        } else {
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text("余额").font(.caption).foregroundStyle(.secondary)
-                Text("—").font(.headline)
-            }
-        }
     }
 
     private var topBar: some View {
@@ -545,6 +513,17 @@ struct OverviewSections: View {
                                value: countText(snap.windows?["today"]?.events ?? 0))
                 }
 
+                if let balances = snap.balances, balances.configured == true,
+                   let providers = balances.providers, !providers.isEmpty {
+                    NativeSection("余额") {
+                        ForEach(Array(providers.enumerated()), id: \.offset) { _, provider in
+                            SummaryRow(label: provider.name ?? provider.id ?? "余额",
+                                       value: providerBalanceText(provider),
+                                       help: provider.error)
+                        }
+                    }
+                }
+
                 NativeSection("按模型") {
                     SliceRows(slices: snap.modelsToday ?? [], symbol: snap.symbol ?? "¥",
                               empty: "今天还没有用量")
@@ -594,6 +573,7 @@ struct HistorySections: View {
 struct SummaryRow: View {
     let label: String
     let value: String
+    var help: String? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -602,6 +582,7 @@ struct SummaryRow: View {
                 Spacer()
                 Text(value)
                     .monospacedDigit()
+                    .help(help ?? "")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 2)
