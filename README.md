@@ -386,3 +386,4 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 | [prices.example.json](prices.example.json) | 三种写法的结构示例 |
 | [assets/](assets/) | App 图标源文件、`.icns`、4 个候选样式 |
 | [docs/panel.png](docs/panel.png) | 菜单栏面板效果图 |
+| [docs/panel-buttons.png](docs/panel-buttons.png) | 底部按钮三态（常态 / 悬停 / 按下） |

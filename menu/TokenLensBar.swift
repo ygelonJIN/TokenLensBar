@@ -7,7 +7,7 @@ import Cocoa
 let kRefreshInterval: TimeInterval = 60
 let kDashboardPort = 8787
 let kPanelWidth: CGFloat = 344
-let kFooterHeight: CGFloat = 42
+let kFooterHeight: CGFloat = 46
 
 // MARK: - 取数
 
@@ -208,7 +208,7 @@ final class ChartView: NSView {
         }
         let width = (bounds.width > 0 ? bounds.width : kPanelWidth) - pad * 2
         var y: CGFloat = 0
-        y += 68
+        y += 74
 
         let modelsToday = snap.modelsToday?.count ?? 0
         let agentsToday = snap.agentsToday?.count ?? 0
@@ -301,17 +301,17 @@ final class ChartView: NSView {
     }
 
     private func drawHeadline(_ snap: Snapshot, today: Snapshot.Window?, symbol: String) {
-        text("今日用量", NSPoint(x: pad, y: 6), size: 11, weight: .semibold)
+        text("今日用量", NSPoint(x: pad, y: 12), size: 11, weight: .semibold)
         // 金额在左、Token 在右，同一个字号
         let moneyText = money(today?.cost ?? 0, symbol)
-        text(moneyText, NSPoint(x: pad - 1, y: 21), size: 23,
+        text(moneyText, NSPoint(x: pad - 1, y: 27), size: 23,
              weight: .semibold, color: Palette.mint)
         text(cn(today?.tokens ?? 0),
-             NSPoint(x: pad - 1 + width(moneyText, size: 23, weight: .semibold) + 9, y: 21),
+             NSPoint(x: pad - 1 + width(moneyText, size: 23, weight: .semibold) + 9, y: 27),
              size: 23, weight: .semibold, color: Palette.mint)
         let rate = Int(((snap.cacheRate ?? 0) * 100).rounded())
         text("缓存命中 \(rate)% · \(today?.events ?? 0) 次请求",
-             NSPoint(x: pad, y: 49), size: 9.5, color: Palette.muted)
+             NSPoint(x: pad, y: 55), size: 9.5, color: Palette.muted)
     }
 
     private func drawTodayCard(_ box: NSRect, snap: Snapshot, symbol: String) {
@@ -433,56 +433,315 @@ final class ChartView: NSView {
 // MARK: - 面板
 
 /// 深色底上的胶囊按钮：有底色、有描边，hover 和按下都有反馈。
+/// 自绘而不是用系统 bezel，是为了在深色面板上控制渐变、描边和发光。
 final class PanelButton: NSButton {
+    enum Tone { case normal, destructive }
+
+    private let tone: Tone
     private var tracking: NSTrackingArea?
+    private var hovering = false
+    private var pressed = false
+    private var hoverProgress: CGFloat = 0
+    private var pressProgress: CGFloat = 0
+    private var animationTimer: Timer?
+    private var lastTick: CFTimeInterval = 0
 
-    static let hoverColor = NSColor(srgbRed: 0.129, green: 0.157, blue: 0.204, alpha: 1)
-    static let pressColor = NSColor(srgbRed: 0.180, green: 0.216, blue: 0.274, alpha: 1)
+    private var accent: NSColor { tone == .destructive ? Palette.rose : Palette.mint }
 
-    static func make(_ title: String, target: AnyObject, action: Selector) -> PanelButton {
-        let button = PanelButton(title: title, target: target, action: action)
+    // 常态 / hover / 按下三档，按下时文字和描边染上强调色
+    private static let normalTop = NSColor(srgbRed: 0.118, green: 0.142, blue: 0.182, alpha: 1)
+    private static let normalBottom = NSColor(srgbRed: 0.073, green: 0.088, blue: 0.114, alpha: 1)
+    private static let normalBorder = NSColor(srgbRed: 0.188, green: 0.216, blue: 0.263, alpha: 1)
+    private static let normalText = NSColor(srgbRed: 0.855, green: 0.886, blue: 0.918, alpha: 1)
+    private static let hoverTop = NSColor(srgbRed: 0.165, green: 0.196, blue: 0.243, alpha: 1)
+    private static let hoverBottom = NSColor(srgbRed: 0.106, green: 0.125, blue: 0.157, alpha: 1)
+    private static let hoverText = NSColor(srgbRed: 0.957, green: 0.969, blue: 0.980, alpha: 1)
+    private static let pressTop = NSColor(srgbRed: 0.104, green: 0.122, blue: 0.150, alpha: 1)
+    private static let pressBottom = NSColor(srgbRed: 0.071, green: 0.084, blue: 0.104, alpha: 1)
+
+    init(title: String, tone: Tone, target: AnyObject?, action: Selector?) {
+        self.tone = tone
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    static func make(_ title: String, tone: Tone = .normal,
+                     target: AnyObject?, action: Selector?) -> PanelButton {
+        let button = PanelButton(title: title, tone: tone, target: target, action: action)
         button.isBordered = false
         button.setButtonType(.momentaryChange)
+        button.focusRingType = .none
         button.wantsLayer = true
-        button.layer?.cornerRadius = 7
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = Palette.line.cgColor
-        button.layer?.backgroundColor = Palette.card.cgColor
-        button.attributedTitle = NSAttributedString(string: title, attributes: [
-            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: Palette.text,
-        ])
+        button.layer?.masksToBounds = false
+        button.setAccessibilityLabel(title)
         return button
     }
+
+    /// 真正按钮宽 + 左右各 4pt 的透明留白（留给 hover 外发光）
+    static func width(for title: String) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let textWidth = (title as NSString).size(withAttributes: [
+            .font: font, .kern: 0.2,
+        ]).width
+        return ceil(textWidth) + 32
+    }
+
+    // MARK: - 状态
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeInActiveApp],
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseEnteredAndExited,
+                                            .activeInActiveApp, .inVisibleRect],
                                   owner: self, userInfo: nil)
         addTrackingArea(area)
         tracking = area
     }
 
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
     override func mouseEntered(with event: NSEvent) {
-        layer?.backgroundColor = PanelButton.hoverColor.cgColor
+        hovering = true
+        animate()
     }
 
     override func mouseExited(with event: NSEvent) {
-        layer?.backgroundColor = Palette.card.cgColor
+        hovering = false
+        animate()
     }
 
     override func highlight(_ flag: Bool) {
         super.highlight(flag)
-        layer?.backgroundColor = (flag ? PanelButton.pressColor : Palette.card).cgColor
+        pressed = flag
+        if flag {
+            // 按下要即时，不等动画
+            pressProgress = 1
+            needsDisplay = true
+            displayIfNeeded()
+        } else {
+            animate()
+        }
+    }
+
+    /// 离屏渲染时强制某一帧的状态，正常运行时不用
+    func preview(hover: Bool, press: Bool) {
+        hovering = hover
+        pressed = press
+        hoverProgress = hover ? 1 : 0
+        pressProgress = press ? 1 : 0
+        needsDisplay = true
+    }
+
+    /// 面板收起时清掉残留的 hover/按下状态，下次展开从常态开始
+    func resetState() {
+        hovering = false
+        pressed = false
+        hoverProgress = 0
+        pressProgress = 0
+        animationTimer?.invalidate()
+        animationTimer = nil
+        needsDisplay = true
+    }
+
+    deinit {
+        animationTimer?.invalidate()
+    }
+
+    private func animate() {
+        guard animationTimer == nil else { return }
+        lastTick = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            let now = CACurrentMediaTime()
+            let dt = min(0.05, max(0.001, now - self.lastTick))
+            self.lastTick = now
+            let hoverTarget: CGFloat = self.hovering ? 1 : 0
+            let pressTarget: CGFloat = self.pressed ? 1 : 0
+            let hoverStep = 1 - CGFloat(exp(-Double(dt) / 0.055))
+            let pressStep = 1 - CGFloat(exp(-Double(dt) / 0.028))
+            self.hoverProgress += (hoverTarget - self.hoverProgress) * hoverStep
+            self.pressProgress += (pressTarget - self.pressProgress) * pressStep
+            if abs(self.hoverProgress - hoverTarget) < 0.004,
+               abs(self.pressProgress - pressTarget) < 0.004 {
+                self.hoverProgress = hoverTarget
+                self.pressProgress = pressTarget
+                timer.invalidate()
+                self.animationTimer = nil
+            }
+            self.needsDisplay = true
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        animationTimer = timer
+    }
+
+    // MARK: - 绘制
+
+    private func blend(_ a: NSColor, _ b: NSColor, _ amount: CGFloat) -> NSColor {
+        let t = max(0, min(1, amount))
+        guard let left = a.usingColorSpace(.sRGB),
+              let right = b.usingColorSpace(.sRGB) else { return b }
+        return NSColor(srgbRed: left.redComponent + (right.redComponent - left.redComponent) * t,
+                       green: left.greenComponent + (right.greenComponent - left.greenComponent) * t,
+                       blue: left.blueComponent + (right.blueComponent - left.blueComponent) * t,
+                       alpha: left.alphaComponent + (right.alphaComponent - left.alphaComponent) * t)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        // 四周留 4pt，外壳的发光才有地方画
+        let rect = bounds.insetBy(dx: 4, dy: 4)
+        guard rect.width > 0, rect.height > 0 else { return }
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+
+        let hover = hoverProgress
+        let press = pressProgress
+
+        var top = blend(PanelButton.normalTop, PanelButton.hoverTop, hover)
+        var bottom = blend(PanelButton.normalBottom, PanelButton.hoverBottom, hover)
+        var textColor = blend(PanelButton.normalText, PanelButton.hoverText, hover)
+        var borderColor = blend(PanelButton.normalBorder, accent, hover * 0.45)
+        top = blend(top, PanelButton.pressTop, press)
+        bottom = blend(bottom, PanelButton.pressBottom, press)
+        // 按下时填充也轻轻染一点强调色，避免按钮“陷进”背景里只剩一圈线
+        top = blend(top, accent, 0.08 * press)
+        bottom = blend(bottom, accent, 0.05 * press)
+        textColor = blend(textColor, accent, press)
+        borderColor = blend(borderColor, accent, press * 0.85)
+
+        // hover 外发光：用阴影画一圈很淡的强调色
+        if hover > 0.02, press < 0.6 {
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = accent.withAlphaComponent(0.28 * hover * (1 - press))
+            shadow.shadowBlurRadius = 4
+            shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+            shadow.set()
+            NSColor.black.setFill()
+            path.fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
+        // 主体渐变（必须裁到路径里，否则会填满整个 dirtyRect）
+        NSGraphicsContext.saveGraphicsState()
+        path.addClip()
+        if let gradient = NSGradient(starting: top, ending: bottom) {
+            // NSGradient 把 ending 色画在 from 点、starting 色画在 to 点，
+            // 所以这里 from 写底边、to 写顶边，才是上亮下暗。
+            gradient.draw(from: NSPoint(x: rect.midX, y: rect.minY),
+                          to: NSPoint(x: rect.midX, y: rect.maxY),
+                          options: [])
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        NSGraphicsContext.saveGraphicsState()
+        path.addClip()
+
+        // 顶部 1pt 内高光，让平面有一点厚度
+        let highlight = (0.055 + 0.035 * hover) * (1 - press)
+        if highlight > 0.001 {
+            NSColor.white.withAlphaComponent(highlight).setFill()
+            NSBezierPath(rect: NSRect(x: rect.minX, y: rect.maxY - 1,
+                                      width: rect.width, height: 1)).fill()
+        }
+
+        // 按下：顶部压一道内阴影，整体往下坐一点
+        if press > 0.01 {
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.45 * press)
+            shadow.shadowBlurRadius = 2.2
+            shadow.shadowOffset = NSSize(width: 0, height: -1.5)
+            shadow.set()
+            NSColor.black.withAlphaComponent(0.35 * press).setFill()
+            NSBezierPath(rect: NSRect(x: rect.minX, y: rect.maxY - 1,
+                                      width: rect.width, height: 1)).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        // 描边：0.5pt 在 Retina 上正好是一像素
+        borderColor.setStroke()
+        let stroke = NSBezierPath(roundedRect: rect.insetBy(dx: 0.25, dy: 0.25),
+                                  xRadius: 7.75, yRadius: 7.75)
+        stroke.lineWidth = 0.5
+        stroke.stroke()
+
+        // 标题
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: textColor,
+            .kern: 0.2,
+        ]
+        let attributed = NSAttributedString(string: title, attributes: attributes)
+        let size = attributed.size()
+        let textRect = NSRect(x: rect.midX - size.width / 2,
+                              y: rect.midY - size.height / 2 - press * 0.5,
+                              width: size.width, height: size.height)
+        attributed.draw(in: textRect)
+    }
+}
+
+/// 底部按钮栏：和面板同色，靠顶部一条渐隐细线跟内容分开。
+final class PanelFooter: NSView {
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Palette.bg.setFill()
+        bounds.fill()
+
+        let lineY = bounds.maxY - 0.5
+        let colors = [
+            NSColor.white.withAlphaComponent(0.0),
+            NSColor.white.withAlphaComponent(0.085),
+            NSColor.white.withAlphaComponent(0.0),
+        ]
+        if let gradient = NSGradient(colors: colors) {
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: NSRect(x: 14, y: lineY - 0.5,
+                                      width: bounds.width - 28, height: 1)).addClip()
+            gradient.draw(from: NSPoint(x: 14, y: lineY),
+                          to: NSPoint(x: bounds.width - 14, y: lineY),
+                          options: [])
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+}
+
+/// 离屏预览三种按钮状态，方便改样式时对照（--render-buttons）
+final class ButtonPreview: NSView {
+    private let labels = ["常态", "悬停", "按下"]
+    private let rowHeight: CGFloat = 50
+
+    override var isOpaque: Bool { true }
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Palette.bg.setFill()
+        bounds.fill()
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: Palette.muted,
+        ]
+        for (row, label) in labels.enumerated() {
+            NSAttributedString(string: label, attributes: attrs)
+                .draw(at: NSPoint(x: 16, y: 17 + CGFloat(row) * rowHeight))
+        }
     }
 }
 
 final class PanelController: NSViewController {
     private let bridge = PyBridge()
     let chart = ChartView(frame: NSRect(x: 0, y: 0, width: kPanelWidth, height: 660))
-    private let footer = NSView()
+    private let footer = PanelFooter()
     weak var popover: NSPopover?
 
     private let footerStatus: NSTextField = {
@@ -490,6 +749,7 @@ final class PanelController: NSViewController {
         field.font = NSFont.systemFont(ofSize: 10.5)
         field.textColor = Palette.muted
         field.alignment = .right
+        field.lineBreakMode = .byTruncatingTail
         field.isBezeled = false
         field.drawsBackground = false
         field.isEditable = false
@@ -510,21 +770,22 @@ final class PanelController: NSViewController {
         footer.wantsLayer = true
         footer.layer?.backgroundColor = Palette.bg.cgColor
 
-        let buttons: [(String, Selector)] = [
-            ("立即采集", #selector(scanNow)),
-            ("打开看板", #selector(openDashboard)),
-            ("退出", #selector(quit)),
+        let buttons: [(String, Selector, PanelButton.Tone)] = [
+            ("立即采集", #selector(scanNow), .normal),
+            ("打开看板", #selector(openDashboard), .normal),
+            ("退出", #selector(quit), .destructive),
         ]
-        var x: CGFloat = 12
-        for (title, action) in buttons {
-            let button = PanelButton.make(title, target: self, action: action)
-            button.sizeToFit()
-            button.frame = NSRect(x: x, y: 9, width: button.frame.width + 16, height: 22)
+        var x: CGFloat = 10   // 按钮 frame 自带左右 4pt 留白，视觉上和卡片一样从 14pt 开始
+        for (title, action, tone) in buttons {
+            let button = PanelButton.make(title, tone: tone, target: self, action: action)
+            let width = PanelButton.width(for: title)
+            button.frame = NSRect(x: x, y: 7, width: width, height: 32)
             footer.addSubview(button)
-            x += button.frame.width + 8
+            x += width
         }
-        footerStatus.frame = NSRect(x: x + 4, y: 13,
-                                    width: kPanelWidth - x - 20, height: 16)
+        let statusX = x + 4
+        footerStatus.frame = NSRect(x: statusX, y: 15,
+                                    width: kPanelWidth - statusX - 14, height: 16)
         footer.addSubview(footerStatus)
 
         container.addSubview(footer)
@@ -533,6 +794,13 @@ final class PanelController: NSViewController {
 
         chart.onHeightChange = { [weak self] height in self?.applyHeight(height) }
         applyHeight(chart.contentHeight)
+    }
+
+    override func viewWillAppear() {
+        super.viewWillAppear()
+        for case let button as PanelButton in footer.subviews {
+            button.resetState()
+        }
     }
 
     /// 行数变了就重排：面板高度跟着内容走
@@ -674,6 +942,11 @@ struct TokenLensBarMain {
             render(path: path)
             return
         }
+        if let index = args.firstIndex(of: "--render-buttons") {
+            let path = index + 1 < args.count ? args[index + 1] : "/tmp/tokenlens-buttons.png"
+            renderButtons(path: path)
+            return
+        }
         if args.contains("--dump") {
             dump()
             return
@@ -722,6 +995,42 @@ struct TokenLensBarMain {
         ) else { return }
         rep.size = size
         panel.view.cacheDisplay(in: panel.view.bounds, to: rep)
+        guard let data = rep.representation(using: .png, properties: [:]) else { return }
+        try? data.write(to: URL(fileURLWithPath: path))
+        print("已输出：\(path)")
+    }
+
+    private static func renderButtons(path: String) {
+        let width = kPanelWidth
+        let height: CGFloat = 3 * 50 + 16
+        let preview = ButtonPreview(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        let specs: [(String, PanelButton.Tone)] = [
+            ("立即采集", .normal),
+            ("打开看板", .normal),
+            ("退出", .destructive),
+        ]
+        for row in 0..<3 {
+            var x: CGFloat = 72
+            for (title, tone) in specs {
+                let button = PanelButton.make(title, tone: tone, target: nil, action: nil)
+                let buttonWidth = PanelButton.width(for: title)
+                button.frame = NSRect(x: x, y: 9 + CGFloat(row) * 50,
+                                      width: buttonWidth, height: 32)
+                button.preview(hover: row >= 1, press: row == 2)
+                preview.addSubview(button)
+                x += buttonWidth
+            }
+        }
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(width * scale),
+            pixelsHigh: Int(height * scale),
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ) else { return }
+        rep.size = NSSize(width: width, height: height)
+        preview.cacheDisplay(in: preview.bounds, to: rep)
         guard let data = rep.representation(using: .png, properties: [:]) else { return }
         try? data.write(to: URL(fileURLWithPath: path))
         print("已输出：\(path)")
