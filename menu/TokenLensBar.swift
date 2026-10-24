@@ -232,15 +232,11 @@ func balanceText(_ value: Double, currency: String) -> String {
     return (value < 0 ? "-" : "") + symbol + number
 }
 
-func balanceSummary(_ snapshot: Snapshot?) -> String {
-    guard let balances = snapshot?.balances, balances.configured == true,
-          let providers = balances.providers, !providers.isEmpty else { return "—" }
-    let values = providers.flatMap { provider in
-        (provider.items ?? []).map {
-            balanceText($0.total ?? 0, currency: $0.currency ?? "CNY")
-        }
+func providerBalanceText(_ provider: Snapshot.BalanceProvider) -> String {
+    let values = (provider.items ?? []).map {
+        balanceText($0.total ?? 0, currency: $0.currency ?? "CNY")
     }
-    return values.isEmpty ? "—" : values.joined(separator: " · ")
+    return values.isEmpty ? "—" : values.joined(separator: " / ")
 }
 
 func clockText(_ epoch: Double) -> String {
@@ -363,27 +359,48 @@ struct PanelView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text("TokenLensBar").font(.headline)
-                Spacer(minLength: 8)
-                Text("余额")
+                Text("本地 token 用量")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(balanceSummary(model.snapshot))
-                    .font(.headline)
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
             }
-            Text("本地 token 用量")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            balanceHeader
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
         .padding(.top, 10)
         .padding(.bottom, 8)
+    }
+
+    /// 右上角余额：写清楚是哪家的钱（DeepSeek: ¥9.17）。
+    /// 单个 provider 一行；多个时纵向排列，正好占住左侧副标题那一行。
+    @ViewBuilder private var balanceHeader: some View {
+        if let balances = model.snapshot?.balances, balances.configured == true,
+           let providers = balances.providers, !providers.isEmpty {
+            VStack(alignment: .trailing, spacing: 1) {
+                ForEach(Array(providers.enumerated()), id: \.offset) { _, provider in
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text("\(provider.name ?? provider.id ?? "?"):")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text(providerBalanceText(provider))
+                            .font(.headline)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
+                }
+            }
+        } else {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text("余额").font(.caption).foregroundStyle(.secondary)
+                Text("—").font(.headline)
+            }
+        }
     }
 
     private var topBar: some View {
