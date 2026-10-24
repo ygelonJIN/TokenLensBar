@@ -2,11 +2,11 @@
 
 纯本地、零网络的 token 用量监控（余额查询是可选功能）。采集器 ~900 行 Python（只用标准库）+ 原生菜单栏 App + 本地看板。
 
-菜单栏点开是图表（近 7 天每天带 token 和金额、全部历史按模型/按 Agent）：
+菜单栏点开是原生面板（概览 / 历史 / 余额）：概览是今日摘要 + 近 7 天柱图 + 按模型/Agent，历史看全部汇总，余额是独立页签。面板跟随菜单栏/系统浅色或深色。
 
 ![面板](docs/panel.png)
 
-（面板截图里的余额数字是示例；填入 Key 后会显示真实余额。）
+（「余额」页签里的数字是示例；填入 Key 后会显示真实余额。）
 
 完整看板在浏览器里：
 
@@ -55,7 +55,9 @@ launchctl kickstart gui/$(id -u)/com.tokenlens.scan     # 立刻采集一次
 
 ## 账户余额（可选）
 
-默认不联网。开启后菜单栏面板会多一张「账户余额」卡片，目前支持 DeepSeek。
+默认不联网。开启后菜单栏面板会多一个「余额」页签，目前支持 DeepSeek。
+
+![余额页签](docs/panel-balance.png)
 
 安装时已经生成 `~/.tokenlens/balances.json`（DeepSeek 已启用）。填入 Key 即可：
 
@@ -427,5 +429,5 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 | [balances.example.json](balances.example.json) | 余额 provider 配置模板 |
 | [secrets.example.json](secrets.example.json) | 余额 Key 文件模板（填好后另存为 `secrets.json`） |
 | [assets/](assets/) | App 图标源文件、`.icns`、4 个候选样式 |
-| [docs/panel.png](docs/panel.png) | 菜单栏面板效果图 |
-| [docs/panel-buttons.png](docs/panel-buttons.png) | 底部按钮三态（常态 / 悬停 / 按下） |
+| [docs/panel.png](docs/panel.png) | 菜单栏原生面板效果图 |
+| [docs/panel-balance.png](docs/panel-balance.png) | 「余额」页签效果图 |

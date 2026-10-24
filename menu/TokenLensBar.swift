@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import Charts
+import Combine
 
 // 菜单栏外壳 + 点开的图表面板。
 // 计算全在 tokenlens.py 里；这里只负责取数和画图。
@@ -8,7 +9,7 @@ import Charts
 
 let kRefreshInterval: TimeInterval = 60
 let kDashboardPort = 8787
-let kPanelWidth: CGFloat = 344
+let kPanelWidth: CGFloat = 320
 
 // MARK: - 取数
 
@@ -210,82 +211,8 @@ func logLine(_ message: String) {
         FileManager.default.createFile(atPath: path, contents: data)
     }
 }
-// MARK: - 原生小组件
 
-/// 原生 Swift Charts 柱状图：柱高是 Token，柱顶两行是 Token / 金额。
-struct DailyBarChart: View {
-    let days: [Snapshot.DayPoint]
-    let symbol: String
-
-    private var maxValue: Double {
-        max(1, days.map { $0.tokens }.max() ?? 1)
-    }
-
-    var body: some View {
-        Chart(days, id: \.date) { day in
-            BarMark(
-                x: .value("日期", shortDate(day.date)),
-                y: .value("Token", day.tokens)
-            )
-            .foregroundStyle(Color.accentColor)
-            .cornerRadius(2)
-            .annotation(position: .top, spacing: 2) {
-                if day.tokens > 0 {
-                    VStack(spacing: 0) {
-                        Text(cnTiny(day.tokens))
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(.primary)
-                        Text(costText(day.cost ?? 0, tokens: day.tokens, symbol))
-                            .font(.system(size: 8))
-                            .foregroundStyle(.secondary)
-                    }
-                } else {
-                    Text("—")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-        .chartYAxis(.hidden)
-        .chartYScale(domain: 0...(maxValue * 1.55))
-        .chartXAxis {
-            AxisMarks { _ in
-                AxisGridLine().foregroundStyle(.clear)
-                AxisTick().foregroundStyle(.clear)
-                AxisValueLabel()
-            }
-        }
-        .chartPlotStyle { plot in
-            plot.padding(.top, 2)
-        }
-        .background(Color.clear)
-    }
-}
-
-/// 原生分组卡片：系统 controlBackgroundColor + separatorColor，跟随浅色/深色。
-final class CardView: NSView {
-    override var isOpaque: Bool { false }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let path = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
-        NSColor.controlBackgroundColor.setFill()
-        path.fill()
-        NSColor.separatorColor.setStroke()
-        path.lineWidth = 1
-        path.stroke()
-    }
-}
-
-/// 面板底色。用 windowBackgroundColor，浅色/深色都由系统决定。
-final class PanelBackgroundView: NSView {
-    override var isOpaque: Bool { true }
-
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
-        bounds.fill()
-    }
-}
+let kPanelHeight: CGFloat = 560
 
 func shortDate(_ text: String) -> String {
     let parts = text.split(separator: "-")
@@ -313,502 +240,515 @@ func clockText(_ epoch: Double) -> String {
     return formatter.string(from: date)
 }
 
-private func balanceErrorColor(_ message: String) -> NSColor {
-    if message.contains("未配置") { return .secondaryLabelColor }
-    if message.contains("Key") || message.contains("权限") { return .systemRed }
-    return .systemOrange
-}
+// MARK: - 数据模型
 
-// MARK: - 面板
+final class PanelModel: ObservableObject {
+    @Published var snapshot: Snapshot?
+    @Published var status: String = ""
+    @Published var lastLoaded: Date?
+    @Published var loadFailed = false
+    @Published var colorScheme: ColorScheme = .dark
 
-final class PanelController: NSViewController {
     private let bridge = PyBridge()
-    private let contentStack = NSStackView()
-    private let footerStatus = NSTextField(labelWithString: "")
-    private var lastHeight: CGFloat = 0
-    private var snapshotValue: Snapshot?
-
-    weak var popover: NSPopover?
-
-    var snapshot: Snapshot? {
-        get { snapshotValue }
-        set {
-            snapshotValue = newValue
-            if isViewLoaded { rebuild() }
-        }
-    }
-
-    override func loadView() {
-        let root = PanelBackgroundView(frame: NSRect(x: 0, y: 0, width: kPanelWidth, height: 620))
-        self.view = root
-
-        contentStack.orientation = .vertical
-        contentStack.alignment = .leading
-        contentStack.spacing = 8
-        contentStack.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(contentStack)
-        NSLayoutConstraint.activate([
-            contentStack.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
-            contentStack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            contentStack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-            contentStack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
-        ])
-
-        footerStatus.font = .systemFont(ofSize: 10)
-        footerStatus.textColor = .secondaryLabelColor
-        footerStatus.alignment = .right
-        footerStatus.lineBreakMode = .byTruncatingTail
-        footerStatus.translatesAutoresizingMaskIntoConstraints = false
-        footerStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        preferredContentSize = NSSize(width: kPanelWidth, height: 620)
-        rebuild()
-    }
-
-    // MARK: - 重建
-
-    private func rebuild() {
-        guard isViewLoaded else { return }
-        for view in contentStack.arrangedSubviews {
-            contentStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-
-        guard let snap = snapshot, snap.ok else {
-            addFullWidth(makeLabel("还没有数据", size: 13, color: .secondaryLabelColor),
-                         to: contentStack)
-            addFooter()
-            applySize()
-            return
-        }
-
-        addHeader(snap)
-        addBalanceCard(snap)
-        addTodayCard(snap)
-        addChartCard(snap)
-        addHistoryCard(snap)
-        addFooter()
-        applySize()
-    }
-
-    private func applySize() {
-        guard isViewLoaded else { return }
-        view.layoutSubtreeIfNeeded()
-        let fitting = contentStack.fittingSize
-        let height = max(160, ceil(fitting.height + 22))
-        guard abs(height - lastHeight) > 0.5 else { return }
-        lastHeight = height
-        let size = NSSize(width: kPanelWidth, height: height)
-        preferredContentSize = size
-        view.frame = NSRect(origin: .zero, size: size)
-        popover?.contentSize = size
-        view.layoutSubtreeIfNeeded()
-    }
-
-    // MARK: - 顶部摘要
-
-    private func addHeader(_ snap: Snapshot) {
-        let header = NSStackView()
-        header.orientation = .vertical
-        header.alignment = .leading
-        header.spacing = 6
-        header.translatesAutoresizingMaskIntoConstraints = false
-
-        header.addArrangedSubview(makeLabel("今日用量", size: 13, weight: .semibold))
-
-        let metrics = NSStackView()
-        metrics.orientation = .horizontal
-        metrics.alignment = .top
-        metrics.distribution = .fillEqually
-        metrics.spacing = 12
-        metrics.translatesAutoresizingMaskIntoConstraints = false
-        metrics.addArrangedSubview(metricColumn("金额",
-                                                money(snap.windows?["today"]?.cost ?? 0,
-                                                      snap.symbol ?? "¥"),
-                                                size: 20))
-        metrics.addArrangedSubview(metricColumn("Token",
-                                                cn(snap.windows?["today"]?.tokens ?? 0),
-                                                size: 20))
-        addFullWidth(metrics, to: header)
-
-        let rate = Int(((snap.cacheRate ?? 0) * 100).rounded())
-        let caption = NSMutableAttributedString()
-        caption.append(NSAttributedString(string: "缓存命中 ", attributes: [
-            .font: NSFont.systemFont(ofSize: 11),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]))
-        caption.append(NSAttributedString(string: "\(rate)%", attributes: [
-            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: NSColor.controlAccentColor,
-        ]))
-        caption.append(NSAttributedString(
-            string: " · \(countText(snap.windows?["today"]?.events ?? 0)) 次请求",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ]))
-        let captionField = NSTextField(labelWithAttributedString: caption)
-        captionField.translatesAutoresizingMaskIntoConstraints = false
-        captionField.lineBreakMode = .byTruncatingTail
-        addFullWidth(captionField, to: header)
-
-        addFullWidth(header, to: contentStack)
-    }
-
-    private func metricColumn(_ title: String, _ value: String, size: CGFloat) -> NSStackView {
-        let column = NSStackView()
-        column.orientation = .vertical
-        column.alignment = .leading
-        column.spacing = 1
-        column.translatesAutoresizingMaskIntoConstraints = false
-        column.addArrangedSubview(makeLabel(title, size: 11, color: .secondaryLabelColor))
-        column.addArrangedSubview(makeLabel(value, size: size, weight: .semibold,
-                                           monospaced: true))
-        return column
-    }
-
-    // MARK: - 余额
-
-    private func addBalanceCard(_ snap: Snapshot) {
-        guard let balances = snap.balances, balances.configured == true,
-              let providers = balances.providers, !providers.isEmpty else { return }
-
-        let (card, stack) = makeCard()
-        let (update, updateColor) = balanceUpdate(providers)
-        let right = update.isEmpty ? nil : makeLabel(update, size: 10, color: updateColor)
-        addFullWidth(cardTitle("账户余额", right: right), to: stack)
-
-        for provider in providers {
-            let name = provider.name ?? provider.id ?? "?"
-            let items = provider.items ?? []
-            if items.isEmpty {
-                let row = horizontalRow()
-                row.addArrangedSubview(makeLabel(name, size: 12))
-                row.addArrangedSubview(makeSpacer())
-                let message = provider.error ?? "读取中…"
-                row.addArrangedSubview(makeLabel(message, size: 11,
-                                                 color: balanceErrorColor(message)))
-                addFullWidth(row, to: stack)
-                continue
-            }
-            for (index, item) in items.enumerated() {
-                let row = horizontalRow()
-                row.addArrangedSubview(makeLabel(index == 0 ? name : (item.currency ?? ""),
-                                                 size: index == 0 ? 12 : 10,
-                                                 color: index == 0 ? .labelColor : .secondaryLabelColor))
-                row.addArrangedSubview(makeSpacer())
-                row.addArrangedSubview(makeLabel(
-                    balanceText(item.total ?? 0, currency: item.currency ?? "CNY"),
-                    size: 12, weight: .semibold,
-                    color: item.available == false ? .systemRed : .labelColor,
-                    monospaced: true))
-                addFullWidth(row, to: stack)
-            }
-        }
-
-        addFullWidth(card, to: contentStack)
-    }
-
-    private func balanceUpdate(_ providers: [Snapshot.BalanceProvider]) -> (String, NSColor) {
-        let fetched = providers.compactMap { $0.fetchedAt }.max()
-        guard let fetched else { return ("", .secondaryLabelColor) }
-        if providers.contains(where: { !($0.error ?? "").isEmpty }) {
-            return ("更新失败", .systemOrange)
-        }
-        if providers.contains(where: { $0.stale == true }) {
-            return ("已过期", .systemOrange)
-        }
-        return ("\(clockText(fetched)) 更新", .secondaryLabelColor)
-    }
-
-    // MARK: - 今日明细
-
-    private func addTodayCard(_ snap: Snapshot) {
-        let (card, stack) = makeCard()
-        let symbol = snap.symbol ?? "¥"
-
-        stack.addArrangedSubview(makeLabel("按模型", size: 11, weight: .semibold,
-                                           color: .secondaryLabelColor))
-        let models = snap.modelsToday ?? []
-        if models.isEmpty {
-            stack.addArrangedSubview(makeLabel("今天还没有用量", size: 11,
-                                               color: .secondaryLabelColor))
-        } else if let grid = makeGrid(models.map {
-            ($0.model ?? "?", cn($0.tokens),
-             costText($0.cost, tokens: $0.tokens, symbol,
-                      subscription: $0.subscription ?? false))
-        }) {
-            addGrid(grid, to: stack)
-        }
-        stack.setCustomSpacing(8, after: stack.arrangedSubviews.last!)
-
-        stack.addArrangedSubview(makeLabel("按 Agent", size: 11, weight: .semibold,
-                                           color: .secondaryLabelColor))
-        let agents = snap.agentsToday ?? []
-        if agents.isEmpty {
-            stack.addArrangedSubview(makeLabel("今天还没有用量", size: 11,
-                                               color: .secondaryLabelColor))
-        } else if let grid = makeGrid(agents.map {
-            ($0.agent ?? "?", cn($0.tokens),
-             costText($0.cost, tokens: $0.tokens, symbol,
-                      subscription: $0.subscription ?? false))
-        }) {
-            addGrid(grid, to: stack)
-        }
-
-        addFullWidth(card, to: contentStack)
-    }
-
-    // MARK: - 近 7 天
-
-    private func addChartCard(_ snap: Snapshot) {
-        let (card, stack) = makeCard()
-        addFullWidth(cardTitle("近 7 天",
-                               right: makeLabel("Token / 金额", size: 9,
-                                                color: .tertiaryLabelColor)),
-                     to: stack)
-
-        let days = snap.daily ?? []
-        if days.isEmpty {
-            stack.addArrangedSubview(makeLabel("暂无数据", size: 11,
-                                               color: .secondaryLabelColor))
-        } else {
-            let host = NSHostingView(rootView: DailyBarChart(
-                days: days, symbol: snap.symbol ?? "¥"))
-            host.translatesAutoresizingMaskIntoConstraints = false
-            host.wantsLayer = true
-            host.layer?.backgroundColor = NSColor.clear.cgColor
-            stack.addArrangedSubview(host)
-            host.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-            host.heightAnchor.constraint(equalToConstant: 88).isActive = true
-        }
-
-        addFullWidth(card, to: contentStack)
-    }
-
-    // MARK: - 全部历史
-
-    private func addHistoryCard(_ snap: Snapshot) {
-        let (card, stack) = makeCard()
-        let symbol = snap.symbol ?? "¥"
-        let totalCost = (snap.models ?? []).reduce(0.0) { $0 + $1.cost }
-
-        let titleRow = horizontalRow()
-        titleRow.addArrangedSubview(makeLabel("全部历史", size: 12, weight: .semibold))
-        titleRow.addArrangedSubview(makeLabel(money(totalCost, symbol), size: 12,
-                                              weight: .semibold, monospaced: true))
-        titleRow.addArrangedSubview(makeLabel(cn(snap.allTokens ?? 0), size: 12,
-                                              weight: .semibold, monospaced: true))
-        titleRow.addArrangedSubview(makeSpacer())
-        addFullWidth(titleRow, to: stack)
-
-        stack.addArrangedSubview(makeLabel("按模型", size: 11, weight: .semibold,
-                                           color: .secondaryLabelColor))
-        let models = snap.models ?? []
-        if models.isEmpty {
-            stack.addArrangedSubview(makeLabel("还没有历史数据", size: 11,
-                                               color: .secondaryLabelColor))
-        } else if let grid = makeGrid(models.map {
-            ($0.model ?? "?", cn($0.tokens),
-             costText($0.cost, tokens: $0.tokens, symbol,
-                      subscription: $0.subscription ?? false))
-        }) {
-            addGrid(grid, to: stack)
-        }
-        stack.setCustomSpacing(8, after: stack.arrangedSubviews.last!)
-
-        stack.addArrangedSubview(makeLabel("按 Agent", size: 11, weight: .semibold,
-                                           color: .secondaryLabelColor))
-        let agents = snap.agents ?? []
-        if agents.isEmpty {
-            stack.addArrangedSubview(makeLabel("还没有历史数据", size: 11,
-                                               color: .secondaryLabelColor))
-        } else if let grid = makeGrid(agents.map {
-            ($0.agent ?? "?", cn($0.tokens),
-             costText($0.cost, tokens: $0.tokens, symbol,
-                      subscription: $0.subscription ?? false))
-        }) {
-            addGrid(grid, to: stack)
-        }
-
-        let footer = makeLabel("共 \(countText(snap.allEvents ?? 0)) 次请求",
-                               size: 10, color: .secondaryLabelColor)
-        stack.setCustomSpacing(6, after: stack.arrangedSubviews.last!)
-        stack.addArrangedSubview(footer)
-        addFullWidth(card, to: contentStack)
-    }
-
-    // MARK: - 底部
-
-    private func addFooter() {
-        let separator = NSBox()
-        separator.boxType = .separator
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        contentStack.addArrangedSubview(separator)
-        separator.widthAnchor.constraint(equalTo: contentStack.widthAnchor).isActive = true
-
-        let row = horizontalRow()
-        row.addArrangedSubview(makeButton("立即采集", symbol: "arrow.clockwise",
-                                          action: #selector(scanNow)))
-        row.addArrangedSubview(makeButton("打开看板", symbol: "rectangle.on.rectangle",
-                                          action: #selector(openDashboard)))
-        row.addArrangedSubview(makeButton("退出", symbol: "power",
-                                          action: #selector(quit)))
-        row.addArrangedSubview(makeSpacer())
-        row.addArrangedSubview(footerStatus)
-        footerStatus.widthAnchor.constraint(lessThanOrEqualToConstant: 92).isActive = true
-        addFullWidth(row, to: contentStack)
-    }
-
-    private func makeButton(_ title: String, symbol: String, action: Selector) -> NSButton {
-        let button = NSButton(title: title, target: self, action: action)
-        button.bezelStyle = .rounded
-        button.controlSize = .small
-        button.font = .systemFont(ofSize: 11)
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        button.imagePosition = .imageLeading
-        button.imageHugsTitle = true
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.setContentHuggingPriority(.required, for: .horizontal)
-        return button
-    }
-
-    // MARK: - 基础小组件
-
-    private func makeCard() -> (CardView, NSStackView) {
-        let card = CardView()
-        card.translatesAutoresizingMaskIntoConstraints = false
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 6
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
-            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
-            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
-        ])
-        return (card, stack)
-    }
-
-    private func cardTitle(_ title: String, right: NSView? = nil) -> NSStackView {
-        let row = horizontalRow()
-        row.addArrangedSubview(makeLabel(title, size: 12, weight: .semibold))
-        row.addArrangedSubview(makeSpacer())
-        if let right { row.addArrangedSubview(right) }
-        return row
-    }
-
-    private func horizontalRow() -> NSStackView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
-        row.translatesAutoresizingMaskIntoConstraints = false
-        return row
-    }
-
-    private func makeSpacer() -> NSView {
-        let view = NSView()
-        view.translatesAutoresizingMaskIntoConstraints = false
-        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return view
-    }
-
-    private func makeLabel(_ text: String, size: CGFloat = 12,
-                           weight: NSFont.Weight = .regular,
-                           color: NSColor = .labelColor,
-                           monospaced: Bool = false) -> NSTextField {
-        let field = NSTextField(labelWithString: text)
-        field.font = monospaced
-            ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
-            : NSFont.systemFont(ofSize: size, weight: weight)
-        field.textColor = color
-        field.lineBreakMode = .byTruncatingTail
-        field.translatesAutoresizingMaskIntoConstraints = false
-        return field
-    }
-
-    private func makeGrid(_ rows: [(String, String, String)]) -> NSGridView? {
-        guard !rows.isEmpty else { return nil }
-        var views: [[NSView]] = []
-        for row in rows {
-            views.append([
-                makeLabel(row.0, size: 12),
-                makeLabel(row.1, size: 11, color: .secondaryLabelColor, monospaced: true),
-                makeLabel(row.2, size: 12, weight: .medium, monospaced: true),
-            ])
-        }
-        let grid = NSGridView(views: views)
-        grid.translatesAutoresizingMaskIntoConstraints = false
-        grid.rowSpacing = 2
-        grid.columnSpacing = 10
-        grid.rowAlignment = .firstBaseline
-        grid.column(at: 0).xPlacement = .leading
-        grid.column(at: 1).xPlacement = .trailing
-        grid.column(at: 2).xPlacement = .trailing
-        grid.column(at: 1).width = 72
-        grid.column(at: 2).width = 66
-        return grid
-    }
-
-    private func addGrid(_ grid: NSGridView, to stack: NSStackView) {
-        stack.addArrangedSubview(grid)
-        grid.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-    }
-
-    private func addFullWidth(_ child: NSView, to stack: NSStackView) {
-        child.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(child)
-        child.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-    }
-
-    // MARK: - 动作
-
-    private func note(_ text: String, color: NSColor = .secondaryLabelColor) {
-        footerStatus.textColor = color
-        footerStatus.stringValue = text
-    }
-
-    @objc private func scanNow() {
-        note("采集中…", color: .controlAccentColor)
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.bridge.scan()
-            DispatchQueue.main.async {
-                self?.reload()
-                let stamp = DateFormatter()
-                stamp.dateFormat = "HH:mm"
-                self?.note("已采集 " + stamp.string(from: Date()),
-                           color: .controlAccentColor)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
-                    if self?.footerStatus.stringValue.hasPrefix("已采集") == true {
-                        self?.note("")
-                    }
-                }
-            }
-        }
-    }
-
-    @objc private func openDashboard() {
-        note("正在打开看板…", color: .controlAccentColor)
-        bridge.openDashboard()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            self?.note("看板 127.0.0.1:8787")
-        }
-    }
-
-    @objc private func quit() {
-        NSApp.terminate(nil)
-    }
+    private var clearItem: DispatchWorkItem?
 
     func reload() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let snap = self.bridge.load()
-            DispatchQueue.main.async { self.snapshot = snap }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.snapshot = snap
+                self.loadFailed = (snap == nil)
+                self.lastLoaded = Date()
+            }
+        }
+    }
+
+    func scan() {
+        status = "采集中…"
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.bridge.scan()
+            let snap = self.bridge.load()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.snapshot = snap
+                self.loadFailed = (snap == nil)
+                self.lastLoaded = Date()
+                let stamp = DateFormatter()
+                stamp.dateFormat = "HH:mm"
+                self.status = "已采集 " + stamp.string(from: Date())
+                self.clearItem?.cancel()
+                let item = DispatchWorkItem { [weak self] in
+                    if self?.status.hasPrefix("已采集") == true { self?.status = "" }
+                }
+                self.clearItem = item
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: item)
+            }
+        }
+    }
+
+    func openDashboard() {
+        status = "正在打开看板…"
+        bridge.openDashboard()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.status = "看板 127.0.0.1:8787"
+        }
+    }
+
+    func quit() {
+        NSApp.terminate(nil)
+    }
+}
+
+// MARK: - 原生 SwiftUI 面板
+
+enum PanelTab: String, CaseIterable, Identifiable {
+    case overview = "概览"
+    case history = "历史"
+    case balance = "余额"
+
+    var id: String { rawValue }
+}
+
+struct PanelView: View {
+    @ObservedObject var model: PanelModel
+    @State private var tab: PanelTab = {
+        if let raw = ProcessInfo.processInfo.environment["TOKENLENS_TAB"],
+           let value = PanelTab(rawValue: raw) {
+            return value
+        }
+        return .overview
+    }()
+
+    var body: some View {
+        GeometryReader { geo in
+            VStack(spacing: 0) {
+                topBar
+                if model.snapshot?.ok == true {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            switch tab {
+                            case .overview:
+                                OverviewSections(model: model)
+                            case .history:
+                                HistorySections(model: model)
+                            case .balance:
+                                BalanceSections(model: model)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                        .padding(.bottom, 30)
+                    }
+                    .frame(height: max(120, geo.size.height - 84))
+                    .clipped()
+                } else {
+                    Spacer(minLength: 0)
+                    emptyState
+                    Spacer(minLength: 0)
+                }
+            }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+            .overlay(alignment: .bottom) { bottomBar }
+        }
+        .frame(width: kPanelWidth, height: kPanelHeight)
+        .background(Color.clear)
+        .preferredColorScheme(model.colorScheme)
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("tokenlens").font(.headline)
+                Text("本地 token 用量").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Menu {
+                Button {
+                    model.scan()
+                } label: {
+                    Label("立即采集", systemImage: "arrow.clockwise")
+                }
+                Button {
+                    model.openDashboard()
+                } label: {
+                    Label("打开看板", systemImage: "rectangle.on.rectangle")
+                }
+                Divider()
+                Button(role: .destructive) {
+                    model.quit()
+                } label: {
+                    Label("退出", systemImage: "power")
+                }
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 14))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("操作")
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
+    }
+
+    private var topBar: some View {
+        VStack(spacing: 0) {
+            header
+            Picker("", selection: $tab) {
+                ForEach(PanelTab.allCases) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+            Divider()
+        }
+        .background(.bar)
+    }
+
+    private var bottomBar: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 8) {
+                Text(model.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                if let loaded = model.lastLoaded {
+                    HStack(spacing: 3) {
+                        Text("更新")
+                        Text(loaded, style: .time)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+        .background(.bar)
+    }
+
+    @ViewBuilder
+    private var emptyState: some View {
+        if model.snapshot == nil {
+            if model.loadFailed {
+                ContentUnavailableView {
+                    Label("读取失败", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text("点右上角齿轮里的“立即采集”重试")
+                } actions: {
+                    Button("立即采集") { model.scan() }
+                }
+            } else {
+                ProgressView("读取中…")
+            }
+        } else {
+            ContentUnavailableView {
+                Label("还没有数据", systemImage: "chart.bar")
+            } description: {
+                Text("点右上角齿轮里的“立即采集”")
+            } actions: {
+                Button("立即采集") { model.scan() }
+            }
+        }
+    }
+}
+
+struct NativeSection<Content: View>: View {
+    let title: String
+    let content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+                .padding(.bottom, 4)
+            content
+        }
+    }
+}
+
+// MARK: - 概览
+
+struct OverviewSections: View {
+    @ObservedObject var model: PanelModel
+    @State private var selectedDate: String?
+
+    @ViewBuilder
+    var body: some View {
+        if let snap = model.snapshot, snap.ok {
+            NativeSection("今日") {
+                SummaryRow(label: "金额",
+                           value: money(snap.windows?["today"]?.cost ?? 0,
+                                        snap.symbol ?? "¥"))
+                SummaryRow(label: "Token",
+                           value: cn(snap.windows?["today"]?.tokens ?? 0))
+                SummaryRow(label: "缓存命中",
+                           value: "\(Int(((snap.cacheRate ?? 0) * 100).rounded()))%")
+                SummaryRow(label: "请求",
+                           value: countText(snap.windows?["today"]?.events ?? 0))
+            }
+
+            NativeSection("近 7 天") {
+                Chart(snap.daily ?? [], id: \.date) { day in
+                    BarMark(
+                        x: .value("日期", shortDate(day.date)),
+                        y: .value("Token", day.tokens)
+                    )
+                    .foregroundStyle(Color.accentColor)
+                    .cornerRadius(2)
+                }
+                .chartYAxis(.hidden)
+                .chartXAxis {
+                    AxisMarks { _ in
+                        AxisGridLine().foregroundStyle(.clear)
+                        AxisTick().foregroundStyle(.clear)
+                        AxisValueLabel()
+                    }
+                }
+                .frame(height: 110)
+                .padding(.vertical, 4)
+                .chartXSelection(value: $selectedDate)
+                if let selected = selectedDate,
+                   let day = (snap.daily ?? []).first(where: { shortDate($0.date) == selected }) {
+                    Text("\(selected) · \(cn(day.tokens)) · \(costText(day.cost ?? 0, tokens: day.tokens, snap.symbol ?? "¥"))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 6)
+                } else {
+                    Text("柱高：Token；点柱子看当天明细")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 6)
+                }
+            }
+
+            NativeSection("按模型") {
+                SliceRows(slices: snap.modelsToday ?? [], symbol: snap.symbol ?? "¥",
+                          empty: "今天还没有用量")
+            }
+
+            NativeSection("按 Agent") {
+                SliceRows(slices: snap.agentsToday ?? [], symbol: snap.symbol ?? "¥",
+                          empty: "今天还没有用量", agent: true)
+            }
+        }
+    }
+}
+
+// MARK: - 历史
+
+struct HistorySections: View {
+    @ObservedObject var model: PanelModel
+
+    @ViewBuilder
+    var body: some View {
+        if let snap = model.snapshot, snap.ok {
+            NativeSection("全部历史") {
+                SummaryRow(label: "总金额",
+                           value: money((snap.models ?? []).reduce(0.0) { $0 + $1.cost },
+                                        snap.symbol ?? "¥"))
+                SummaryRow(label: "总 Token", value: cn(snap.allTokens ?? 0))
+                SummaryRow(label: "请求", value: countText(snap.allEvents ?? 0))
+            }
+
+            NativeSection("按模型") {
+                SliceRows(slices: snap.models ?? [], symbol: snap.symbol ?? "¥",
+                          empty: "还没有历史数据")
+            }
+
+            NativeSection("按 Agent") {
+                SliceRows(slices: snap.agents ?? [], symbol: snap.symbol ?? "¥",
+                          empty: "还没有历史数据", agent: true)
+            }
+        }
+    }
+}
+
+// MARK: - 余额
+
+struct BalanceSections: View {
+    @ObservedObject var model: PanelModel
+
+    @ViewBuilder
+    var body: some View {
+        if let balances = model.snapshot?.balances, balances.configured == true,
+           let providers = balances.providers, !providers.isEmpty {
+            NativeSection("账户余额") {
+                BalanceRows(providers: providers)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    model.scan()
+                } label: {
+                    Label("刷新余额", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                Text("余额 10 分钟刷新一次；失败会保留上次的值。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        } else {
+            NativeSection("账户余额") {
+                Text("未启用余额查询")
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 3)
+                Text("在 ~/.tokenlens/balances.json 启用 DeepSeek，并在 secrets.json 填入 Key。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 3)
+            }
+        }
+    }
+}
+
+// MARK: - 复用行
+
+struct SummaryRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(label)
+                Spacer()
+                Text(value)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 3)
+            Divider()
+                .padding(.leading, 12)
+        }
+    }
+}
+
+struct SliceRows: View {
+    let slices: [Snapshot.Slice]
+    let symbol: String
+    let empty: String
+    var agent: Bool = false
+
+    var body: some View {
+        if slices.isEmpty {
+            Text(empty)
+                .foregroundStyle(.secondary)
+        } else if agent {
+            ForEach(slices, id: \.agent) { slice in
+                SliceRow(slice: slice, symbol: symbol, agent: true)
+            }
+        } else {
+            ForEach(slices, id: \.model) { slice in
+                SliceRow(slice: slice, symbol: symbol, agent: false)
+            }
+        }
+    }
+}
+
+struct SliceRow: View {
+    let slice: Snapshot.Slice
+    let symbol: String
+    let agent: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(agent ? (slice.agent ?? "?") : (slice.model ?? "?"))
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text(costText(slice.cost, tokens: slice.tokens, symbol,
+                                  subscription: slice.subscription ?? false))
+                        .monospacedDigit()
+                    Text(cn(slice.tokens))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 3)
+            Divider()
+                .padding(.leading, 12)
+        }
+    }
+}
+
+struct BalanceRows: View {
+    let providers: [Snapshot.BalanceProvider]
+
+    var body: some View {
+        ForEach(providers, id: \.id) { provider in
+            if let items = provider.items, !items.isEmpty {
+                ForEach(items, id: \.currency) { item in
+                    VStack(spacing: 0) {
+                        HStack {
+                            Text((provider.name ?? provider.id ?? "?") +
+                                 ((item.currency ?? "").isEmpty ? "" : " · " + (item.currency ?? "")))
+                            Spacer()
+                            Text(balanceText(item.total ?? 0,
+                                             currency: item.currency ?? "CNY"))
+                                .monospacedDigit()
+                                .foregroundStyle(item.available == false ? .red : .secondary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 3)
+                        Divider()
+                            .padding(.leading, 12)
+                    }
+                }
+            } else {
+                VStack(spacing: 0) {
+                    HStack {
+                        Text(provider.name ?? provider.id ?? "?")
+                        Spacer()
+                        Text(provider.error ?? "读取中…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 3)
+                    Divider()
+                        .padding(.leading, 12)
+                }
+            }
+            if let fetched = provider.fetchedAt {
+                Text("更新于 \(clockText(fetched))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 2)
+            }
+            if let error = provider.error {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 2)
+            }
         }
     }
 }
@@ -816,12 +756,12 @@ final class PanelController: NSViewController {
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let bridge = PyBridge()
-    private let panel = PanelController()
+    private let model = PanelModel()
+    private var panel: NSHostingController<PanelView>?
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var timer: Timer?
-    private var lastSnapshot: Snapshot?
+    private var cancellables = Set<AnyCancellable>()
     private var loggedFirstTitle = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -832,50 +772,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.action = #selector(togglePopover)
 
         popover = NSPopover()
-        popover.appearance = NSAppearance(named: .aqua)
         popover.behavior = .transient
         popover.animates = true
-        popover.contentViewController = panel
-        panel.popover = popover
+
+        model.$snapshot
+            .receive(on: RunLoop.main)
+            .sink { [weak self] snapshot in
+                self?.updateStatusItem(snapshot)
+            }
+            .store(in: &cancellables)
 
         logLine("启动：statusItem=\(statusItem.button == nil ? "nil" : "ok")")
-        refresh()
+        model.reload()
 
         let timer = Timer.scheduledTimer(withTimeInterval: kRefreshInterval, repeats: true) { [weak self] _ in
-            self?.refresh()
+            self?.model.reload()
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
     }
 
-    private func refresh() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            let snapshot = self.bridge.load()
-            DispatchQueue.main.async {
-                self.lastSnapshot = snapshot
-                self.panel.snapshot = snapshot
-                guard let snapshot, snapshot.ok,
-                      let today = snapshot.windows?["today"] else {
-                    self.statusItem.button?.title = "—"
-                    logLine("取数失败")
-                    return
-                }
-                let title = cn(today.tokens) + " · " + moneyCompact(today.cost, snapshot.symbol ?? "¥")
-                self.statusItem.button?.title = title
-                if !self.loggedFirstTitle {
-                    self.loggedFirstTitle = true
-                    logLine("首次刷新成功：菜单栏标题=\(title)")
-                }
-                self.statusItem.button?.toolTip =
-                    "今日 \(title) tokens · \(money(today.cost, snapshot.symbol ?? "¥"))"
-            }
+    private func updateStatusItem(_ snapshot: Snapshot?) {
+        guard let snapshot, snapshot.ok, let today = snapshot.windows?["today"] else {
+            statusItem.button?.title = "—"
+            return
         }
+        let title = cn(today.tokens) + " · " + moneyCompact(today.cost, snapshot.symbol ?? "¥")
+        statusItem.button?.title = title
+        if !loggedFirstTitle {
+            loggedFirstTitle = true
+            logLine("首次刷新成功：菜单栏标题=\(title)")
+        }
+        statusItem.button?.toolTip =
+            "今日 \(title) tokens · \(money(today.cost, snapshot.symbol ?? "¥"))"
     }
 
-    private func syncPopoverAppearance() {
-        let match = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
-        popover.appearance = NSAppearance(named: match == .darkAqua ? .darkAqua : .aqua)
+    private func ensurePanel() -> NSHostingController<PanelView> {
+        if let panel { return panel }
+        let host = NSHostingController(rootView: PanelView(model: model))
+        host.view.wantsLayer = true
+        host.view.layer?.backgroundColor = NSColor.clear.cgColor
+        host.preferredContentSize = NSSize(width: kPanelWidth, height: kPanelHeight)
+        panel = host
+        return host
     }
 
     @objc private func togglePopover() {
@@ -884,11 +823,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
             return
         }
-        syncPopoverAppearance()
-        panel.reload()
-        popover.contentSize = panel.preferredContentSize
+        model.reload()
+        let menuDark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        model.colorScheme = menuDark ? .dark : .light
+        let host = ensurePanel()
+        popover.contentViewController = host
+        popover.contentSize = NSSize(width: kPanelWidth, height: kPanelHeight)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let effective = self.popover.contentViewController?.view.window?.effectiveAppearance
+                ?? NSApp.effectiveAppearance
+            let isDark = effective.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            self.panel?.view.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
+            self.model.colorScheme = isDark ? .dark : .light
+        }
     }
 }
 
@@ -912,20 +862,33 @@ struct TokenLensBarMain {
         app.run()
     }
 
-    /// 离屏把面板画成 PNG，方便验证版式。
     private static func renderPanel(path: String) {
-        let panel = PanelController()
-        _ = panel.view
+        let model = PanelModel()
+        model.snapshot = PyBridge().load()
+        model.lastLoaded = Date()
+        let scheme: ColorScheme = ProcessInfo.processInfo.environment["TOKENLENS_APPEARANCE"] == "light"
+            ? .light : .dark
+        model.colorScheme = scheme
+        let root = PanelView(model: model)
+            .environment(\.colorScheme, scheme)
+            .background(Color(nsColor: .windowBackgroundColor))
+        let host = NSHostingController(rootView: root)
+        let size = NSSize(width: kPanelWidth, height: kPanelHeight)
+        host.view.frame = NSRect(origin: .zero, size: size)
         let appearanceName = ProcessInfo.processInfo.environment["TOKENLENS_APPEARANCE"] == "light"
             ? NSAppearance.Name.aqua : NSAppearance.Name.darkAqua
-        panel.view.appearance = NSAppearance(named: appearanceName)
-        panel.snapshot = PyBridge().load()
-        panel.view.layoutSubtreeIfNeeded()
-        let size = panel.preferredContentSize.height > 100
-            ? panel.preferredContentSize
-            : NSSize(width: kPanelWidth, height: 700)
-        panel.view.frame = NSRect(origin: .zero, size: size)
-        panel.view.layoutSubtreeIfNeeded()
+        host.view.appearance = NSAppearance(named: appearanceName)
+        host.view.wantsLayer = true
+        host.view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentViewController = host
+        window.appearance = NSAppearance(named: appearanceName)
+        window.orderFrontRegardless()
+        host.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+
         let scale: CGFloat = 2
         guard let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -935,10 +898,12 @@ struct TokenLensBarMain {
             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
         ) else { return }
         rep.size = size
-        panel.view.cacheDisplay(in: panel.view.bounds, to: rep)
-        guard let data = rep.representation(using: .png, properties: [:]) else { return }
-        try? data.write(to: URL(fileURLWithPath: path))
-        print("已输出：\(path)")
+        host.view.cacheDisplay(in: host.view.bounds, to: rep)
+        if let data = rep.representation(using: .png, properties: [:]) {
+            try? data.write(to: URL(fileURLWithPath: path))
+            print("已输出：\(path)")
+        }
+        window.orderOut(nil)
     }
 
     private static func dump() {
