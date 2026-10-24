@@ -301,17 +301,17 @@ final class ChartView: NSView {
     }
 
     private func drawHeadline(_ snap: Snapshot, today: Snapshot.Window?, symbol: String) {
-        text("今日用量", NSPoint(x: pad, y: 7), size: 10, color: Palette.muted)
+        text("今日用量", NSPoint(x: pad, y: 6), size: 11, weight: .semibold)
         // 金额在左、Token 在右，同一个字号
         let moneyText = money(today?.cost ?? 0, symbol)
-        text(moneyText, NSPoint(x: pad - 1, y: 20), size: 23,
+        text(moneyText, NSPoint(x: pad - 1, y: 21), size: 23,
              weight: .semibold, color: Palette.mint)
         text(cn(today?.tokens ?? 0),
-             NSPoint(x: pad - 1 + width(moneyText, size: 23, weight: .semibold) + 9, y: 20),
+             NSPoint(x: pad - 1 + width(moneyText, size: 23, weight: .semibold) + 9, y: 21),
              size: 23, weight: .semibold, color: Palette.mint)
         let rate = Int(((snap.cacheRate ?? 0) * 100).rounded())
         text("缓存命中 \(rate)% · \(today?.events ?? 0) 次请求",
-             NSPoint(x: pad, y: 48), size: 9.5, color: Palette.muted)
+             NSPoint(x: pad, y: 49), size: 9.5, color: Palette.muted)
     }
 
     private func drawTodayCard(_ box: NSRect, snap: Snapshot, symbol: String) {
