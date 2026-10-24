@@ -1487,7 +1487,7 @@ def fetch_mimo_balance(entry, cookie, timeout=6.0):
     if "serviceToken" not in header:
         raise BalanceError("Cookie 里缺少 api-platform_serviceToken")
     if "userId" not in header:
-        raise BalanceError("Cookie 里缺少 userId（控制台地址 ?userId=...）")
+        raise BalanceError("Cookie 里缺少 userId（Cookies 表里的 userId，或控制台地址 ?userId=...）")
     url = entry.get("url") or MIMO_BALANCE_URL
     data = _http_json(url, cookie=header, timeout=timeout,
                       auth_error="Cookie 已失效或缺少 userId，请重新登录后粘贴")

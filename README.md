@@ -83,11 +83,13 @@ chmod 600 ~/.tokenlensbar/secrets.json
 API Key 只用于推理，查不了余额。
 
 1. 浏览器登录 `https://platform.xiaomimimo.com/#/console/balance`
-2. 拿两个值：
-   - DevTools → Application → Storage → Cookies → `https://platform.xiaomimimo.com`，
-     复制 `api-platform_serviceToken` 的 Value
-   - 控制台地址栏里的 `?userId=2725...`，取那串数字
-3. 拼成 `api-platform_serviceToken=<Value>; userId=<数字>`，填进 `secrets.json` 的 `mimo_cookie`，
+2. DevTools（`⌥⌘I`）→ Application → Storage → Cookies → `https://platform.xiaomimimo.com`，
+   在表里复制这两行的 **Value**：
+   - `api-platform_serviceToken`
+   - `userId`
+
+   如果表里没看到 `userId`，就用控制台地址栏 `?userId=` 后面的数字。
+3. 拼成 `api-platform_serviceToken=<Value>; userId=<Value>`，填进 `secrets.json` 的 `mimo_cookie`，
    把 `balances.json` 里 mimo 的 `enabled` 改成 `true`
 4. 点面板「立即采集」，或 `python3 ~/.tokenlensbar/tokenlensbar.py balance --refresh`
 
@@ -99,7 +101,7 @@ API Key 只用于推理，查不了余额。
 
 注意：
 
-- `userId` 不一定在 Cookie 列表里，它在控制台地址的 `?userId=` 后面；服务端要它，少一个就是 401。
+- 这两个值缺一个都会 401；`userId` 通常在 Cookies 表里也有，没有就取地址栏 `?userId=`。
 - Cookie 是整账号会话，权限比单个 API Key 大；只存这两个值，别提交到 git。
 - 过期后接口返回 401，面板显示 `Xiaomi MiMo: —`，鼠标悬停会提示「Cookie 已失效」，重新粘一次即可。
 - 这是控制台内部接口，小米改版就可能失效；失效时把 `enabled` 改成 `false` 即可，不影响 token 统计。
