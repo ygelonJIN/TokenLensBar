@@ -44,7 +44,10 @@ def home(*parts):
     return Path(os.path.expanduser("~")).joinpath(*parts)
 
 
-DEFAULT_OFF_PEAK = {"timezone": "Asia/Shanghai", "windows": [["00:30", "08:30"]]}
+DEFAULT_OFF_PEAK = {"timezone": "Asia/Shanghai",
+                    "peak_windows": [["09:00", "12:00"], ["14:00", "18:00"]],
+                    "weekdays": [1, 2, 3, 4, 5],
+                    "holidays": []}
 RATE_KEYS = ("input_cache_hit", "input_cache_miss", "output", "cache_write")
 
 
@@ -170,9 +173,19 @@ def resolve_rate(model, ts, prices):
 
 
 def is_off_peak(ts, prices):
-    config = prices.get("off_peak") or {}
+    """这条请求发生时是不是空闲时段。
+
+    两种写法：
+      peak_windows  只给出「高峰」区间（工作日 + 时段），其余一律算空闲；
+                    配合 weekdays / holidays，周末和法定节假日全天都是空闲。
+      windows       老写法：直接给出「空闲」区间。
+
+    判定按事件自己的时间戳，所以历史账单不会因为"现在几点"而变。
+    """
+    config = (prices or {}).get("off_peak") or {}
+    peak_windows = config.get("peak_windows")
     windows = config.get("windows") or []
-    if not windows:
+    if peak_windows is None and not windows:
         return False
     try:
         zone = ZoneInfo(config.get("timezone") or "Asia/Shanghai")
@@ -180,6 +193,25 @@ def is_off_peak(ts, prices):
         return False
     local = datetime.fromtimestamp(ts, zone)
     minutes = local.hour * 60 + local.minute
+
+    if peak_windows is not None:
+        weekdays = config.get("weekdays") or [1, 2, 3, 4, 5]
+        holidays = set(config.get("holidays") or [])
+        if local.isoweekday() not in weekdays:
+            return True                                    # 周末
+        if local.strftime("%Y-%m-%d") in holidays:
+            return True                                    # 法定节假日
+        for window in peak_windows:
+            try:
+                start, end = _hhmm(window[0]), _hhmm(window[1])
+            except (ValueError, IndexError, TypeError):
+                continue
+            if start <= end and start <= minutes < end:
+                return False
+            if start > end and (minutes >= start or minutes < end):  # 跨午夜
+                return False
+        return True                                        # 工作日但不在高峰时段
+
     for window in windows:
         try:
             start, end = _hhmm(window[0]), _hhmm(window[1])
@@ -1183,33 +1215,33 @@ def status_json(db_path, prices=None):
         "windows": windows,
         "top_today": [
             {"model": name, "tokens": b["tokens"], "cost": round(b["cost"], 6)}
-            for name, b in sorted(today_models.items(), key=lambda kv: -kv[1]["tokens"])[:5]
+            for name, b in sorted(today_models.items(), key=lambda kv: -kv[1]["tokens"])
         ],
         # 面板「今日」页签用：今天真正用过的模型 / Agent，口径和「全部」一致
         "models_today": [
             {"model": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
              "share": round(b["tokens"] / today_total, 4),
              "subscription": name in subscription_models}
-            for name, b in sorted(today_models.items(), key=lambda kv: -kv[1]["tokens"])[:5]
+            for name, b in sorted(today_models.items(), key=lambda kv: -kv[1]["tokens"])
         ],
         "agents_today": [
             {"agent": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
              "share": round(b["tokens"] / today_total, 4),
              "subscription": agent_is_subscription(name)}
-            for name, b in sorted(today_agents.items(), key=lambda kv: -kv[1]["tokens"])[:5]
+            for name, b in sorted(today_agents.items(), key=lambda kv: -kv[1]["tokens"])
         ],
         "daily": daily_filled(items, 7),
         "models": [
             {"model": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
              "share": round(b["tokens"] / all_total, 4),
              "subscription": name in subscription_models}
-            for name, b in sorted(all_models.items(), key=lambda kv: -kv[1]["tokens"])[:6]
+            for name, b in sorted(all_models.items(), key=lambda kv: -kv[1]["tokens"])
         ],
         "agents": [
             {"agent": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
              "share": round(b["tokens"] / all_total, 4),
              "subscription": agent_is_subscription(name)}
-            for name, b in sorted(all_agents.items(), key=lambda kv: -kv[1]["tokens"])[:5]
+            for name, b in sorted(all_agents.items(), key=lambda kv: -kv[1]["tokens"])
         ],
         "cache_rate": round(min(1.0, week_cache / week_input) if week_input else 0.0, 4),
         "unpriced": unpriced,

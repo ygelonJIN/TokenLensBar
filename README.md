@@ -283,7 +283,12 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 {
   "currency": "CNY",
   "symbol": "¥",
-  "off_peak": { "timezone": "Asia/Shanghai", "windows": [["00:30", "08:30"]] },
+  "off_peak": {
+    "timezone": "Asia/Shanghai",
+    "peak_windows": [["09:00", "12:00"], ["14:00", "18:00"]],
+    "weekdays": [1, 2, 3, 4, 5],
+    "holidays": []
+  },
   "models": {
     "mimo-v2.6-pro": {
       "match": ["mimo-v2.6-pro"],
@@ -318,19 +323,31 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 ```
 每条事件：
     本地时间 = 该事件的时间戳 → Asia/Shanghai
-    若 00:30 ≤ HH:mm < 08:30  → 用 off_peak 价
-    否则                        → 用 peak 价
+    工作日（周一至周五）且不是法定节假日，且
+        09:00 ≤ HH:mm < 12:00  或  14:00 ≤ HH:mm < 18:00  → 用 peak 价
+    其余（午休、夜里、周末、节假日）                        → 用 off_peak 价
     成本 = 缓存命中 × hit价 + 未命中 × miss价 + 输出 × out价
 ```
+
+空闲价 = 高峰价的一半，所以价格表里只要把高峰价写在 `peak`、半价写在 `off_peak` 即可。
 
 一次遍历就算完，每条大约 **5 微秒**。当前 4,717 条事件，全量重算 **24.8 毫秒**。
 所以"点开就有数"是真的现算，不是预存的。
 
-窗口配置支持跨午夜、也支持多段（比如以后有第二个低谷时段）：
+工作日/时段/节假日都写在配置里，改完按事件时间重算，历史不会变：
 
 ```json
-"off_peak": { "timezone": "Asia/Shanghai", "windows": [["00:30", "08:30"]] }
+"off_peak": {
+  "timezone": "Asia/Shanghai",
+  "peak_windows": [["09:00", "12:00"], ["14:00", "18:00"]],
+  "weekdays": [1, 2, 3, 4, 5],
+  "holidays": ["2026-10-01", "2026-10-02"]
+}
 ```
+
+- `weekdays`：1=周一 … 7=周日。周末默认不进高峰时段。
+- `holidays`：中国法定节假日，写 `YYYY-MM-DD`，那一天全天按空闲价。国务院每年公布一次，年初补进去即可。
+- 老写法 `"windows": [["00:30", "08:30"]]` 仍然兼容（直接给空闲区间）。
 
 ## 四个容易做错的地方
 

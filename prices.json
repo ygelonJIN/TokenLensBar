@@ -1,17 +1,29 @@
 {
   "_unit": "每百万 tokens 的价格",
-  "_note": "match 是模型名匹配列表（不区分大小写，支持前缀/包含）。带 peak/off_peak 的按北京时间峰谷计价；只有扁平费率的直接写四个字段。",
+  "_note": "match 是模型名匹配列表（不区分大小写，支持前缀/包含）。峰值/空闲：工作日 09:00-12:00、14:00-18:00（北京时间）算高峰，其余时段、周末、法定节假日全天算空闲；空闲价 = 高峰价的一半。",
   "currency": "CNY",
   "symbol": "¥",
   "use_source_cost": false,
   "off_peak": {
     "timezone": "Asia/Shanghai",
-    "windows": [
+    "peak_windows": [
       [
-        "00:30",
-        "08:30"
+        "09:00",
+        "12:00"
+      ],
+      [
+        "14:00",
+        "18:00"
       ]
-    ]
+    ],
+    "weekdays": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "holidays": []
   },
   "models": {
     "mimo-v2.6-pro": {

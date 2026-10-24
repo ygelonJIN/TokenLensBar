@@ -111,6 +111,28 @@ def main():
     passed &= check("未定价模型进 unpriced 列表", "brand-new-model" in agg["unpriced"], True)
     passed &= check("未定价不影响 token 统计", agg["totals"]["total"], 1100)
 
+    # 8. 工作日峰时 / 周末全天空闲 / 节假日全天空闲
+    prices = tl.load_prices(write_prices({
+        "currency": "CNY", "symbol": "\u00a5",
+        "off_peak": {"timezone": "Asia/Shanghai",
+                     "peak_windows": [["09:00", "12:00"], ["14:00", "18:00"]],
+                     "weekdays": [1, 2, 3, 4, 5],
+                     "holidays": ["2026-11-03"]},
+        "models": {"m": {"match": ["m"],
+                         "peak": {"input_cache_hit": 0.04, "input_cache_miss": 2.0, "output": 8.0},
+                         "off_peak": {"input_cache_hit": 0.02, "input_cache_miss": 1.0, "output": 4.0}}},
+    }))
+
+    def unit(text):
+        return tl.event_cost(event("m", epoch(text), 1_000_000, 0, 0), prices)[0]
+
+    passed &= check("周一 10:00 走高峰价", unit("2026-11-02 10:00"), 2.0)
+    passed &= check("周一 15:00 走高峰价", unit("2026-11-02 15:00"), 2.0)
+    passed &= check("周一 12:30 午休走空闲价", unit("2026-11-02 12:30"), 1.0)
+    passed &= check("周一 08:59 还没到峰时", unit("2026-11-02 08:59"), 1.0)
+    passed &= check("周六全天空闲", unit("2026-10-24 10:00"), 1.0)
+    passed &= check("节假日全天空闲", unit("2026-11-03 10:00"), 1.0)
+
     # 6. 压缩流被截断时，前面解出来的部分仍然可用
     #    （DSH 是"追加帧"格式：最后一帧写了一半，前面几帧还是完整的）
     work = tempfile.mkdtemp()
