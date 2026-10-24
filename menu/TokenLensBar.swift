@@ -6,7 +6,7 @@ import Cocoa
 
 let kRefreshInterval: TimeInterval = 60
 let kDashboardPort = 8787
-let kPanelWidth: CGFloat = 372
+let kPanelWidth: CGFloat = 344
 let kFooterHeight: CGFloat = 42
 
 // MARK: - 取数
@@ -195,7 +195,7 @@ final class ChartView: NSView {
     private let pad: CGFloat = 14
     private let inset: CGFloat = 13
     private let rowHeight: CGFloat = 21
-    private let chartHeight: CGFloat = 104
+    private let chartHeight: CGFloat = 94
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
@@ -302,13 +302,13 @@ final class ChartView: NSView {
 
     private func drawHeadline(_ snap: Snapshot, today: Snapshot.Window?, symbol: String) {
         text("今日用量", NSPoint(x: pad, y: 7), size: 10, color: Palette.muted)
-        let tokenText = cn(today?.tokens ?? 0)
-        text(tokenText, NSPoint(x: pad - 1, y: 20), size: 23,
+        // 金额在左、Token 在右，同一个字号
+        let moneyText = money(today?.cost ?? 0, symbol)
+        text(moneyText, NSPoint(x: pad - 1, y: 20), size: 23,
              weight: .semibold, color: Palette.mint)
-        // 金额紧贴 token 右侧
-        text(money(today?.cost ?? 0, symbol),
-             NSPoint(x: pad - 1 + width(tokenText, size: 23, weight: .semibold) + 9, y: 24),
-             size: 19, weight: .semibold, color: Palette.mint)
+        text(cn(today?.tokens ?? 0),
+             NSPoint(x: pad - 1 + width(moneyText, size: 23, weight: .semibold) + 9, y: 20),
+             size: 23, weight: .semibold, color: Palette.mint)
         let rate = Int(((snap.cacheRate ?? 0) * 100).rounded())
         text("缓存命中 \(rate)% · \(today?.events ?? 0) 次请求",
              NSPoint(x: pad, y: 48), size: 9.5, color: Palette.muted)
@@ -348,21 +348,12 @@ final class ChartView: NSView {
         let days = snap.daily ?? []
         guard !days.isEmpty else { return }
 
-        let weekTitle = "近 7 天"
-        text(weekTitle, NSPoint(x: box.minX + inset, y: box.minY + 7), size: 9.5,
-             color: Palette.muted)
-        let week = snap.windows?["week"]
-        text(money(week?.cost ?? 0, symbol),
-             NSPoint(x: box.minX + inset + width(weekTitle, size: 9.5, weight: .regular) + 8,
-                     y: box.minY + 7),
-             size: 9.5, color: Palette.mint)
-
         let labelX = box.minX + inset
         let chartX = box.minX + 40
         let chartW = box.maxX - inset - chartX
         let slot = chartW / CGFloat(days.count)
-        let barsTop = box.minY + 22
-        let barsBottom = box.minY + 60
+        let barsTop = box.minY + 8
+        let barsBottom = box.minY + 52
         let maxValue = max(1, days.map { $0.tokens }.max() ?? 1)
 
         for (index, day) in days.enumerated() {
@@ -377,18 +368,18 @@ final class ChartView: NSView {
             let cellX = chartX + CGFloat(index) * slot
             let hasData = day.tokens > 0
             text(hasData ? cnTiny(day.tokens) : "—",
-                 NSPoint(x: cellX, y: box.minY + 62), size: 8,
+                 NSPoint(x: cellX, y: box.minY + 54), size: 8,
                  color: hasData ? Palette.text : Palette.muted, align: .center, width: slot)
             text(hasData ? costText(day.cost ?? 0, tokens: day.tokens, symbol) : "—",
-                 NSPoint(x: cellX, y: box.minY + 74), size: 8,
+                 NSPoint(x: cellX, y: box.minY + 66), size: 8,
                  color: hasData ? Palette.mint : Palette.muted, align: .center, width: slot)
-            text(shortDate(day.date), NSPoint(x: cellX, y: box.minY + 86), size: 7.5,
+            text(shortDate(day.date), NSPoint(x: cellX, y: box.minY + 78), size: 7.5,
                  color: Palette.muted, align: .center, width: slot)
         }
 
-        text("Token", NSPoint(x: labelX, y: box.minY + 62), size: 7.5, color: Palette.muted)
-        text("金额", NSPoint(x: labelX, y: box.minY + 74), size: 7.5, color: Palette.muted)
-        text("日期", NSPoint(x: labelX, y: box.minY + 86), size: 7.5, color: Palette.muted)
+        text("Token", NSPoint(x: labelX, y: box.minY + 54), size: 7.5, color: Palette.muted)
+        text("金额", NSPoint(x: labelX, y: box.minY + 66), size: 7.5, color: Palette.muted)
+        text("日期", NSPoint(x: labelX, y: box.minY + 78), size: 7.5, color: Palette.muted)
     }
 
     private func drawAllCard(_ box: NSRect, snap: Snapshot, symbol: String) {
@@ -399,12 +390,12 @@ final class ChartView: NSView {
         text(allTitle, NSPoint(x: box.minX + inset, y: box.minY + 12), size: 11,
              weight: .semibold)
         let titleWidth = width(allTitle, size: 11, weight: .semibold)
-        let totalText = cn(snap.allTokens ?? 0)
-        let totalX = box.minX + inset + titleWidth + 12
-        text(totalText, NSPoint(x: totalX, y: box.minY + 12), size: 11.5,
+        let moneyText = money(cost, symbol)
+        let moneyX = box.minX + inset + titleWidth + 12
+        text(moneyText, NSPoint(x: moneyX, y: box.minY + 12), size: 11.5,
              weight: .semibold, color: Palette.mint)
-        text(money(cost, symbol),
-             NSPoint(x: totalX + width(totalText, size: 11.5, weight: .semibold) + 8,
+        text(cn(snap.allTokens ?? 0),
+             NSPoint(x: moneyX + width(moneyText, size: 11.5, weight: .semibold) + 8,
                      y: box.minY + 12),
              size: 11.5, weight: .semibold, color: Palette.mint)
 

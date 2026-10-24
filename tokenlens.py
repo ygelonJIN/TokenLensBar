@@ -125,6 +125,8 @@ def load_prices(path=None):
         "currency": raw.get("currency") or "USD",
         "symbol": raw.get("symbol") or "$",
         "off_peak": raw.get("off_peak") or DEFAULT_OFF_PEAK,
+        # 这些 Agent 的记录只有"最后一次活动时间"，分不清峰谷 —— 一律按峰时算（宁高不低）
+        "peak_only_agents": [str(a).lower() for a in (raw.get("peak_only_agents") or [])],
         "models": {},
         "subscription": set(),
     }
@@ -235,7 +237,10 @@ def event_cost(event, prices):
         return 0.0, None
 
     rates = version["peak"]
-    if version["off_peak"] and is_off_peak(ts, prices):
+    agent = (event.get("agent") or "").lower()
+    peak_only = any(agent == name or agent.startswith(name)
+                    for name in (prices.get("peak_only_agents") or []))
+    if version["off_peak"] and not peak_only and is_off_peak(ts, prices):
         rates = version["off_peak"]
 
     cache_hit = float(event.get("cache_read") or 0)
@@ -882,6 +887,7 @@ def fetch_rows(db_path, since):
 def row_event(row):
     return {
         "ts": row[0],
+        "agent": row[1],
         "model": row[3],
         "input": row[4],
         "output": row[5],

@@ -111,6 +111,27 @@ def main():
     passed &= check("未定价模型进 unpriced 列表", "brand-new-model" in agg["unpriced"], True)
     passed &= check("未定价不影响 token 统计", agg["totals"]["total"], 1100)
 
+    # 9. 时间不准的来源整体按峰价（峰值 * 1，不走空闲价）
+    prices = tl.load_prices(write_prices({
+        "currency": "CNY", "symbol": "\u00a5",
+        "off_peak": {"timezone": "Asia/Shanghai",
+                     "peak_windows": [["09:00", "12:00"], ["14:00", "18:00"]],
+                     "weekdays": [1, 2, 3, 4, 5], "holidays": []},
+        "peak_only_agents": ["hermes"],
+        "models": {"m": {"match": ["m"],
+                         "peak": {"input_cache_hit": 0.04, "input_cache_miss": 2.0, "output": 8.0},
+                         "off_peak": {"input_cache_hit": 0.02, "input_cache_miss": 1.0, "output": 4.0}}},
+    }))
+
+    def by_agent(agent, text):
+        ev = event("m", epoch(text), 1_000_000, 0, 1_000_000)
+        ev["agent"] = agent
+        return tl.event_cost(ev, prices)[0]
+
+    passed &= check("周六 hermes 也按峰价", by_agent("hermes", "2026-10-24 10:00"), 2.0 + 8.0)
+    passed &= check("周六 hermes-pi 也按峰价", by_agent("hermes-pi", "2026-10-24 10:00"), 2.0 + 8.0)
+    passed &= check("同一时刻 codex 仍走空闲价", by_agent("codex", "2026-10-24 10:00"), 1.0 + 4.0)
+
     # 8. 工作日峰时 / 周末全天空闲 / 节假日全天空闲
     prices = tl.load_prices(write_prices({
         "currency": "CNY", "symbol": "\u00a5",
