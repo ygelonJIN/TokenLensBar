@@ -256,6 +256,12 @@ final class ChartView: NSView {
         NSAttributedString(string: string, attributes: attrs).draw(in: rect)
     }
 
+    private func width(_ string: String, size: CGFloat, weight: NSFont.Weight) -> CGFloat {
+        NSAttributedString(string: string, attributes: [
+            .font: NSFont.systemFont(ofSize: size, weight: weight),
+        ]).size().width
+    }
+
     private func card(_ rect: NSRect) {
         Palette.card.setFill()
         NSBezierPath(roundedRect: rect, xRadius: 11, yRadius: 11).fill()
@@ -296,11 +302,13 @@ final class ChartView: NSView {
 
     private func drawHeadline(_ snap: Snapshot, today: Snapshot.Window?, symbol: String) {
         text("今日用量", NSPoint(x: pad, y: 7), size: 10, color: Palette.muted)
-        text(cn(today?.tokens ?? 0), NSPoint(x: pad - 1, y: 20), size: 23,
+        let tokenText = cn(today?.tokens ?? 0)
+        text(tokenText, NSPoint(x: pad - 1, y: 20), size: 23,
              weight: .semibold, color: Palette.mint)
-        text(money(today?.cost ?? 0, symbol), NSPoint(x: 0, y: 23), size: 20,
-             weight: .semibold, color: Palette.mint, align: .right,
-             width: bounds.width - pad)
+        // 金额紧贴 token 右侧
+        text(money(today?.cost ?? 0, symbol),
+             NSPoint(x: pad - 1 + width(tokenText, size: 23, weight: .semibold) + 9, y: 24),
+             size: 19, weight: .semibold, color: Palette.mint)
         let rate = Int(((snap.cacheRate ?? 0) * 100).rounded())
         text("缓存命中 \(rate)% · \(today?.events ?? 0) 次请求",
              NSPoint(x: pad, y: 48), size: 9.5, color: Palette.muted)
@@ -340,12 +348,14 @@ final class ChartView: NSView {
         let days = snap.daily ?? []
         guard !days.isEmpty else { return }
 
-        text("近 7 天", NSPoint(x: box.minX + inset, y: box.minY + 7), size: 9.5,
+        let weekTitle = "近 7 天"
+        text(weekTitle, NSPoint(x: box.minX + inset, y: box.minY + 7), size: 9.5,
              color: Palette.muted)
         let week = snap.windows?["week"]
         text(money(week?.cost ?? 0, symbol),
-             NSPoint(x: box.maxX - inset - 70, y: box.minY + 7), size: 9.5,
-             color: Palette.mint, align: .right, width: 70)
+             NSPoint(x: box.minX + inset + width(weekTitle, size: 9.5, weight: .regular) + 8,
+                     y: box.minY + 7),
+             size: 9.5, color: Palette.mint)
 
         let labelX = box.minX + inset
         let chartX = box.minX + 40
@@ -385,13 +395,18 @@ final class ChartView: NSView {
         card(box)
         let cost = (snap.models ?? []).reduce(0.0) { $0 + $1.cost }
 
-        text("全部历史", NSPoint(x: box.minX + inset, y: box.minY + 12), size: 11,
+        let allTitle = "全部历史"
+        text(allTitle, NSPoint(x: box.minX + inset, y: box.minY + 12), size: 11,
              weight: .semibold)
-        text(money(cost, symbol), NSPoint(x: box.maxX - inset - 64, y: box.minY + 11),
-             size: 12, weight: .semibold, color: Palette.mint, align: .right, width: 64)
-        text(cn(snap.allTokens ?? 0),
-             NSPoint(x: box.maxX - inset - 64 - 86, y: box.minY + 11),
-             size: 12, weight: .semibold, color: Palette.mint, align: .right, width: 84)
+        let titleWidth = width(allTitle, size: 11, weight: .semibold)
+        let totalText = cn(snap.allTokens ?? 0)
+        let totalX = box.minX + inset + titleWidth + 12
+        text(totalText, NSPoint(x: totalX, y: box.minY + 12), size: 11.5,
+             weight: .semibold, color: Palette.mint)
+        text(money(cost, symbol),
+             NSPoint(x: totalX + width(totalText, size: 11.5, weight: .semibold) + 8,
+                     y: box.minY + 12),
+             size: 11.5, weight: .semibold, color: Palette.mint)
 
         var y = box.minY + 38
         sectionLabel("按模型", NSPoint(x: box.minX + inset, y: y))
