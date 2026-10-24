@@ -282,9 +282,7 @@ final class PanelModel: ObservableObject {
                 self.snapshot = snap
                 self.loadFailed = (snap == nil)
                 self.lastLoaded = Date()
-                let stamp = DateFormatter()
-                stamp.dateFormat = "HH:mm"
-                self.status = "已采集 " + stamp.string(from: Date())
+                self.status = "已采集"
                 self.clearItem?.cancel()
                 let item = DispatchWorkItem { [weak self] in
                     if self?.status.hasPrefix("已采集") == true { self?.status = "" }
@@ -299,7 +297,14 @@ final class PanelModel: ObservableObject {
         status = "正在打开看板…"
         bridge.openDashboard()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            self?.status = "看板 127.0.0.1:8787"
+            guard let self else { return }
+            self.status = "看板已打开"
+            self.clearItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                if self?.status == "看板已打开" { self?.status = "" }
+            }
+            self.clearItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: item)
         }
     }
 
@@ -360,11 +365,31 @@ struct PanelView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text("TokenLensBar").font(.headline)
-            Text("本地 token 用量")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("TokenLensBar").font(.headline)
+                Text("本地 token 用量")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            // 采集状态和更新时间放右上角，不再占底部按钮的位置。
+            VStack(alignment: .trailing, spacing: 1) {
+                if !model.status.isEmpty {
+                    Text(model.status)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if let loaded = model.lastLoaded {
+                    HStack(spacing: 3) {
+                        Text("更新")
+                        Text(loaded, style: .time)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
@@ -421,24 +446,7 @@ struct PanelView: View {
             }
             .padding(.horizontal, 12)
             .padding(.top, 6)
-
-            HStack(spacing: 8) {
-                Text(model.status)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer()
-                if let loaded = model.lastLoaded {
-                    HStack(spacing: 3) {
-                        Text("更新")
-                        Text(loaded, style: .time)
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
+            .padding(.bottom, 8)
         }
         .background(.bar)
     }
