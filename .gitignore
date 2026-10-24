@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# 构建产物（build.sh 会重新生成）
+TokenLensBar.app/
+menu/GeneratedConfig.swift
+.build/
+
+# 数据库与运行数据（不进版本库）
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

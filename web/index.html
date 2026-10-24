@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tokenlens · 本地用量看板</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2230;
+    --line: #262d3a;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #38d39f;
+    --accent-2: #7c8cff;
+    --warn: #f0b429;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 28px 60px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro SC", "PingFang SC", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-bottom: 28px; }
+  h1 { font-size: 19px; font-weight: 600; margin: 0; letter-spacing: .2px; }
+  h1 span { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 10px; }
+  .tabs { display: flex; gap: 6px; }
+  .tabs button {
+    background: var(--panel); color: var(--muted); border: 1px solid var(--line);
+    border-radius: 7px; padding: 5px 13px; font-size: 13px; cursor: pointer;
+    transition: all .15s;
+  }
+  .tabs button:hover { color: var(--text); border-color: #39445a; }
+  .tabs button.on { background: var(--accent); color: #06231a; border-color: var(--accent); font-weight: 600; }
+
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 26px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 15px 17px; }
+  .card .k { color: var(--muted); font-size: 12px; margin-bottom: 7px; letter-spacing: .3px; }
+  .card .v { font-size: 25px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.5px; }
+  .card .v small { font-size: 13px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-top: 5px; }
+
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; margin-bottom: 18px; }
+  section h2 { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+  section .hint { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
+
+  .chart { display: flex; align-items: flex-end; gap: 3px; height: 132px; padding-top: 8px; }
+  .chart .bar { flex: 1; min-width: 2px; position: relative; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
+  .chart .bar i { display: block; background: linear-gradient(180deg, var(--accent), #1d7f63); border-radius: 2px 2px 0 0; min-height: 2px; transition: opacity .12s; }
+  .chart .bar:hover i { opacity: .65; }
+  .chart .bar:hover::after {
+    content: attr(data-tip); position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+    background: #0b0f16; border: 1px solid var(--line); color: var(--text);
+    padding: 4px 9px; border-radius: 6px; font-size: 11px; white-space: nowrap; z-index: 5;
+  }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th { text-align: right; font-weight: 500; color: var(--muted); font-size: 12px; padding: 0 10px 9px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  td { text-align: right; padding: 9px 10px; border-bottom: 1px solid #1b2029; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: #1a2029; }
+
+  .name { color: var(--text); font-weight: 500; }
+  .agents { color: var(--muted); font-size: 11px; margin-left: 8px; }
+  .share { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+  .share .track { width: 62px; height: 5px; background: #222a36; border-radius: 3px; overflow: hidden; }
+  .share .fill { height: 100%; background: var(--accent-2); border-radius: 3px; }
+  .cost { color: var(--accent); }
+
+  .warn { background: rgba(240,180,41,.09); border: 1px solid rgba(240,180,41,.35); color: var(--warn);
+          border-radius: 10px; padding: 12px 16px; font-size: 13px; margin-bottom: 18px; }
+  .warn b { font-weight: 600; }
+
+  footer { color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+  .empty { text-align: center; color: var(--muted); padding: 60px 0; }
+  tbody tr.dim td { color: var(--muted); }
+  tbody tr.dim td .cost { color: #6f8f83; }
+  @media (max-width: 860px) { .cards { grid-template-columns: repeat(2, 1fr); } body { padding: 20px 14px 40px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>tokenlens <span>本地 token 用量 · 不联网 · 不读 API Key</span></h1>
+    <div class="tabs" id="tabs">
+      <button data-days="7">7 天</button>
+      <button data-days="30" class="on">30 天</button>
+      <button data-days="90">90 天</button>
+      <button data-days="3650">全部</button>
+    </div>
+  </header>
+
+  <div id="content">
+    <div class="empty">加载中…</div>
+  </div>
+
+  <footer>
+    <span id="src"></span>
+    <span id="stamp"></span>
+  </footer>
+</div>
+
+<script>
+const fmt = (n) => {
+  if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿';
+  if (n >= 1e4) return (n / 1e4).toFixed(1) + '万';
+  return String(Math.round(n));
+};
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+let current = 30;
+
+async function load(days) {
+  current = days;
+  const res = await fetch('/api/summary?days=' + days);
+  const d = await res.json();
+  render(d);
+}
+
+function render(d) {
+  const box = document.getElementById('content');
+  if (!d.ok) {
+    box.innerHTML = '<div class="empty">还没有数据。先运行 <code>python3 tokenlens.py scan</code></div>';
+    return;
+  }
+
+  const t = d.totals;
+  const hitRate = t.input ? (t.cache_read / t.input * 100) : 0;
+  const sym = d.symbol;
+
+  const cars = `
+    <div class="cards">
+      <div class="card">
+        <div class="k">总 TOKEN</div>
+        <div class="v">${fmt(t.tokens)}</div>
+        <div class="sub">${t.events.toLocaleString()} 次请求</div>
+      </div>
+      <div class="card">
+        <div class="k">成本</div>
+        <div class="v">${sym}${t.cost.toFixed(2)}</div>
+        <div class="sub">${d.priced ? '按本地单价表' : '未配置单价表'}</div>
+      </div>
+      <div class="card">
+        <div class="k">缓存命中率</div>
+        <div class="v">${hitRate.toFixed(1)}<small>%</small></div>
+        <div class="sub">命中 ${fmt(t.cache_read)} / 输入 ${fmt(t.input)}</div>
+      </div>
+      <div class="card">
+        <div class="k">输出</div>
+        <div class="v">${fmt(t.output)}</div>
+        <div class="sub">输入 ${fmt(t.input)}</div>
+      </div>
+    </div>`;
+
+  const warn = d.unpriced && d.unpriced.length ? `
+    <div class="warn">
+      <b>未定价模型：</b>${d.unpriced.map(esc).join('、')}
+      —— token 已计入总量，但成本算不出来。补到 <code>~/.tokenlens/prices.json</code> 即可。
+    </div>` : '';
+
+  const daily = d.daily || [];
+  const maxDay = Math.max(1, ...daily.map(x => x.tokens));
+  const chart = `
+    <section>
+      <h2>每日用量</h2>
+      <div class="hint">共 ${daily.length} 天有记录，峰值 ${fmt(maxDay)} tokens/天</div>
+      <div class="chart">
+        ${daily.map(x => `<div class="bar" data-tip="${x.date} · ${fmt(x.tokens)} · ${x.count} 次">
+             <i style="height:${Math.max(2, x.tokens / maxDay * 100)}%"></i>
+           </div>`).join('')}
+      </div>
+    </section>`;
+
+  const grand = t.tokens || 1;
+  const modelRows = d.models.map(m => `
+    <tr>
+      <td><span class="name">${esc(m.model)}</span><span class="agents">${m.agents.map(esc).join(' · ')}</span></td>
+      <td>${fmt(m.tokens)}</td>
+      <td>${fmt(m.input)}</td>
+      <td>${fmt(m.output)}</td>
+      <td>${fmt(m.cache_read)}</td>
+      <td>${m.events.toLocaleString()}</td>
+      <td class="cost">${sym}${m.cost.toFixed(2)}</td>
+      <td><div class="share"><div class="track"><div class="fill" style="width:${(m.tokens / grand * 100).toFixed(1)}%"></div></div><span>${(m.tokens / grand * 100).toFixed(1)}%</span></div></td>
+    </tr>`).join('');
+
+  const models = `
+    <section>
+      <h2>按模型</h2>
+      <div class="hint">模型名来自各 Agent 自己的日志，代号变了会自动出现新行</div>
+      <table>
+        <thead><tr><th>模型 / 出现在</th><th>总量</th><th>输入</th><th>输出</th><th>缓存命中</th><th>次数</th><th>成本</th><th>占比</th></tr></thead>
+        <tbody>${modelRows}</tbody>
+      </table>
+    </section>`;
+
+  const agentRows = d.agents.map(a => `
+    <tr>
+      <td><span class="name">${esc(a.agent)}</span></td>
+      <td>${fmt(a.total)}</td>
+      <td>${fmt(a.input)}</td>
+      <td>${fmt(a.output)}</td>
+      <td>${a.count.toLocaleString()}</td>
+      <td class="cost">${sym}${a.cost.toFixed(2)}</td>
+    </tr>`).join('');
+
+  const agents = `
+    <section>
+      <h2>按 Agent</h2>
+      <div class="hint">同一个 Agent 会切不同厂商和模型，所以这里只回答"哪个工具用的多"</div>
+      <table>
+        <thead><tr><th>Agent</th><th>总量</th><th>输入</th><th>输出</th><th>次数</th><th>成本</th></tr></thead>
+        <tbody>${agentRows}</tbody>
+      </table>
+    </section>`;
+
+  const matrixRows = (d.matrix || []).map(m => `
+    <tr>
+      <td><span class="name">${esc(m.agent)}</span></td>
+      <td style="text-align:left"><span class="name">${esc(m.model)}</span></td>
+      <td>${fmt(m.total)}</td>
+      <td>${fmt(m.input)}</td>
+      <td>${fmt(m.output)}</td>
+      <td>${m.count.toLocaleString()}</td>
+      <td class="cost">${sym}${m.cost.toFixed(2)}</td>
+    </tr>`).join('');
+
+  const matrix = `
+    <section>
+      <h2>Agent × 模型</h2>
+      <div class="hint">同时回答"哪个 Agent 用了哪个模型、各用了多少"</div>
+      <table>
+        <thead><tr><th>Agent</th><th style="text-align:left">模型</th><th>总量</th><th>输入</th><th>输出</th><th>次数</th><th>成本</th></tr></thead>
+        <tbody>${matrixRows}</tbody>
+      </table>
+    </section>`;
+
+  const outside = d.outside || [];
+  const outsideBlock = outside.length ? `
+    <section>
+      <h2>窗口外还有</h2>
+      <div class="hint">这些 Agent × 模型 在最近 ${d.days} 天没有新记录，但历史数据仍在库里 —— 切到「全部」看完整报表</div>
+      <table>
+        <thead><tr><th>Agent</th><th style="text-align:left">模型</th><th>历史总量</th><th>成本</th><th>最后使用</th></tr></thead>
+        <tbody>
+          ${outside.map(o => `
+            <tr class="dim">
+              <td>${esc(o.agent)}</td>
+              <td style="text-align:left">${esc(o.model)}</td>
+              <td>${fmt(o.tokens)}</td>
+              <td class="cost">${sym}${o.cost.toFixed(2)}</td>
+              <td>${new Date(o.last * 1000).toLocaleDateString('zh-CN')}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </section>` : '';
+
+  box.innerHTML = cars + warn + chart + models + agents + matrix + outsideBlock;
+
+  document.getElementById('src').textContent =
+    '数据源：' + d.sources.map(s => `${s.agent}(${s.files})`).join('  ') + ' · 本机 SQLite';
+  document.getElementById('stamp').textContent =
+    '窗口 ' + d.days + ' 天 · ' + new Date().toLocaleString('zh-CN');
+}
+
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.remove('on'));
+  btn.classList.add('on');
+  load(Number(btn.dataset.days));
+});
+
+load(current);
+</script>
+</body>
+</html>
