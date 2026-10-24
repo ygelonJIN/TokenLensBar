@@ -1,10 +1,12 @@
 # tokenlens
 
-纯本地、零 API Key、零网络请求的 token 用量监控。采集器 ~900 行 Python（只用标准库）+ 原生菜单栏 App + 本地看板。
+纯本地、零网络的 token 用量监控（余额查询是可选功能）。采集器 ~900 行 Python（只用标准库）+ 原生菜单栏 App + 本地看板。
 
 菜单栏点开是图表（近 7 天每天带 token 和金额、全部历史按模型/按 Agent）：
 
 ![面板](docs/panel.png)
+
+（面板截图里的余额数字是示例；填入 Key 后会显示真实余额。）
 
 完整看板在浏览器里：
 
@@ -26,6 +28,8 @@ python3 tokenlens.py serve          # 浏览器看板 http://127.0.0.1:8787
 | 看板页面 | `~/.tokenlens/web/index.html` |
 | 数据 | `~/.tokenlens/usage.db` |
 | 单价表 | `~/.tokenlens/prices.json` |
+| 余额配置 | `~/.tokenlens/balances.json`（可选） |
+| 余额 Key | `~/.tokenlens/secrets.json`（可选，权限 600） |
 | 每 5 分钟采集 | `~/Library/LaunchAgents/com.tokenlens.scan.plist` |
 | 登录自启 | `~/Library/LaunchAgents/com.tokenlens.bar.plist` |
 | App 启动日志 | `~/.tokenlens/bar.log` |
@@ -48,6 +52,39 @@ launchctl kickstart gui/$(id -u)/com.tokenlens.scan     # 立刻采集一次
 
 图标是 `—` 或 `!` 时看 `~/.tokenlens/bar.log`：`statusItem=ok` 表示状态栏挂上了，
 `取数失败` 表示调 Python 出了问题（先跑 `python3 ~/.tokenlens/tokenlens.py status` 验证）。
+
+## 账户余额（可选）
+
+默认不联网。开启后菜单栏面板会多一张「账户余额」卡片，目前支持 DeepSeek。
+
+安装时已经生成 `~/.tokenlens/balances.json`（DeepSeek 已启用）。填入 Key 即可：
+
+安装时已经生成 `~/.tokenlens/secrets.json`（权限 600），直接编辑它：
+
+```bash
+# 文件不存在时才需要这行：
+# cp ~/.tokenlens/secrets.example.json ~/.tokenlens/secrets.json
+
+# 编辑 ~/.tokenlens/secrets.json：
+# {"deepseek": "sk-你的完整Key"}
+
+chmod 600 ~/.tokenlens/secrets.json
+```
+
+然后在面板里点「立即采集」，或直接刷新：
+
+```bash
+python3 ~/.tokenlens/tokenlens.py balance --refresh
+```
+
+说明：
+
+- Key 是**整串**，通常 `sk-` 开头；不用拆前后缀，不需要账号密码。代码会自己加 `Bearer`。
+- 只 GET `https://api.deepseek.com/user/balance`，不发送本地用量；查询余额不消耗 token。
+- Key 有调用 API 的权限，不是只读的。建议在 DeepSeek 控制台单独建一个 `tokenlens` Key，不用了直接删。
+- 余额缓存 10 分钟；面板每 60 秒读缓存，不会因为网络卡住。失败时保留上次余额并标「更新失败」。
+- 不想要余额：把 `balances.json` 里的 `enabled` 改成 `false`，或删掉这个文件；之后就完全不发请求。
+- 目前只内置 DeepSeek。Kimi、OpenRouter 等 Bearer 余额接口可以按同样的 adapter 结构扩展；小米 MiMo 的 Token Plan 额度目前更像控制台 Cookie 接口，不稳定，暂不内置。
 
 ## 它是怎么工作的
 
@@ -371,6 +408,8 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 - **菜单栏只读**。采集由 launchd 每 5 分钟跑一次；App 关掉不影响数据。
 - **构建缓存不能放外置盘**。仓库在外置 exFAT 卷上，`swiftc` 的 module cache 放这里会 SIGTRAP，
   `build.sh` 已固定到 `/tmp/tokenlens-modcache`。移动仓库后重跑 `./build.sh`。
+- **余额接口因厂商而异**。DeepSeek 有官方余额接口；Kimi/OpenRouter 等可以扩展 adapter；
+  小米 MiMo 的 Token Plan 额度目前更像控制台 Cookie 接口，不稳定且有安全风险，暂不内置。
 
 ## 文件
 
@@ -382,8 +421,11 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 | [build.sh](build.sh) | 构建 App |
 | [install.sh](install.sh) | 一条命令安装（运行时 + App + 两个 LaunchAgent） |
 | [tests/test_pricing.py](tests/test_pricing.py) | 定价回归测试 |
+| [tests/test_balance.py](tests/test_balance.py) | 余额缓存/解析/错误处理回归测试 |
 | [prices.json](prices.json) | 单价表模板（已填你的价格，安装时复制到 `~/.tokenlens/`） |
 | [prices.example.json](prices.example.json) | 三种写法的结构示例 |
+| [balances.example.json](balances.example.json) | 余额 provider 配置模板 |
+| [secrets.example.json](secrets.example.json) | 余额 Key 文件模板（填好后另存为 `secrets.json`） |
 | [assets/](assets/) | App 图标源文件、`.icns`、4 个候选样式 |
 | [docs/panel.png](docs/panel.png) | 菜单栏面板效果图 |
 | [docs/panel-buttons.png](docs/panel-buttons.png) | 底部按钮三态（常态 / 悬停 / 按下） |

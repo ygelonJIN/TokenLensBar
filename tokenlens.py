@@ -26,12 +26,18 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
 DEFAULT_DB = Path(os.environ.get("TOKENLENS_DB", "~/.tokenlens/usage.db")).expanduser()
 PRICES_PATH = Path(os.environ.get("TOKENLENS_PRICES", "~/.tokenlens/prices.json")).expanduser()
+BALANCES_PATH = Path(os.environ.get("TOKENLENS_BALANCES", "~/.tokenlens/balances.json")).expanduser()
+SECRETS_PATH = Path(os.environ.get("TOKENLENS_SECRETS", "~/.tokenlens/secrets.json")).expanduser()
+DEEPSEEK_BALANCE_URL = os.environ.get(
+    "TOKENLENS_DEEPSEEK_BALANCE_URL", "https://api.deepseek.com/user/balance")
 
 MTOK = 1_000_000.0
 
@@ -729,6 +735,22 @@ CREATE TABLE IF NOT EXISTS files (
     offset INTEGER DEFAULT 0,
     events INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS balances (
+    provider   TEXT NOT NULL,
+    currency   TEXT NOT NULL,
+    total      REAL NOT NULL DEFAULT 0,
+    granted    REAL,
+    topped_up  REAL,
+    available  INTEGER NOT NULL DEFAULT 1,
+    fetched_at REAL NOT NULL,
+    PRIMARY KEY (provider, currency)
+);
+CREATE TABLE IF NOT EXISTS balance_state (
+    provider     TEXT PRIMARY KEY,
+    last_attempt REAL,
+    last_success REAL,
+    error        TEXT
+);
 """
 
 
@@ -769,7 +791,7 @@ def insert_event(con, event, origin):
     ))
 
 
-def scan(db_path, verbose=False):
+def scan(db_path, verbose=False, force_balance=False):
     con = connect(db_path)
     stats = {}
     for adapter in ADAPTERS:
@@ -836,6 +858,12 @@ def scan(db_path, verbose=False):
         con.commit()
         stats[adapter.name] = (found, parsed, inserted)
     con.close()
+    # 余额是可选功能；配置缺失时这里会立刻返回，不发请求。
+    try:
+        refresh_balances(db_path, force=force_balance, verbose=verbose)
+    except Exception:
+        if verbose:
+            print("  ! 余额刷新异常，保留上次缓存")
     return stats
 
 
@@ -1214,6 +1242,12 @@ def status_json(db_path, prices=None):
     week_input = sum(item["input"] for item in items if item["ts"] >= week_start)
     week_cache = sum(item["cache_read"] for item in items if item["ts"] >= week_start)
 
+    try:
+        balances = balance_payload(db_path)
+    except Exception:
+        balances = {"configured": False, "refresh_seconds": 600,
+                    "providers": [], "error": "余额读取失败"}
+
     return {
         "ok": True,
         "symbol": symbol,
@@ -1255,6 +1289,7 @@ def status_json(db_path, prices=None):
         "all_events": len(items),
         "last_event": rows[-1][0],
         "priced": bool(prices),
+        "balances": balances,
     }
 
 
@@ -1277,6 +1312,286 @@ def status(db_path, days_list=(1, 7, 30)):
         })
     _ = symbol
     return out
+
+
+# --------------------------------------------------------------------------
+# 账户余额（可选）
+# --------------------------------------------------------------------------
+#
+# 默认不联网：只有 balances.json 里启用 provider，并且 secrets.json 里有 Key，
+# 才会在 scan 时请求对应厂商的余额接口。status --json 只读缓存，不碰网络。
+
+class BalanceError(Exception):
+    pass
+
+
+def _is_placeholder_key(value):
+    text = str(value or "").strip()
+    upper = text.upper()
+    return (not text or upper.startswith("PASTE_") or "YOUR_" in upper
+            or upper.startswith("SK-在这里") or "换成" in upper)
+
+
+def load_balances_config(path=None):
+    path = Path(path or BALANCES_PATH)
+    if not path.exists():
+        return {"configured": False, "refresh_seconds": 600,
+                "providers": [], "error": None}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"configured": False, "refresh_seconds": 600,
+                "providers": [], "error": "balances.json 读取失败"}
+    if not isinstance(raw, dict):
+        return {"configured": False, "refresh_seconds": 600,
+                "providers": [], "error": "balances.json 格式不对"}
+    try:
+        refresh = int(raw.get("refresh_seconds") or 600)
+    except (TypeError, ValueError):
+        refresh = 600
+    refresh = max(60, min(refresh, 86400))
+    providers = []
+    for entry in raw.get("providers") or []:
+        if not isinstance(entry, dict) or entry.get("enabled") is False:
+            continue
+        ptype = str(entry.get("type") or entry.get("id") or "").strip()
+        pid = str(entry.get("id") or ptype).strip()
+        if not pid or not ptype:
+            continue
+        default_name = "DeepSeek" if ptype == "deepseek" else pid
+        providers.append({
+            "id": pid,
+            "type": ptype,
+            "name": str(entry.get("name") or default_name),
+            "url": str(entry.get("url") or "").strip(),
+        })
+    return {"configured": bool(providers), "refresh_seconds": refresh,
+            "providers": providers, "error": None}
+
+
+def load_secrets(path=None):
+    path = Path(path or SECRETS_PATH)
+    if not path.exists():
+        return {}, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, "secrets.json 读取失败"
+    if not isinstance(data, dict):
+        return {}, "secrets.json 格式不对"
+    out = {}
+    for name, value in data.items():
+        if isinstance(value, str) and not _is_placeholder_key(value):
+            out[str(name)] = value.strip()
+    return out, None
+
+
+def _balance_number(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _http_json(url, key, timeout=6.0):
+    request = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + key,
+        "Accept": "application/json",
+        "User-Agent": "tokenlens/1.0",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(2_000_000)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise BalanceError("Key 无效或没有权限")
+        if exc.code == 429:
+            raise BalanceError("请求过于频繁")
+        raise BalanceError("HTTP %s" % exc.code)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        text = str(reason).lower()
+        if isinstance(reason, TimeoutError) or "timed out" in text or "timeout" in text:
+            raise BalanceError("网络超时")
+        raise BalanceError("网络错误")
+    except TimeoutError:
+        raise BalanceError("网络超时")
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise BalanceError("返回格式异常")
+
+
+def fetch_deepseek_balance(entry, key, timeout=6.0):
+    url = entry.get("url") or DEEPSEEK_BALANCE_URL
+    data = _http_json(url, key, timeout=timeout)
+    if not isinstance(data, dict):
+        raise BalanceError("返回格式异常")
+    infos = data.get("balance_infos")
+    if not isinstance(infos, list):
+        raise BalanceError("返回里没有 balance_infos")
+    available = bool(data.get("is_available", True))
+    if not infos:
+        # 没有余额时有的账号会返回空数组；按 0 元处理，而不是当成解析失败。
+        return [{"currency": "CNY", "total": 0.0, "granted": None,
+                 "topped_up": None, "available": available}]
+    items = []
+    for info in infos:
+        if not isinstance(info, dict):
+            continue
+        total = _balance_number(info.get("total_balance"))
+        if total is None:
+            continue
+        currency = str(info.get("currency") or "CNY").strip().upper()
+        items.append({
+            "currency": currency,
+            "total": total,
+            "granted": _balance_number(info.get("granted_balance")),
+            "topped_up": _balance_number(info.get("topped_up_balance")),
+            "available": available,
+        })
+    if not items:
+        raise BalanceError("返回里没有余额数据")
+    return items
+
+
+def _provider_key(secrets, entry):
+    key = secrets.get(entry["id"])
+    if not key and entry["type"] == "deepseek":
+        key = os.environ.get("DEEPSEEK_API_KEY")
+    return (key or "").strip()
+
+
+def refresh_balances(db_path, force=False, verbose=False, config_path=None,
+                     secrets_path=None, fetcher=None, now=None):
+    """按需刷新余额。配置缺失/没 Key 时只写错误状态，不发请求。"""
+    config = load_balances_config(config_path)
+    result = {"configured": config["configured"], "refreshed": [],
+              "skipped": [], "errors": []}
+    if not config["configured"]:
+        return result
+
+    secrets, secret_error = load_secrets(secrets_path)
+    con = connect(db_path)
+    now = time.time() if now is None else now
+    for entry in config["providers"]:
+        provider = entry["id"]
+        state = con.execute(
+            "select last_attempt, last_success, error from balance_state where provider=?",
+            (provider,)).fetchone()
+        last_attempt = (state[0] or 0) if state else 0
+        last_success = state[1] if state else None
+        if not force and last_attempt and now - last_attempt < config["refresh_seconds"]:
+            result["skipped"].append(provider)
+            continue
+
+        key = _provider_key(secrets, entry)
+        if not key:
+            message = secret_error or "未配置 Key"
+            con.execute(
+                "insert or replace into balance_state"
+                " (provider, last_attempt, last_success, error) values (?,?,?,?)",
+                (provider, now, last_success, message))
+            con.commit()
+            result["errors"].append((provider, message))
+            if verbose:
+                print("  ! %s 余额：%s" % (entry["name"], message))
+            continue
+
+        try:
+            if fetcher is not None:
+                items = fetcher(entry, key)
+            elif entry["type"] == "deepseek":
+                items = fetch_deepseek_balance(entry, key)
+            else:
+                raise BalanceError("暂不支持 %s" % entry["type"])
+            if not items:
+                raise BalanceError("没有返回余额")
+        except BalanceError as exc:
+            message = str(exc)
+            con.execute(
+                "insert or replace into balance_state"
+                " (provider, last_attempt, last_success, error) values (?,?,?,?)",
+                (provider, now, last_success, message))
+            con.commit()
+            result["errors"].append((provider, message))
+            if verbose:
+                print("  ! %s 余额：%s" % (entry["name"], message))
+            continue
+        except Exception:
+            message = "刷新异常"
+            con.execute(
+                "insert or replace into balance_state"
+                " (provider, last_attempt, last_success, error) values (?,?,?,?)",
+                (provider, now, last_success, message))
+            con.commit()
+            result["errors"].append((provider, message))
+            if verbose:
+                print("  ! %s 余额：刷新异常" % entry["name"])
+            continue
+
+        con.execute("delete from balances where provider=?", (provider,))
+        for item in items:
+            con.execute(
+                "insert or replace into balances"
+                " (provider, currency, total, granted, topped_up, available, fetched_at)"
+                " values (?,?,?,?,?,?,?)",
+                (provider, item.get("currency") or "CNY", float(item.get("total") or 0),
+                 item.get("granted"), item.get("topped_up"),
+                 1 if item.get("available", True) else 0, now))
+        con.execute(
+            "insert or replace into balance_state"
+            " (provider, last_attempt, last_success, error) values (?,?,?,?)",
+            (provider, now, now, None))
+        con.commit()
+        result["refreshed"].append(provider)
+        if verbose:
+            print("  ✓ %s 余额已更新" % entry["name"])
+    con.close()
+    return result
+
+
+def balance_payload(db_path, config_path=None, now=None):
+    """给菜单栏用的余额缓存。只读 SQLite，不发网络请求。"""
+    config = load_balances_config(config_path)
+    if not config["configured"]:
+        return {"configured": False, "refresh_seconds": config["refresh_seconds"],
+                "providers": []}
+    con = connect(db_path)
+    now = time.time() if now is None else now
+    providers = []
+    for entry in config["providers"]:
+        rows = con.execute(
+            "select currency, total, granted, topped_up, available, fetched_at"
+            " from balances where provider=? order by currency", (entry["id"],)).fetchall()
+        state = con.execute(
+            "select last_attempt, last_success, error from balance_state where provider=?",
+            (entry["id"],)).fetchone()
+        fetched_at = max((row[5] for row in rows), default=None)
+        if fetched_at is None and state:
+            fetched_at = state[1]
+        error = state[2] if state else None
+        providers.append({
+            "id": entry["id"],
+            "name": entry["name"],
+            "type": entry["type"],
+            "items": [{
+                "currency": row[0],
+                "total": row[1],
+                "granted": row[2],
+                "topped_up": row[3],
+                "available": bool(row[4]),
+            } for row in rows],
+            "fetched_at": fetched_at,
+            "last_attempt": state[0] if state else None,
+            "error": error,
+            "stale": bool(fetched_at and now - fetched_at > config["refresh_seconds"] * 2),
+        })
+    con.close()
+    return {"configured": True, "refresh_seconds": config["refresh_seconds"],
+            "providers": providers}
 
 
 # --------------------------------------------------------------------------
@@ -1584,6 +1899,8 @@ def main(argv=None):
 
     scan_parser = sub.add_parser("scan", help="采集一次")
     scan_parser.add_argument("-v", "--verbose", action="store_true")
+    scan_parser.add_argument("--force-balance", action="store_true",
+                             help="忽略余额缓存间隔，立即刷新余额")
 
     report_parser = sub.add_parser("report", help="看报表")
     report_parser.add_argument("--days", type=int, default=7, help="0 = 全部历史")
@@ -1603,13 +1920,17 @@ def main(argv=None):
     status_parser = sub.add_parser("status", help="一行式摘要")
     status_parser.add_argument("--json", action="store_true")
 
+    balance_parser = sub.add_parser("balance", help="查看账户余额")
+    balance_parser.add_argument("--refresh", action="store_true", help="立即请求余额接口")
+    balance_parser.add_argument("--json", action="store_true")
+
     serve_parser = sub.add_parser("serve", help="启动本地看板")
     serve_parser.add_argument("--port", type=int, default=8787)
     serve_parser.add_argument("--no-browser", action="store_true")
 
     args = parser.parse_args(argv)
     if args.command == "scan":
-        stats = scan(DEFAULT_DB, verbose=args.verbose)
+        stats = scan(DEFAULT_DB, verbose=args.verbose, force_balance=args.force_balance)
         total = 0
         parts = []
         for name, (found, parsed, inserted) in stats.items():
@@ -1624,6 +1945,33 @@ def main(argv=None):
                 print("⚠ 有未定价模型：%s（补到 %s）" % ("、".join(new_models), PRICES_PATH))
     elif args.command == "report":
         report(DEFAULT_DB, args.days, args.by)
+    elif args.command == "balance":
+        if args.refresh:
+            try:
+                result = refresh_balances(DEFAULT_DB, force=True, verbose=True)
+            except Exception as exc:
+                print("余额刷新失败：%s" % exc)
+                return 1
+            if not result["configured"]:
+                print("余额查询未启用：先配置 %s" % BALANCES_PATH)
+        try:
+            payload = balance_payload(DEFAULT_DB)
+        except Exception as exc:
+            print("余额读取失败：%s" % exc)
+            return 1
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        elif not payload["configured"]:
+            print("余额查询未启用。参考 %s 和 %s" % (BALANCES_PATH, SECRETS_PATH))
+        else:
+            for provider in payload["providers"]:
+                if provider["items"]:
+                    for item in provider["items"]:
+                        print("%s  %s %.2f%s" % (
+                            provider["name"], item["currency"], item["total"],
+                            "" if item.get("available", True) else "  (不可用)"))
+                else:
+                    print("%s  %s" % (provider["name"], provider["error"] or "读取中…"))
     elif args.command == "status":
         if args.json:
             print(json.dumps(status_json(DEFAULT_DB), ensure_ascii=False))

@@ -1,0 +1,11 @@
+{
+  "refresh_seconds": 600,
+  "providers": [
+    {
+      "id": "deepseek",
+      "type": "deepseek",
+      "name": "DeepSeek",
+      "enabled": true
+    }
+  ]
+}

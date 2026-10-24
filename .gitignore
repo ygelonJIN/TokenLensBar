@@ -11,3 +11,7 @@ menu/GeneratedConfig.swift
 *.db-journal
 *.db-wal
 *.db-shm
+
+# 本机余额配置和密钥（示例文件 *.example.json 才进版本库）
+balances.json
+secrets.json

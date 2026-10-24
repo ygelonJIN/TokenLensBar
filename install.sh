@@ -22,6 +22,18 @@ if [ ! -f "$RUNTIME/prices.json" ]; then
     cp "$ROOT/prices.json" "$RUNTIME/prices.json"
     echo "     已放置单价表：$RUNTIME/prices.json"
 fi
+if [ ! -f "$RUNTIME/balances.json" ]; then
+    cp "$ROOT/balances.example.json" "$RUNTIME/balances.json"
+    echo "     已启用 DeepSeek 余额模板：$RUNTIME/balances.json"
+fi
+if [ ! -f "$RUNTIME/secrets.example.json" ]; then
+    cp "$ROOT/secrets.example.json" "$RUNTIME/secrets.example.json"
+fi
+if [ ! -f "$RUNTIME/secrets.json" ]; then
+    cp "$ROOT/secrets.example.json" "$RUNTIME/secrets.json"
+    chmod 600 "$RUNTIME/secrets.json"
+    echo "     已放置余额 Key 模板：$RUNTIME/secrets.json（把占位符换成完整 Key）"
+fi
 
 echo "2/6  构建 App（指向运行时目录，仓库之后可以挪走）"
 TOKENLENS_RUNTIME_DIR="$RUNTIME" "$ROOT/build.sh" >/dev/null
@@ -84,6 +96,8 @@ echo "装好了："
 echo "  App      $APP_TARGET"
 echo "  数据     $RUNTIME/usage.db"
 echo "  单价表   $RUNTIME/prices.json"
+echo "  余额     $RUNTIME/balances.json（DeepSeek 已启用）"
+echo "  余额 Key $RUNTIME/secrets.json（编辑它，把占位符换成完整 Key；权限 600）"
 echo "  看板     python3 $RUNTIME/tokenlens.py serve"
 echo
 echo "菜单栏右上角会出现一个 token 用量数字。没出现就手动开一次："

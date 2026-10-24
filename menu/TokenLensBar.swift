@@ -30,6 +30,44 @@ struct Snapshot: Decodable {
         let share: Double
         let subscription: Bool?
     }
+    struct BalanceItem: Decodable {
+        let currency: String?
+        let total: Double?
+        let granted: Double?
+        let toppedUp: Double?
+        let available: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case currency, total, granted, available
+            case toppedUp = "topped_up"
+        }
+    }
+    struct BalanceProvider: Decodable {
+        let id: String?
+        let name: String?
+        let type: String?
+        let items: [BalanceItem]?
+        let fetchedAt: Double?
+        let lastAttempt: Double?
+        let error: String?
+        let stale: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case id, name, type, items, error, stale
+            case fetchedAt = "fetched_at"
+            case lastAttempt = "last_attempt"
+        }
+    }
+    struct Balances: Decodable {
+        let configured: Bool?
+        let refreshSeconds: Int?
+        let providers: [BalanceProvider]?
+
+        enum CodingKeys: String, CodingKey {
+            case configured, providers
+            case refreshSeconds = "refresh_seconds"
+        }
+    }
 
     let ok: Bool
     let symbol: String?
@@ -44,10 +82,11 @@ struct Snapshot: Decodable {
     let allEvents: Int?
     let unpriced: [String]?
     let priced: Bool?
+    let balances: Balances?
     let reason: String?
 
     enum CodingKeys: String, CodingKey {
-        case ok, symbol, windows, daily, models, agents, unpriced, priced, reason
+        case ok, symbol, windows, daily, models, agents, unpriced, priced, balances, reason
         case cacheRate = "cache_rate"
         case allTokens = "all_tokens"
         case allEvents = "all_events"
@@ -81,7 +120,7 @@ final class PyBridge {
         return try? JSONDecoder().decode(Snapshot.self, from: data)
     }
 
-    func scan() { _ = run(arguments: ["scan"]) }
+    func scan() { _ = run(arguments: ["scan", "--force-balance"]) }
 
     /// 打开看板：服务已经在跑就直接开浏览器，没跑就先起服务再开。
     /// 原来不管服务在不在都 blindly 起一个 serve，端口被占用时进程直接退出，
@@ -209,13 +248,22 @@ final class ChartView: NSView {
 
     // MARK: - 布局
 
-    private func plan() -> (height: CGFloat, today: NSRect, chart: NSRect, all: NSRect) {
+    private func plan() -> (height: CGFloat, balance: NSRect?,
+                            today: NSRect, chart: NSRect, all: NSRect) {
         guard let snap = snapshot, snap.ok else {
-            return (160, .zero, .zero, .zero)
+            return (160, nil, .zero, .zero, .zero)
         }
         let width = (bounds.width > 0 ? bounds.width : kPanelWidth) - pad * 2
         var y: CGFloat = 0
         y += 101
+
+        var balance: NSRect?
+        let balanceRows = balanceRowCount(snap)
+        if balanceRows > 0 {
+            let height = 12 + 17 + CGFloat(balanceRows) * rowHeight + 11
+            balance = NSRect(x: pad, y: y, width: width, height: height)
+            y += height + 10
+        }
 
         let modelsToday = snap.modelsToday?.count ?? 0
         let agentsToday = snap.agentsToday?.count ?? 0
@@ -234,7 +282,15 @@ final class ChartView: NSView {
         let all = NSRect(x: pad, y: y, width: width, height: allHeight)
         y += allHeight + 6
 
-        return (y, today, chart, all)
+        return (y, balance, today, chart, all)
+    }
+
+    private func balanceRowCount(_ snap: Snapshot) -> Int {
+        guard let balances = snap.balances, balances.configured == true,
+              let providers = balances.providers, !providers.isEmpty else { return 0 }
+        return providers.reduce(0) { total, provider in
+            total + max(1, provider.items?.count ?? 0)
+        }
     }
 
     private func relayout() {
@@ -302,6 +358,9 @@ final class ChartView: NSView {
         let layout = plan()
 
         drawHeadline(snap, today: snap.windows?["today"], symbol: symbol)
+        if let balance = layout.balance {
+            drawBalanceCard(balance, snap: snap)
+        }
         drawTodayCard(layout.today, snap: snap, symbol: symbol)
         drawWeekChart(snap, box: layout.chart, symbol: symbol)
         drawAllCard(layout.all, snap: snap, symbol: symbol)
@@ -337,6 +396,88 @@ final class ChartView: NSView {
             .foregroundColor: Palette.muted,
         ]))
         caption.draw(in: NSRect(x: pad, y: 77, width: bounds.width - pad * 2, height: 17))
+    }
+
+    private func drawBalanceCard(_ box: NSRect, snap: Snapshot) {
+        card(box)
+        text("账户余额", NSPoint(x: box.minX + inset, y: box.minY + 12),
+             size: 11, weight: .semibold)
+
+        let providers = snap.balances?.providers ?? []
+        let fetched = providers.compactMap { $0.fetchedAt }.max()
+        let hasError = providers.contains { !($0.error ?? "").isEmpty }
+        let stale = providers.contains { $0.stale == true }
+        if let fetched {
+            let label: String
+            let color: NSColor
+            if hasError {
+                label = "更新失败"
+                color = Palette.amber
+            } else if stale {
+                label = "已过期"
+                color = Palette.amber
+            } else {
+                label = clockText(fetched) + " 更新"
+                color = Palette.muted
+            }
+            text(label, NSPoint(x: box.maxX - inset - 96, y: box.minY + 13), size: 9,
+                 color: color, align: .right, width: 96)
+        }
+
+        var y = box.minY + 38
+        for provider in providers {
+            let name = provider.name ?? provider.id ?? "?"
+            let items = provider.items ?? []
+            if items.isEmpty {
+                text(name, NSPoint(x: box.minX + inset, y: y), size: 11,
+                     width: box.width - 170)
+                let message = provider.error ?? "读取中…"
+                text(message, NSPoint(x: box.maxX - inset - 132, y: y + 1), size: 10,
+                     color: balanceErrorColor(message), align: .right, width: 132)
+                y += rowHeight
+                continue
+            }
+            for (index, item) in items.enumerated() {
+                let label = index == 0 ? name : (item.currency ?? "")
+                text(label, NSPoint(x: box.minX + inset, y: y),
+                     size: index == 0 ? 11 : 9.5,
+                     color: index == 0 ? Palette.text : Palette.muted,
+                     width: box.width - 160)
+                let total = item.total ?? 0
+                let value = balanceMoney(total, currency: item.currency ?? "CNY")
+                text(value, NSPoint(x: box.maxX - inset - 118, y: y),
+                     size: 11, weight: .semibold,
+                     color: item.available == false ? Palette.rose : Palette.mint,
+                     align: .right, width: 118)
+                y += rowHeight
+            }
+        }
+    }
+
+    private func balanceMoney(_ value: Double, currency: String) -> String {
+        let code = currency.uppercased()
+        let symbol = code == "CNY" ? "¥" : (code == "USD" ? "$" : code + " ")
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        formatter.groupingSeparator = ","
+        let number = formatter.string(from: NSNumber(value: abs(value)))
+            ?? String(format: "%.2f", abs(value))
+        return (value < 0 ? "-" : "") + symbol + number
+    }
+
+    private func balanceErrorColor(_ message: String) -> NSColor {
+        if message.contains("未配置") { return Palette.muted }
+        if message.contains("Key") || message.contains("权限") { return Palette.rose }
+        return Palette.amber
+    }
+
+    private func clockText(_ epoch: Double) -> String {
+        let date = Date(timeIntervalSince1970: epoch)
+        let formatter = DateFormatter()
+        formatter.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm" : "MM-dd HH:mm"
+        return formatter.string(from: date)
     }
 
     private func drawTodayCard(_ box: NSRect, snap: Snapshot, symbol: String) {
