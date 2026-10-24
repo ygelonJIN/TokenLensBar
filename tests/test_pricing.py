@@ -111,6 +111,69 @@ def main():
     passed &= check("未定价模型进 unpriced 列表", "brand-new-model" in agg["unpriced"], True)
     passed &= check("未定价不影响 token 统计", agg["totals"]["total"], 1100)
 
+    # 6. 压缩流被截断时，前面解出来的部分仍然可用
+    #    （DSH 是"追加帧"格式：最后一帧写了一半，前面几帧还是完整的）
+    work = tempfile.mkdtemp()
+    import subprocess
+    import pathlib
+
+    def pack(name, start, count):
+        plain = os.path.join(work, name + ".jsonl")
+        with open(plain, "w", encoding="utf-8") as handle:
+            for i in range(start, start + count):
+                handle.write(json.dumps({"i": i, "pad": "x" * 200}) + "\n")
+        out = os.path.join(work, name + ".zstd")
+        subprocess.run(["zstd", "-q", "-f", plain, "-o", out], check=True)
+        with open(out, "rb") as handle:
+            return handle.read()
+
+    first = pack("p1", 0, 25)
+    second = pack("p2", 25, 25)
+    packed = os.path.join(work, "a.zstd")
+    with open(packed, "wb") as handle:
+        handle.write(first + second[: len(second) // 2])  # 模拟"正在写入"的半截文件
+    text = tl.zstd_decompress(packed)
+    passed &= check("半截 zstd 仍能解出前面完整的内容",
+                    len([line for line in (text or "").splitlines() if line.strip()]), 25)
+
+    # 7. 读不出来的文件不能被记成"已处理"（否则永久漏采）
+    class Flaky(tl.Adapter):
+        name = "flaky"
+        always_scan = True
+        busy = True
+
+        def __init__(self, path):
+            self.path = path
+
+        def discover(self):
+            return [pathlib.Path(self.path)]
+
+        def parse(self, path):
+            if self.busy:
+                raise tl.SourceBusy(path)
+            yield tl.make_event("flaky:1", epoch("2026-10-24 12:00"), "flaky",
+                                "m", {"input_tokens": 1000, "output_tokens": 100})
+
+    source = os.path.join(work, "b.json")
+    with open(source, "w", encoding="utf-8") as handle:
+        handle.write("{}")
+    db = pathlib.Path(work) / "t.db"
+    adapter = Flaky(source)
+    saved = tl.ADAPTERS
+    tl.ADAPTERS = [adapter]
+    try:
+        tl.scan(db)
+        con = tl.connect(db)
+        passed &= check("读取失败时不写 files 表", con.execute(
+            "select count(*) from files where path=?", (source,)).fetchone()[0], 0)
+        adapter.busy = False
+        tl.scan(db)
+        passed &= check("下一轮重试后能补上", con.execute(
+            "select count(*) from events where agent='flaky'").fetchone()[0], 1)
+        con.close()
+    finally:
+        tl.ADAPTERS = saved
+
     print()
     print("全部通过" if passed else "有失败项")
     return 0 if passed else 1

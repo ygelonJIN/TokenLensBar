@@ -240,7 +240,12 @@ def iso_to_epoch(text):
 
 
 def zstd_decompress(path):
-    """返回解压后的文本行；本机没有 zstd 命令时返回 None。"""
+    """返回解压后的文本；本机没有 zstd 命令、或一个字节都读不出来时返回 None。
+
+    文件正在被追加写入时，zstd 会因为末尾帧不完整而返回非 0，但前面已经解出来的
+    部分是有效数据。所以只要 stdout 有内容就照常返回，让调用方自己跳过被截断的
+    最后一行（json 解析失败会自动跳过）。返回 None 才是真的没法读。
+    """
     try:
         proc = subprocess.run(
             ["zstd", "-dc", str(path)],
@@ -250,9 +255,10 @@ def zstd_decompress(path):
         )
     except FileNotFoundError:
         return None
-    if proc.returncode != 0:
+    text = proc.stdout.decode("utf-8", "replace")
+    if proc.returncode != 0 and not text.strip():
         return None
-    return proc.stdout.decode("utf-8", "replace")
+    return text
 
 
 def iter_jsonl(text):
@@ -303,11 +309,23 @@ def make_event(event_id, ts, agent, model, usage, provider=None, cost=0.0,
 # Adapter：一个 Adapter 认领一种"本地用量记录格式"
 # --------------------------------------------------------------------------
 
+class SourceBusy(Exception):
+    """源文件当前读不出来（比如正在写入 / 压缩流被截断）。
+
+    抛出它的文件本轮不写进 files 表，下一轮扫描会重试——
+    绝不能让"没读到"被当成"读完了"，否则这个文件会永久漏采。
+    """
+
+
 class Adapter:
     name = "?"
     # delta    = 每条记录是"一次请求的增量"，可安全追加
     # snapshot = 每条记录是"累计值快照"，每次全量覆盖
     mode = "delta"
+    # True = 每次扫描都重读，不走 (size, mtime) 快路径。
+    # 整文件重写的源（zstd 会话、sqlite 快照）必须用它：
+    # 写入落在 -wal 或扫描正好撞上写入时，size/mtime 会停在半截。
+    always_scan = False
 
     def discover(self):
         """返回本机上存在的候选文件路径。"""
@@ -376,6 +394,9 @@ class DshAdapter(Adapter):
     """
 
     name = "dsh"
+    # DSH 每步都会整文件重写 zstd 会话。扫描正好撞上写入时，解出来的是半截流，
+    # 而 (size, mtime) 会被记成"已处理"，之后再也不重读——所以这个源永远重扫。
+    always_scan = True
 
     def discover(self):
         root = home(".dsh", "sessions")
@@ -386,7 +407,7 @@ class DshAdapter(Adapter):
     def parse(self, path):
         text = zstd_decompress(path)
         if text is None:
-            return
+            raise SourceBusy(path)
         session_id = ""
         provider = ""
         model = ""
@@ -398,6 +419,15 @@ class DshAdapter(Adapter):
                 data = obj.get("data") or {}
                 provider = (data.get("provider") or "").replace("-account", "")
                 model = data.get("model") or model
+            elif kind == "request/context":
+                # 有的会话没有 model/selection，模型只在 request/context 里
+                data = obj.get("data") or {}
+                provider = (data.get("provider") or "").replace("-account", "") or provider
+                model = data.get("model") or model
+            elif kind == "request/header":
+                config = ((obj.get("data") or {}).get("header") or {}).get("config") or {}
+                provider = (config.get("provider") or "").replace("-account", "") or provider
+                model = config.get("model") or model
             elif kind == "assistant/message":
                 data = obj.get("data") or {}
                 usage = data.get("usage")
@@ -427,6 +457,9 @@ class HermesAdapter(Adapter):
 
     name = "hermes"
     mode = "snapshot"
+    # 写入落在 state.db-wal 上，state.db 的 mtime 可能几小时不动。
+    # 走快路径就会一直用几小时前的快照，所以这个源永远重读。
+    always_scan = True
 
     def discover(self):
         for name in ("state.db", "state.db-wal"):
@@ -739,13 +772,21 @@ def scan(db_path, verbose=False):
             except OSError:
                 continue
             row = con.execute("select size, mtime from files where path=?", (str(path),)).fetchone()
-            if row and row[0] == st.st_size and row[1] == st.st_mtime:
+            if (not adapter.always_scan and row
+                    and row[0] == st.st_size and row[1] == st.st_mtime):
+                continue
+            # 先把事件全部解出来，再动数据库：解析失败时什么都不能改
+            try:
+                events = list(adapter.parse(path))
+            except SourceBusy:
+                if verbose:
+                    print("  ~ %-6s %s（正在写入，下一轮重试）" % (adapter.name, path.name))
                 continue
             parsed += 1
             if adapter.mode == "snapshot":
                 con.execute("delete from events where origin=?", (str(path),))
             before = con.total_changes
-            for event in adapter.parse(path):
+            for event in events:
                 insert_event(con, event, str(path))
             inserted += con.total_changes - before
             con.execute(
