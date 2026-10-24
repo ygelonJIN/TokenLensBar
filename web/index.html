@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tokenlens · 本地用量看板</title>
+<title>TokenLensBar · 本地用量看板</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -107,7 +107,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>tokenlens <span>本地 token 用量 · 数据不出本机 · 余额查询可选</span></h1>
+    <h1>TokenLensBar <span>本地 token 用量 · 数据不出本机 · 余额查询可选</span></h1>
     <div class="tabs" id="tabs">
       <button data-days="7">7 天</button>
       <button data-days="30" class="on">30 天</button>
@@ -147,7 +147,7 @@ async function load(days) {
 function render(d) {
   const box = document.getElementById('content');
   if (!d.ok) {
-    box.innerHTML = '<div class="empty">还没有数据。先运行 <code>python3 tokenlens.py scan</code></div>';
+    box.innerHTML = '<div class="empty">还没有数据。先运行 <code>python3 tokenlensbar.py scan</code></div>';
     return;
   }
 
@@ -182,7 +182,7 @@ function render(d) {
   const warn = d.unpriced && d.unpriced.length ? `
     <div class="warn">
       <b>未定价模型：</b>${d.unpriced.map(esc).join('、')}
-      —— token 已计入总量，但成本算不出来。补到 <code>~/.tokenlens/prices.json</code> 即可。
+      —— token 已计入总量，但成本算不出来。补到 <code>~/.tokenlensbar/prices.json</code> 即可。
     </div>` : '';
 
   const daily = d.daily || [];

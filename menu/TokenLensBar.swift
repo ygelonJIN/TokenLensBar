@@ -3,7 +3,7 @@ import SwiftUI
 import Combine
 
 // 菜单栏外壳 + 点开的图表面板。
-// 计算全在 tokenlens.py 里；这里只负责取数和画图。
+// 计算全在 tokenlensbar.py 里；这里只负责取数和画图。
 // 图表用 NSBezierPath 原生绘制，不引入 WebView 进程，所以点开是瞬时的。
 
 let kRefreshInterval: TimeInterval = 60
@@ -97,7 +97,7 @@ struct Snapshot: Decodable {
 }
 
 final class PyBridge {
-    private let scriptPath = ProcessInfo.processInfo.environment["TOKENLENS_SCRIPT"] ?? kScriptPath
+    private let scriptPath = ProcessInfo.processInfo.environment["TOKENLENSBAR_SCRIPT"] ?? kScriptPath
 
     private func run(arguments: [String], wait: Bool = true) -> Data? {
         let process = Process()
@@ -324,7 +324,7 @@ enum PanelTab: String, CaseIterable, Identifiable {
 struct PanelView: View {
     @ObservedObject var model: PanelModel
     @State private var tab: PanelTab = {
-        if let raw = ProcessInfo.processInfo.environment["TOKENLENS_TAB"],
+        if let raw = ProcessInfo.processInfo.environment["TOKENLENSBAR_TAB"],
            let value = PanelTab(rawValue: raw) {
             return value
         }
@@ -365,7 +365,7 @@ struct PanelView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 1) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("tokenlens").font(.headline)
+                Text("TokenLensBar").font(.headline)
                 Spacer(minLength: 8)
                 Text("余额")
                     .font(.caption)
@@ -654,7 +654,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "…"
-        statusItem.button?.toolTip = "tokenlens：本地 token 用量"
+        statusItem.button?.toolTip = "TokenLensBar：本地 token 用量"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
 
@@ -748,7 +748,7 @@ struct TokenLensBarMain {
     static func main() {
         let args = CommandLine.arguments
         if let index = args.firstIndex(of: "--render-panel") {
-            let path = index + 1 < args.count ? args[index + 1] : "/tmp/tokenlens-panel.png"
+            let path = index + 1 < args.count ? args[index + 1] : "/tmp/tokenlensbar-panel.png"
             renderPanel(path: path)
             return
         }
@@ -767,7 +767,7 @@ struct TokenLensBarMain {
         let model = PanelModel()
         model.snapshot = PyBridge().load()
         model.lastLoaded = Date()
-        let scheme: ColorScheme = ProcessInfo.processInfo.environment["TOKENLENS_APPEARANCE"] == "light"
+        let scheme: ColorScheme = ProcessInfo.processInfo.environment["TOKENLENSBAR_APPEARANCE"] == "light"
             ? .light : .dark
         model.colorScheme = scheme
         let root = PanelView(model: model)
@@ -776,7 +776,7 @@ struct TokenLensBarMain {
         let host = NSHostingController(rootView: root)
         let size = NSSize(width: kPanelWidth, height: kPanelHeight)
         host.view.frame = NSRect(origin: .zero, size: size)
-        let appearanceName = ProcessInfo.processInfo.environment["TOKENLENS_APPEARANCE"] == "light"
+        let appearanceName = ProcessInfo.processInfo.environment["TOKENLENSBAR_APPEARANCE"] == "light"
             ? NSAppearance.Name.aqua : NSAppearance.Name.darkAqua
         host.view.appearance = NSAppearance(named: appearanceName)
         host.view.wantsLayer = true

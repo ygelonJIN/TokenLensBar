@@ -1,4 +1,4 @@
-# tokenlens
+# TokenLensBar
 
 纯本地、零网络的 token 用量监控（余额查询是可选功能）。采集器 ~900 行 Python（只用标准库）+ 原生菜单栏 App + 本地看板。
 
@@ -6,7 +6,7 @@
 
 ![面板](docs/panel.png)
 
-（截图里的余额是示例；填入 Key 后会显示真实余额。）
+（截图里关闭了余额，所以显示 `—`；填入 Key 后会显示真实余额。）
 
 完整看板在浏览器里，顶部是每日用量柱状图：
 
@@ -14,25 +14,28 @@
 
 ```bash
 ./install.sh                       # 装好：采集库 + 单价表 + 定时任务 + 菜单栏 App
-python3 tokenlens.py serve          # 浏览器看板 http://127.0.0.1:8787
+python3 tokenlensbar.py serve          # 浏览器看板 http://127.0.0.1:8787
 ```
 
 ## 装在哪
 
 `./install.sh` 会把运行时从仓库复制出去，所以装完仓库可以挪走甚至删掉。
 
+从旧版 `tokenlens` 升级：重跑 `./install.sh` 即可。它会把 `~/.tokenlens/` 迁到
+`~/.tokenlensbar/`，并把旧的 `com.tokenlens.*` 任务换成 `com.tokenlensbar.*`。
+
 | 东西 | 位置 |
 | --- | --- |
 | 菜单栏 App | `/Applications/TokenLensBar.app` |
-| 采集器运行时 | `~/.tokenlens/tokenlens.py` |
-| 看板页面 | `~/.tokenlens/web/index.html` |
-| 数据 | `~/.tokenlens/usage.db` |
-| 单价表 | `~/.tokenlens/prices.json` |
-| 余额配置 | `~/.tokenlens/balances.json`（可选） |
-| 余额 Key | `~/.tokenlens/secrets.json`（可选，权限 600） |
-| 每 5 分钟采集 | `~/Library/LaunchAgents/com.tokenlens.scan.plist` |
-| 登录自启 | `~/Library/LaunchAgents/com.tokenlens.bar.plist` |
-| App 启动日志 | `~/.tokenlens/bar.log` |
+| 采集器运行时 | `~/.tokenlensbar/tokenlensbar.py` |
+| 看板页面 | `~/.tokenlensbar/web/index.html` |
+| 数据 | `~/.tokenlensbar/usage.db` |
+| 单价表 | `~/.tokenlensbar/prices.json` |
+| 余额配置 | `~/.tokenlensbar/balances.json`（可选） |
+| 余额 Key | `~/.tokenlensbar/secrets.json`（可选，权限 600） |
+| 每 5 分钟采集 | `~/Library/LaunchAgents/com.tokenlensbar.scan.plist` |
+| 登录自启 | `~/Library/LaunchAgents/com.tokenlensbar.bar.plist` |
+| App 启动日志 | `~/.tokenlensbar/bar.log` |
 
 ## 启动 / 停止
 
@@ -41,47 +44,47 @@ python3 tokenlens.py serve          # 浏览器看板 http://127.0.0.1:8787
 
 ```bash
 open -a TokenLensBar            # 手动启动（没出现时用这个）
-launchctl kickstart -k gui/$(id -u)/com.tokenlens.bar   # 重启菜单栏
-launchctl kickstart gui/$(id -u)/com.tokenlens.scan     # 立刻采集一次
+launchctl kickstart -k gui/$(id -u)/com.tokenlensbar.bar   # 重启菜单栏
+launchctl kickstart gui/$(id -u)/com.tokenlensbar.scan     # 立刻采集一次
 ```
 
 - **退出**：点菜单栏图标 → 退出（下次登录还会自启）
-- **不再自启**：`launchctl unload ~/Library/LaunchAgents/com.tokenlens.bar.plist`
-- **彻底卸载**：unload 两个 plist → 删 `~/Library/LaunchAgents/com.tokenlens.*.plist`、
-  `/Applications/TokenLensBar.app`、`~/.tokenlens/`（注意：删 `~/.tokenlens/` 就等于删历史数据）
+- **不再自启**：`launchctl unload ~/Library/LaunchAgents/com.tokenlensbar.bar.plist`
+- **彻底卸载**：unload 两个 plist → 删 `~/Library/LaunchAgents/com.tokenlensbar.*.plist`、
+  `/Applications/TokenLensBar.app`、`~/.tokenlensbar/`（注意：删 `~/.tokenlensbar/` 就等于删历史数据）
 
-图标是 `—` 或 `!` 时看 `~/.tokenlens/bar.log`：`statusItem=ok` 表示状态栏挂上了，
-`取数失败` 表示调 Python 出了问题（先跑 `python3 ~/.tokenlens/tokenlens.py status` 验证）。
+图标是 `—` 或 `!` 时看 `~/.tokenlensbar/bar.log`：`statusItem=ok` 表示状态栏挂上了，
+`取数失败` 表示调 Python 出了问题（先跑 `python3 ~/.tokenlensbar/tokenlensbar.py status` 验证）。
 
 ## 账户余额（可选）
 
 默认不联网。开启后余额直接显示在面板标题右上角，目前支持 DeepSeek。
 
-安装时已经生成 `~/.tokenlens/balances.json`（DeepSeek 已启用）。填入 Key 即可：
+安装时已经生成 `~/.tokenlensbar/balances.json`（DeepSeek 已启用）。填入 Key 即可：
 
-安装时已经生成 `~/.tokenlens/secrets.json`（权限 600），直接编辑它：
+安装时已经生成 `~/.tokenlensbar/secrets.json`（权限 600），直接编辑它：
 
 ```bash
 # 文件不存在时才需要这行：
-# cp ~/.tokenlens/secrets.example.json ~/.tokenlens/secrets.json
+# cp ~/.tokenlensbar/secrets.example.json ~/.tokenlensbar/secrets.json
 
-# 编辑 ~/.tokenlens/secrets.json：
+# 编辑 ~/.tokenlensbar/secrets.json：
 # {"deepseek": "sk-你的完整Key"}
 
-chmod 600 ~/.tokenlens/secrets.json
+chmod 600 ~/.tokenlensbar/secrets.json
 ```
 
 然后在面板里点「立即采集」，或直接刷新：
 
 ```bash
-python3 ~/.tokenlens/tokenlens.py balance --refresh
+python3 ~/.tokenlensbar/tokenlensbar.py balance --refresh
 ```
 
 说明：
 
 - Key 是**整串**，通常 `sk-` 开头；不用拆前后缀，不需要账号密码。代码会自己加 `Bearer`。
 - 只 GET `https://api.deepseek.com/user/balance`，不发送本地用量；查询余额不消耗 token。
-- Key 有调用 API 的权限，不是只读的。建议在 DeepSeek 控制台单独建一个 `tokenlens` Key，不用了直接删。
+- Key 有调用 API 的权限，不是只读的。建议在 DeepSeek 控制台单独建一个 `TokenLensBar` Key，不用了直接删。
 - 余额缓存 10 分钟；面板每 60 秒读缓存，不会因为网络卡住。失败时保留上次余额并标「更新失败」。
 - 不想要余额：把 `balances.json` 里的 `enabled` 改成 `false`，或删掉这个文件；之后就完全不发请求。
 - 目前只内置 DeepSeek。Kimi、OpenRouter 等 Bearer 余额接口可以按同样的 adapter 结构扩展；小米 MiMo 的 Token Plan 额度目前更像控制台 Cookie 接口，不稳定，暂不内置。
@@ -91,7 +94,7 @@ python3 ~/.tokenlens/tokenlens.py balance --refresh
 ```
    ~/.codex/**/*.jsonl               ┐
    ~/.dsh/sessions/**/*.zstd         ├─► Adapter ─► 统一事件 ─► SQLite ─► 报表 / 菜单栏 / 看板
-   ~/.hermes/state.db                ┘   (格式)      每 5 分钟      ~/.tokenlens/usage.db
+   ~/.hermes/state.db                ┘   (格式)      每 5 分钟      ~/.tokenlensbar/usage.db
 ```
 
 绑定的是**本地用量记录的数据格式**，不是 Agent 品牌，也不是厂商。
@@ -146,7 +149,7 @@ ADAPTERS.append(FooAdapter())
 同时在菜单栏和看板上标 **⚠ 未定价**，提醒你补价格。它不会静默按 0 算钱。
 
 **价格变了怎么办？**
-改 `~/.tokenlens/prices.json`。模型可以写多段价格，按事件发生时间自动选当时那段，
+改 `~/.tokenlensbar/prices.json`。模型可以写多段价格，按事件发生时间自动选当时那段，
 所以历史账单不会被新价格改写：
 
 ```json
@@ -163,7 +166,7 @@ ADAPTERS.append(FooAdapter())
 能，这正是核心视图：
 
 ```bash
-python3 tokenlens.py breakdown --days 30
+python3 tokenlensbar.py breakdown --days 30
 ```
 
 ```
@@ -181,7 +184,7 @@ dsh         deepseek-flash    3.76M       42.3K      50.7K       ¥0.57
 数据一直在库里。看板底部有「窗口外还有」一栏专门列这些，命令行加 `--days 0` 看全部：
 
 ```bash
-python3 tokenlens.py breakdown --days 30
+python3 tokenlensbar.py breakdown --days 30
 #   窗口外还有 1 项（加 --days 0 看全部）：
 #     hermes   deepseek-v4-pro           2.36B  ¥666  2026-08-07
 ```
@@ -197,7 +200,7 @@ python3 tokenlens.py breakdown --days 30
 唯一会丢的情况是：日志在第一次扫描之前就被删了。
 
 **怎么保证以后不会静默丢数据？**
-`python3 tokenlens.py health` 会检查每个 Adapter：文件还在不在、解析出了多少事件、最后一条是什么时候。
+`python3 tokenlensbar.py health` 会检查每个 Adapter：文件还在不在、解析出了多少事件、最后一条是什么时候。
 Agent 升级改了日志格式时，最典型的表现是「有文件但零事件」或「很久没有新事件」，这两条都会被点名，
 而不是安静地变成 0。
 
@@ -257,7 +260,7 @@ ssh-copy-id pi@raspberrypi.local
 ssh pi@raspberrypi.local 'python3 -c "import sqlite3; print("ok")"'
 
 # 2) 登记这条远程源
-cat > ~/.tokenlens/remotes.json <<'JSON'
+cat > ~/.tokenlensbar/remotes.json <<'JSON'
 {
   "remotes": [
     { "name": "pi", "ssh": "pi@raspberrypi.local", "db": "~/.hermes/state.db" }
@@ -266,8 +269,8 @@ cat > ~/.tokenlens/remotes.json <<'JSON'
 JSON
 
 # 3) 验证
-python3 ~/.tokenlens/tokenlens.py scan -v
-python3 ~/.tokenlens/tokenlens.py health
+python3 ~/.tokenlensbar/tokenlensbar.py scan -v
+python3 ~/.tokenlensbar/tokenlensbar.py health
 ```
 
 本机已接通树莓派（`ygelonpi@ygelonpi.local`，用 mDNS 主机名所以换 IP 也不影响）：
@@ -287,7 +290,7 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 细节：
 
 - 每 5 分钟 SSH 过去执行一段内联 Python，读 `session_model_usage` 后输出 JSON，**不复制整库**。
-- 远端只需要 `python3`，不需要装 tokenlens，也不需要能反向连回本机。
+- 远端只需要 `python3`，不需要装 TokenLensBar，也不需要能反向连回本机。
 - **断网不会清空数据**：SSH 失败时保留上次抓到的记录，`health` 会报「没拉到数据」。
 - 多台机器就多写几条，`name` 会显示成 `Hermes (pi)`、`Hermes (nas)`。
 - 用的是 `BatchMode=yes`，所以必须先配好免密；否则会直接失败而不是卡在密码提示。
@@ -296,19 +299,19 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 
 | 命令 | 作用 |
 | --- | --- |
-| `python3 tokenlens.py scan` | 采集一次（幂等，重复跑不重复计数） |
-| `python3 tokenlens.py report --days 7` | 文本报表，`--by model/agent/provider`（`--days 0` = 全部） |
-| `python3 tokenlens.py breakdown --days 30` | Agent × 模型 交叉明细（`--days 0` = 全部） |
-| `python3 tokenlens.py models` | 所有见过的模型 + 定价状态 |
-| `python3 tokenlens.py health` | 体检：数据源还在不在、有没有静默停止解析 |
-| `python3 tokenlens.py reset --agent dsh` | 清掉某个来源重扫（改了 Adapter 解析逻辑时用） |
+| `python3 tokenlensbar.py scan` | 采集一次（幂等，重复跑不重复计数） |
+| `python3 tokenlensbar.py report --days 7` | 文本报表，`--by model/agent/provider`（`--days 0` = 全部） |
+| `python3 tokenlensbar.py breakdown --days 30` | Agent × 模型 交叉明细（`--days 0` = 全部） |
+| `python3 tokenlensbar.py models` | 所有见过的模型 + 定价状态 |
+| `python3 tokenlensbar.py health` | 体检：数据源还在不在、有没有静默停止解析 |
+| `python3 tokenlensbar.py reset --agent dsh` | 清掉某个来源重扫（改了 Adapter 解析逻辑时用） |
 
 > 内部 key 用 `dsh` / `codex` / `hermes`，界面上显示为 **DeepSeek Harness** / **Codex** /
 > **Hermes (MacBook)**（`AGENT_LABELS` 映射；树莓派那台是 **Hermes (pi)**）。
 > 改显示名不会动历史事件的 id，所以不会重复计数。
-| `python3 tokenlens.py status --json` | 结构化摘要（菜单栏用） |
-| `python3 tokenlens.py serve` | 本地看板，只监听 127.0.0.1 |
-| `python3 tokenlens.py sources` | 本机发现了哪些数据源 |
+| `python3 tokenlensbar.py status --json` | 结构化摘要（菜单栏用） |
+| `python3 tokenlensbar.py serve` | 本地看板，只监听 127.0.0.1 |
+| `python3 tokenlensbar.py sources` | 本机发现了哪些数据源 |
 | `python3 tests/test_pricing.py` | 定价逻辑回归测试 |
 
 ## 定价模型
@@ -407,7 +410,7 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 - **`cache_read` 各来源语义不同**，已归一化但跨来源比较仍要小心。
 - **菜单栏只读**。采集由 launchd 每 5 分钟跑一次；App 关掉不影响数据。
 - **构建缓存不能放外置盘**。仓库在外置 exFAT 卷上，`swiftc` 的 module cache 放这里会 SIGTRAP，
-  `build.sh` 已固定到 `/tmp/tokenlens-modcache`。移动仓库后重跑 `./build.sh`。
+  `build.sh` 已固定到 `/tmp/tokenlensbar-modcache`。移动仓库后重跑 `./build.sh`。
 - **余额接口因厂商而异**。DeepSeek 有官方余额接口；Kimi/OpenRouter 等可以扩展 adapter；
   小米 MiMo 的 Token Plan 额度目前更像控制台 Cookie 接口，不稳定且有安全风险，暂不内置。
 
@@ -415,14 +418,14 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 
 | 文件 | 作用 |
 | --- | --- |
-| [tokenlens.py](tokenlens.py) | 采集 + 定价 + 报表 + 看板服务 |
+| [tokenlensbar.py](tokenlensbar.py) | 采集 + 定价 + 报表 + 看板服务 |
 | [web/index.html](web/index.html) | 看板单页（无 CDN、无框架） |
 | [menu/TokenLensBar.swift](menu/TokenLensBar.swift) | 菜单栏 App（只做显示，计算全在 Python） |
 | [build.sh](build.sh) | 构建 App |
 | [install.sh](install.sh) | 一条命令安装（运行时 + App + 两个 LaunchAgent） |
 | [tests/test_pricing.py](tests/test_pricing.py) | 定价回归测试 |
 | [tests/test_balance.py](tests/test_balance.py) | 余额缓存/解析/错误处理回归测试 |
-| [prices.json](prices.json) | 单价表模板（已填你的价格，安装时复制到 `~/.tokenlens/`） |
+| [prices.json](prices.json) | 单价表模板（已填你的价格，安装时复制到 `~/.tokenlensbar/`） |
 | [prices.example.json](prices.example.json) | 三种写法的结构示例 |
 | [balances.example.json](balances.example.json) | 余额 provider 配置模板 |
 | [secrets.example.json](secrets.example.json) | 余额 Key 文件模板（填好后另存为 `secrets.json`） |

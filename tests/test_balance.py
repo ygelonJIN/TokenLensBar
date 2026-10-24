@@ -13,7 +13,7 @@ import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import tokenlens as tl  # noqa: E402
+import tokenlensbar as tl  # noqa: E402
 
 
 def check(name, actual, expected, tolerance=1e-9):

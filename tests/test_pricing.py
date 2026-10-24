@@ -12,7 +12,7 @@ import tempfile
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import tokenlens as tl  # noqa: E402
+import tokenlensbar as tl  # noqa: E402
 
 
 def write_prices(data):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tokenlens — 本地 token 用量采集器
+TokenLensBar — 本地 token 用量采集器
 
 设计原则
   1. 不碰 API Key，不发任何网络请求。
@@ -10,10 +10,10 @@ tokenlens — 本地 token 用量采集器
   4. 增量扫描：只重读变化的文件；事件按稳定 ID 去重，重复扫描不会重复计数。
 
 用法
-  python3 tokenlens.py scan                # 采集（可放进 cron / launchd）
-  python3 tokenlens.py report --days 7     # 看报表
-  python3 tokenlens.py report --by agent
-  python3 tokenlens.py sources             # 看发现了哪些数据源
+  python3 tokenlensbar.py scan                # 采集（可放进 cron / launchd）
+  python3 tokenlensbar.py report --days 7     # 看报表
+  python3 tokenlensbar.py report --by agent
+  python3 tokenlensbar.py sources             # 看发现了哪些数据源
 
 新增一个 Agent 的支持 = 写一个 Adapter 子类 + 注册到 ADAPTERS，约 20 行。
 """
@@ -32,12 +32,12 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
-DEFAULT_DB = Path(os.environ.get("TOKENLENS_DB", "~/.tokenlens/usage.db")).expanduser()
-PRICES_PATH = Path(os.environ.get("TOKENLENS_PRICES", "~/.tokenlens/prices.json")).expanduser()
-BALANCES_PATH = Path(os.environ.get("TOKENLENS_BALANCES", "~/.tokenlens/balances.json")).expanduser()
-SECRETS_PATH = Path(os.environ.get("TOKENLENS_SECRETS", "~/.tokenlens/secrets.json")).expanduser()
+DEFAULT_DB = Path(os.environ.get("TOKENLENSBAR_DB", "~/.tokenlensbar/usage.db")).expanduser()
+PRICES_PATH = Path(os.environ.get("TOKENLENSBAR_PRICES", "~/.tokenlensbar/prices.json")).expanduser()
+BALANCES_PATH = Path(os.environ.get("TOKENLENSBAR_BALANCES", "~/.tokenlensbar/balances.json")).expanduser()
+SECRETS_PATH = Path(os.environ.get("TOKENLENSBAR_SECRETS", "~/.tokenlensbar/secrets.json")).expanduser()
 DEEPSEEK_BALANCE_URL = os.environ.get(
-    "TOKENLENS_DEEPSEEK_BALANCE_URL", "https://api.deepseek.com/user/balance")
+    "TOKENLENSBAR_DEEPSEEK_BALANCE_URL", "https://api.deepseek.com/user/balance")
 
 MTOK = 1_000_000.0
 
@@ -549,7 +549,7 @@ class HermesAdapter(Adapter):
         con.close()
 
 
-REMOTES_PATH = Path(os.environ.get("TOKENLENS_REMOTES", "~/.tokenlens/remotes.json")).expanduser()
+REMOTES_PATH = Path(os.environ.get("TOKENLENSBAR_REMOTES", "~/.tokenlensbar/remotes.json")).expanduser()
 
 # 远端只需要 python3 + 自己的 ~/.hermes/state.db，不用装任何东西
 REMOTE_QUERY = r"""
@@ -1065,7 +1065,7 @@ def money(value, symbol="$"):
 
 def report(db_path, days, group_by):
     if not db_path.exists():
-        print("还没有数据，先运行：python3 tokenlens.py scan")
+        print("还没有数据，先运行：python3 tokenlensbar.py scan")
         return
     since = 0.0 if days <= 0 else time.time() - days * 86400
     rows, sources = fetch_rows(db_path, since)
@@ -1082,7 +1082,7 @@ def report(db_path, days, group_by):
               "provider": agg["by_provider"]}[group_by]
 
     print()
-    print("tokenlens · 本地用量报告")
+    print("TokenLensBar · 本地用量报告")
     window = "全部历史" if days <= 0 else "最近 %d 天" % days
     print("  窗口     %s（%s → %s）" % (window, fmt_ts(rows[0][0]), fmt_ts(rows[-1][0])))
     print("  事件数   %s" % format(len(rows), ","))
@@ -1399,7 +1399,7 @@ def _http_json(url, key, timeout=6.0):
     request = urllib.request.Request(url, headers={
         "Authorization": "Bearer " + key,
         "Accept": "application/json",
-        "User-Agent": "tokenlens/1.0",
+        "User-Agent": "TokenLensBar/1.0",
     })
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1624,7 +1624,7 @@ def load_all_rows(db_path):
 
 def cmd_models(_args):
     if not DEFAULT_DB.exists():
-        print("还没有数据，先运行：python3 tokenlens.py scan")
+        print("还没有数据，先运行：python3 tokenlensbar.py scan")
         return
     rows, _ = load_all_rows(DEFAULT_DB)
     prices = load_prices()
@@ -1669,7 +1669,7 @@ def cmd_reset(args):
 def cmd_health(_args):
     """体检：数据源还在不在、有没有可能静默停止解析。"""
     if not DEFAULT_DB.exists():
-        print("还没有数据，先运行：python3 tokenlens.py scan")
+        print("还没有数据，先运行：python3 tokenlensbar.py scan")
         return
     con = connect(DEFAULT_DB)
     stats = {row[0]: (row[1], row[2]) for row in con.execute(
@@ -1743,7 +1743,7 @@ def cmd_health(_args):
 
 def cmd_breakdown(args):
     if not DEFAULT_DB.exists():
-        print("还没有数据，先运行：python3 tokenlens.py scan")
+        print("还没有数据，先运行：python3 tokenlensbar.py scan")
         return
     since = 0.0 if args.days <= 0 else time.time() - args.days * 86400
     rows, _ = fetch_rows(DEFAULT_DB, since)
@@ -1879,7 +1879,7 @@ def serve(db_path, port, open_browser):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = "http://127.0.0.1:%d/" % port
     print()
-    print("  tokenlens 看板：%s" % url)
+    print("  TokenLensBar 看板：%s" % url)
     print("  只监听 127.0.0.1，数据不出本机。Ctrl+C 退出。")
     print()
     if open_browser:
@@ -1894,7 +1894,7 @@ def serve(db_path, port, open_browser):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="tokenlens", description="本地 token 用量采集器")
+    parser = argparse.ArgumentParser(prog="tokenlensbar", description="本地 token 用量采集器")
     sub = parser.add_subparsers(dest="command")
 
     scan_parser = sub.add_parser("scan", help="采集一次")
