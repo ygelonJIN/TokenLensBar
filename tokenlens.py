@@ -1168,6 +1168,8 @@ def status_json(db_path, prices=None):
     all_agents = group(0, "agent")
     all_total = sum(b["tokens"] for b in all_models.values()) or 1
     today_models = group(today_start, "model")
+    today_agents = group(today_start, "agent")
+    today_total = sum(b["tokens"] for b in today_models.values()) or 1
 
     unpriced = sorted({item["model"] for item in items
                        if item["unpriced"] and item["ts"] >= week_start})
@@ -1182,6 +1184,19 @@ def status_json(db_path, prices=None):
         "top_today": [
             {"model": name, "tokens": b["tokens"], "cost": round(b["cost"], 6)}
             for name, b in sorted(today_models.items(), key=lambda kv: -kv[1]["tokens"])[:5]
+        ],
+        # 面板「今日」页签用：今天真正用过的模型 / Agent，口径和「全部」一致
+        "models_today": [
+            {"model": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
+             "share": round(b["tokens"] / today_total, 4),
+             "subscription": name in subscription_models}
+            for name, b in sorted(today_models.items(), key=lambda kv: -kv[1]["tokens"])[:5]
+        ],
+        "agents_today": [
+            {"agent": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
+             "share": round(b["tokens"] / today_total, 4),
+             "subscription": agent_is_subscription(name)}
+            for name, b in sorted(today_agents.items(), key=lambda kv: -kv[1]["tokens"])[:5]
         ],
         "daily": daily_filled(items, 7),
         "models": [

@@ -37,6 +37,8 @@ struct Snapshot: Decodable {
     let daily: [DayPoint]?
     let models: [Slice]?
     let agents: [Slice]?
+    let modelsToday: [Slice]?
+    let agentsToday: [Slice]?
     let cacheRate: Double?
     let allTokens: Double?
     let allEvents: Int?
@@ -49,6 +51,8 @@ struct Snapshot: Decodable {
         case cacheRate = "cache_rate"
         case allTokens = "all_tokens"
         case allEvents = "all_events"
+        case modelsToday = "models_today"
+        case agentsToday = "agents_today"
     }
 }
 
@@ -79,8 +83,34 @@ final class PyBridge {
 
     func scan() { _ = run(arguments: ["scan"]) }
 
+    /// 打开看板：服务已经在跑就直接开浏览器，没跑就先起服务再开。
+    /// 原来不管服务在不在都 blindly 起一个 serve，端口被占用时进程直接退出，
+    /// 浏览器也不会打开——点上去就像"没反应"。
     func openDashboard() {
-        _ = run(arguments: ["serve", "--port", "\(kDashboardPort)"], wait: false)
+        let url = URL(string: "http://127.0.0.1:\(kDashboardPort)/")!
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            if !PyBridge.portOpen(kDashboardPort) {
+                _ = self?.run(arguments: ["serve", "--port", "\(kDashboardPort)"], wait: false)
+                Thread.sleep(forTimeInterval: 0.9)
+            }
+            DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+        }
+    }
+
+    private static func portOpen(_ port: Int) -> Bool {
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(port).bigEndian)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let handle = socket(AF_INET, SOCK_STREAM, 0)
+        if handle < 0 { return false }
+        defer { close(handle) }
+        let result = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(handle, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return result == 0
     }
 }
 
@@ -155,9 +185,28 @@ enum Palette {
 
 final class ChartView: NSView {
     var snapshot: Snapshot?
+    /// true = 明细卡片显示今天，false = 显示全部历史
+    var showToday = true { didSet { needsDisplay = true } }
+
+    private var tabTodayRect = NSRect.zero
+    private var tabAllRect = NSRect.zero
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
+
+    /// 只有两个页签可点，其余区域不抢事件
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if tabTodayRect.contains(point) { showToday = true; return }
+        if tabAllRect.contains(point) { showToday = false; return }
+        super.mouseDown(with: event)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(tabTodayRect, cursor: .pointingHand)
+        addCursorRect(tabAllRect, cursor: .pointingHand)
+    }
 
     private func text(_ string: String, _ point: NSPoint, size: CGFloat,
                       weight: NSFont.Weight = .regular, color: NSColor = Palette.text,
@@ -192,6 +241,7 @@ final class ChartView: NSView {
         }
         let symbol = snap.symbol ?? "¥"
         let today = snap.windows?["today"]
+        let totalCost = (snap.models ?? []).reduce(0.0) { $0 + $1.cost }
 
         // ── 今日 ──────────────────────────────────────────
         text("今日用量", NSPoint(x: 16, y: 12), size: 12, color: Palette.text)
@@ -249,21 +299,45 @@ final class ChartView: NSView {
                  color: Palette.muted)
         }
 
-        // ── 全部历史 ──────────────────────────────────────
+        // ── 明细：今日 / 全部 ─────────────────────────────
         let historyCard = NSRect(x: 12, y: 248, width: bounds.width - 24, height: 266)
         Palette.card.setFill()
         NSBezierPath(roundedRect: historyCard, xRadius: 10, yRadius: 10).fill()
-        text("全部历史", NSPoint(x: historyCard.minX + 14, y: historyCard.minY + 16),
-             size: 12, weight: .semibold)
 
-        let totalTokens = snap.allTokens ?? 0
-        let totalCost = (snap.models ?? []).reduce(0.0) { $0 + $1.cost }
-        text(cn(totalTokens), NSPoint(x: historyCard.maxX - 206,
-                                      y: historyCard.minY + 13),
+        // 两个页签，点一下切换。默认「今日」——最常看的就是今天花了多少。
+        let pillHeight: CGFloat = 21
+        let pillY = historyCard.minY + 9
+        tabTodayRect = NSRect(x: historyCard.minX + 14, y: pillY, width: 46, height: pillHeight)
+        tabAllRect = NSRect(x: tabTodayRect.maxX + 6, y: pillY, width: 46, height: pillHeight)
+        for (rect, title, on) in [(tabTodayRect, "今日", showToday),
+                                  (tabAllRect, "全部", !showToday)] {
+            let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+            if on {
+                Palette.mint.setFill()
+                path.fill()
+            } else {
+                Palette.line.setStroke()
+                path.lineWidth = 1
+                path.stroke()
+            }
+            text(title, NSPoint(x: rect.minX, y: rect.minY + 4), size: 10.5,
+                 weight: on ? .semibold : .regular,
+                 color: on ? Palette.bg : Palette.muted,
+                 align: .center, width: rect.width)
+        }
+
+        let shownModels = (showToday ? snap.modelsToday : snap.models) ?? []
+        let shownAgents = (showToday ? snap.agentsToday : snap.agents) ?? []
+        let headTokens = showToday ? (today?.tokens ?? 0) : (snap.allTokens ?? 0)
+        let headCost = showToday ? (today?.cost ?? 0) : totalCost
+        let headEvents = showToday ? (today?.events ?? 0) : (snap.allEvents ?? 0)
+
+        text(cn(headTokens), NSPoint(x: historyCard.maxX - 206,
+                                     y: historyCard.minY + 12),
              size: 18, weight: .semibold, color: Palette.mint,
              align: .right, width: 106)
-        text(money(totalCost, symbol), NSPoint(x: historyCard.maxX - 94,
-                                               y: historyCard.minY + 13),
+        text(money(headCost, symbol), NSPoint(x: historyCard.maxX - 94,
+                                              y: historyCard.minY + 12),
              size: 18, weight: .semibold, color: Palette.mint,
              align: .right, width: 80)
 
@@ -288,22 +362,25 @@ final class ChartView: NSView {
                  size: 10.5, color: Palette.text, align: .right, width: costW)
         }
 
+        if shownModels.isEmpty && shownAgents.isEmpty {
+            text(showToday ? "今天还没有用量" : "还没有数据",
+                 NSPoint(x: nameX, y: historyCard.minY + 60), size: 11, color: Palette.muted)
+        }
+
         section("按模型", top: 44)
-        for (index, slice) in (snap.models ?? []).prefix(4).enumerated() {
+        for (index, slice) in shownModels.prefix(4).enumerated() {
             row(slice.model ?? "?", slice.tokens, slice.cost,
                 top: 60 + CGFloat(index) * 22, isSub: slice.subscription ?? false)
         }
 
         section("按 Agent", top: 156)
-        for (index, slice) in (snap.agents ?? []).prefix(4).enumerated() {
+        for (index, slice) in shownAgents.prefix(4).enumerated() {
             row(slice.agent ?? "?", slice.tokens, slice.cost,
                 top: 174 + CGFloat(index) * 22, isSub: slice.subscription ?? false)
         }
 
-        if let events = snap.allEvents {
-            text("共 \(events) 次请求", NSPoint(x: 16, y: 522), size: 9.5,
-                 color: Palette.muted)
-        }
+        text("共 \(headEvents) 次请求", NSPoint(x: 16, y: 522), size: 9.5,
+             color: Palette.muted)
     }
 
     private func shortDate(_ text: String) -> String {
@@ -314,6 +391,54 @@ final class ChartView: NSView {
 }
 
 // MARK: - 面板
+
+/// 深色底上的胶囊按钮：有底色、有描边，hover 和按下都有反馈。
+/// 原来的无边框按钮在深色底上只是三行文字，点了也看不出反应。
+final class PanelButton: NSButton {
+    private var tracking: NSTrackingArea?
+
+    static let hoverColor = NSColor(srgbRed: 0.129, green: 0.157, blue: 0.204, alpha: 1)
+    static let pressColor = NSColor(srgbRed: 0.180, green: 0.216, blue: 0.274, alpha: 1)
+
+    static func make(_ title: String, target: AnyObject, action: Selector) -> PanelButton {
+        let button = PanelButton(title: title, target: target, action: action)
+        button.isBordered = false
+        button.setButtonType(.momentaryChange)
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 6
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = Palette.line.cgColor
+        button.layer?.backgroundColor = Palette.card.cgColor
+        button.attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: Palette.text,
+        ])
+        return button
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeInActiveApp],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        layer?.backgroundColor = PanelButton.hoverColor.cgColor
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        layer?.backgroundColor = Palette.card.cgColor
+    }
+
+    override func highlight(_ flag: Bool) {
+        super.highlight(flag)
+        layer?.backgroundColor = (flag ? PanelButton.pressColor : Palette.card).cgColor
+    }
+}
 
 final class PanelController: NSViewController {
     private let bridge = PyBridge()
@@ -341,30 +466,65 @@ final class PanelController: NSViewController {
         ]
         var x: CGFloat = 12
         for (title, action) in buttons {
-            // 无边框按钮默认黑字，在深色底上看不见 —— 手动给浅色标题
-            let button = NSButton(title: title, target: self, action: action)
-            button.isBordered = false
-            button.attributedTitle = NSAttributedString(string: title, attributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-                .foregroundColor: NSColor(srgbRed: 0.78, green: 0.83, blue: 0.88, alpha: 1),
-            ])
+            let button = PanelButton.make(title, target: self, action: action)
             button.sizeToFit()
-            button.frame = NSRect(x: x, y: 9, width: button.frame.width + 14, height: 22)
+            button.frame = NSRect(x: x, y: 9, width: button.frame.width + 18, height: 23)
             footer.addSubview(button)
             x += button.frame.width + 8
         }
+
+        // 右侧状态字：点了按钮有明确回执，而不是"点了没反应"
+        footerStatus.frame = NSRect(x: x + 4, y: 13,
+                                    width: kPanelWidth - x - 20, height: 16)
+        footer.addSubview(footerStatus)
+
         container.addSubview(footer)
         self.view = container
     }
 
+    private let footerStatus: NSTextField = {
+        let field = NSTextField(labelWithString: "")
+        field.font = NSFont.systemFont(ofSize: 10.5)
+        field.textColor = Palette.muted
+        field.alignment = .right
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.isEditable = false
+        field.isSelectable = false
+        return field
+    }()
+
+    private func note(_ text: String, color: NSColor = Palette.muted) {
+        footerStatus.textColor = color
+        footerStatus.stringValue = text
+    }
+
     @objc private func scanNow() {
+        note("采集中…", color: Palette.mint)
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.bridge.scan()
-            DispatchQueue.main.async { self?.reload() }
+            DispatchQueue.main.async {
+                self?.reload()
+                let stamp = DateFormatter()
+                stamp.dateFormat = "HH:mm"
+                self?.note("已采集 " + stamp.string(from: Date()), color: Palette.mint)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                    if self?.footerStatus.stringValue.hasPrefix("已采集") == true {
+                        self?.note("")
+                    }
+                }
+            }
         }
     }
 
-    @objc private func openDashboard() { bridge.openDashboard() }
+    @objc private func openDashboard() {
+        note("正在打开看板…", color: Palette.mint)
+        bridge.openDashboard()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.note("看板 127.0.0.1:8787", color: Palette.muted)
+        }
+    }
+
     @objc private func quit() { NSApp.terminate(nil) }
 
     func reload() {
@@ -495,6 +655,10 @@ struct TokenLensBarMain {
         let panel = PanelController()
         _ = panel.view
         panel.snapshot = PyBridge().load()
+        // 截图核对版式时用：TOKENLENS_PANEL_TAB=all 渲染「全部」页签
+        if ProcessInfo.processInfo.environment["TOKENLENS_PANEL_TAB"] == "all" {
+            panel.chart.showToday = false
+        }
         let size = panel.view.bounds.size
         let scale: CGFloat = 2
         guard let rep = NSBitmapImageRep(
