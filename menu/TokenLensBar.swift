@@ -657,6 +657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "tokenlens：本地 token 用量"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
+        configureStatusIcon()
 
         popover = NSPopover()
         popover.behavior = .transient
@@ -679,19 +680,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.timer = timer
     }
 
+    private func configureStatusIcon() {
+        guard let symbol = NSImage(systemSymbolName: "chart.bar.fill",
+                                   accessibilityDescription: "Token 用量") else { return }
+        let configuration = NSImage.SymbolConfiguration(pointSize: 10, weight: .medium)
+        let image = symbol.withSymbolConfiguration(configuration)
+        image?.isTemplate = true
+        statusItem.button?.image = image
+        statusItem.button?.imagePosition = .imageLeading
+        statusItem.button?.imageHugsTitle = true
+    }
+
+    private func statusTitle(_ today: Snapshot.Window, symbol: String) -> NSAttributedString {
+        let tokenFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        let moneyFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        let separatorFont = NSFont.systemFont(ofSize: 11, weight: .ultraLight)
+        let title = NSMutableAttributedString()
+        title.append(NSAttributedString(string: cn(today.tokens),
+                                        attributes: [.font: tokenFont]))
+        title.append(NSAttributedString(string: "\u{2002}\u{2502}\u{2002}",
+                                        attributes: [.font: separatorFont]))
+        title.append(NSAttributedString(string: moneyCompact(today.cost, symbol),
+                                        attributes: [.font: moneyFont]))
+        return title
+    }
+
     private func updateStatusItem(_ snapshot: Snapshot?) {
         guard let snapshot, snapshot.ok, let today = snapshot.windows?["today"] else {
             statusItem.button?.title = "—"
             return
         }
-        let title = cn(today.tokens) + " · " + moneyCompact(today.cost, snapshot.symbol ?? "¥")
-        statusItem.button?.title = title
+        let symbol = snapshot.symbol ?? "¥"
+        statusItem.button?.attributedTitle = statusTitle(today, symbol: symbol)
+        let plain = cn(today.tokens) + " │ " + moneyCompact(today.cost, symbol)
         if !loggedFirstTitle {
             loggedFirstTitle = true
-            logLine("首次刷新成功：菜单栏标题=\(title)")
+            logLine("首次刷新成功：菜单栏标题=\(plain)")
         }
         statusItem.button?.toolTip =
-            "今日 \(title) tokens · \(money(today.cost, snapshot.symbol ?? "¥"))"
+            "今日 \(cn(today.tokens)) tokens · \(money(today.cost, symbol)) · \(countText(today.events)) 次请求"
     }
 
     private func ensurePanel() -> NSHostingController<PanelView> {
