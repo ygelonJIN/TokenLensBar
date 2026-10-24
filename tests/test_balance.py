@@ -218,7 +218,7 @@ def main():
         try:
             try:
                 tl.fetch_mimo_balance({"type": "mimo_cookie"},
-                                      "api-platform_serviceToken=bad")
+                                      "api-platform_serviceToken=bad; userId=42")
                 mimo_401 = ""
             except tl.BalanceError as exc:
                 mimo_401 = str(exc)
@@ -232,6 +232,14 @@ def main():
         except tl.BalanceError as exc:
             mimo_missing = str(exc)
         passed &= check("MiMo 缺 serviceToken 报错", "serviceToken" in mimo_missing, True)
+
+        try:
+            tl.fetch_mimo_balance({"type": "mimo_cookie"},
+                                  "api-platform_serviceToken=tok")
+            mimo_no_uid = ""
+        except tl.BalanceError as exc:
+            mimo_no_uid = str(exc)
+        passed &= check("MiMo 缺 userId 报错", "userId" in mimo_no_uid, True)
 
         # 8. 401 不泄露 Key
         def fake_401(request, timeout=0):

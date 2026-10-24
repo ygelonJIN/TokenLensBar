@@ -1476,15 +1476,21 @@ def _cookie_header(value):
 
 
 def fetch_mimo_balance(entry, cookie, timeout=6.0):
-    """小米 MiMo 账户余额。控制台接口只认 Cookie，不认 API Key。"""
+    """小米 MiMo 账户余额。控制台接口只认 Cookie，不认 API Key。
+
+    需要两个值：api-platform_serviceToken（Cookie）和 userId（控制台地址里的
+    ?userId=...，服务端要它，但控制台页面上不一定把它显示成 Cookie）。
+    """
     header = _cookie_header(cookie)
     if not header:
         raise BalanceError("未配置 Cookie")
     if "serviceToken" not in header:
         raise BalanceError("Cookie 里缺少 api-platform_serviceToken")
+    if "userId" not in header:
+        raise BalanceError("Cookie 里缺少 userId（控制台地址 ?userId=...）")
     url = entry.get("url") or MIMO_BALANCE_URL
     data = _http_json(url, cookie=header, timeout=timeout,
-                      auth_error="Cookie 已失效，请重新登录后粘贴")
+                      auth_error="Cookie 已失效或缺少 userId，请重新登录后粘贴")
     if not isinstance(data, dict):
         raise BalanceError("返回格式异常")
     payload = data.get("data")

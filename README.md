@@ -79,23 +79,28 @@ chmod 600 ~/.tokenlensbar/secrets.json
 ### Xiaomi MiMo（Cookie）
 
 小米的按量付费余额只有控制台能查：`https://platform.xiaomimimo.com/api/v1/balance`，
-鉴权用控制台 Cookie（`api-platform_serviceToken` + `userId`），**不是 API Key**——
+鉴权用控制台会话（`api-platform_serviceToken` + `userId`），**不是 API Key**——
 API Key 只用于推理，查不了余额。
 
 1. 浏览器登录 `https://platform.xiaomimimo.com/#/console/balance`
-2. DevTools → Network → 任选一个 `api/v1` 请求 → Request Headers → 复制 `Cookie:` 整行
-3. 填进 `secrets.json` 的 `mimo_cookie`，把 `balances.json` 里 mimo 的 `enabled` 改成 `true`
+2. 拿两个值：
+   - DevTools → Application → Storage → Cookies → `https://platform.xiaomimimo.com`，
+     复制 `api-platform_serviceToken` 的 Value
+   - 控制台地址栏里的 `?userId=2725...`，取那串数字
+3. 拼成 `api-platform_serviceToken=<Value>; userId=<数字>`，填进 `secrets.json` 的 `mimo_cookie`，
+   把 `balances.json` 里 mimo 的 `enabled` 改成 `true`
 4. 点面板「立即采集」，或 `python3 ~/.tokenlensbar/tokenlensbar.py balance --refresh`
 
 编辑完 `secrets.json` 形如：
 
 ```json
-{"deepseek": "sk-...", "mimo_cookie": "api-platform_serviceToken=...; userId=..."}
+{"deepseek": "sk-...", "mimo_cookie": "api-platform_serviceToken=...; userId=2725019088"}
 ```
 
 注意：
 
-- Cookie 是整账号会话，权限比单个 API Key 大；只存这两个 Cookie，别提交到 git。
+- `userId` 不一定在 Cookie 列表里，它在控制台地址的 `?userId=` 后面；服务端要它，少一个就是 401。
+- Cookie 是整账号会话，权限比单个 API Key 大；只存这两个值，别提交到 git。
 - 过期后接口返回 401，面板显示 `Xiaomi MiMo: —`，鼠标悬停会提示「Cookie 已失效」，重新粘一次即可。
 - 这是控制台内部接口，小米改版就可能失效；失效时把 `enabled` 改成 `false` 即可，不影响 token 统计。
 
