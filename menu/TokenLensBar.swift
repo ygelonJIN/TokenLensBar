@@ -657,6 +657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
     private var loggedFirstTitle = false
+    private var themeObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -668,6 +669,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover = NSPopover()
         popover.behavior = .transient
         popover.animates = true
+
+        // 系统浅色/深色切换时，面板若开着就立刻跟着变。
+        themeObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.popover.isShown else { return }
+            self.applyPanelAppearance()
+        }
 
         model.$snapshot
             .receive(on: RunLoop.main)
@@ -725,6 +735,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return host
     }
 
+    /// 系统浅色/深色（不跟菜单栏的壁纸自适应走）。
+    private var systemIsDark: Bool {
+        NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
+    /// 把面板的 AppKit 外观和 SwiftUI colorScheme 一起切到系统外观。
+    /// popover 单独设 appearance，否则会继承菜单栏的 VibrantDark。
+    private func applyPanelAppearance() {
+        let isDark = systemIsDark
+        let appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
+        popover.appearance = appearance
+        popover.contentViewController?.view.window?.appearance = appearance
+        panel?.view.appearance = appearance
+        model.colorScheme = isDark ? .dark : .light
+    }
+
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
@@ -732,20 +758,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         model.reload()
-        let menuDark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        model.colorScheme = menuDark ? .dark : .light
         let host = ensurePanel()
+        applyPanelAppearance()
         popover.contentViewController = host
         popover.contentSize = NSSize(width: kPanelWidth, height: kPanelHeight)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            let effective = self.popover.contentViewController?.view.window?.effectiveAppearance
-                ?? NSApp.effectiveAppearance
-            let isDark = effective.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            self.panel?.view.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
-            self.model.colorScheme = isDark ? .dark : .light
+            self?.applyPanelAppearance()
         }
     }
 }
