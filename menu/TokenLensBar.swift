@@ -6,8 +6,8 @@ import Cocoa
 
 let kRefreshInterval: TimeInterval = 60
 let kDashboardPort = 8787
-let kPanelWidth: CGFloat = 428
-let kFooterHeight: CGFloat = 44
+let kPanelWidth: CGFloat = 372
+let kFooterHeight: CGFloat = 42
 
 // MARK: - 取数
 
@@ -187,73 +187,47 @@ final class ChartView: NSView {
     var snapshot: Snapshot? {
         didSet { needsDisplay = true; relayout() }
     }
-    /// 近 7 天图表默认收起，点按钮才展开
-    var chartExpanded = false {
-        didSet {
-            needsDisplay = true
-            relayout()
-            window?.invalidateCursorRects(for: self)
-        }
-    }
 
     /// 内容高度（不含底部按钮栏），由实际行数决定
-    private(set) var contentHeight: CGFloat = 660
+    private(set) var contentHeight: CGFloat = 640
     var onHeightChange: ((CGFloat) -> Void)?
 
-    private var toggleRect = NSRect.zero
-    private let pad: CGFloat = 16
-    private let inset: CGFloat = 14
+    private let pad: CGFloat = 14
+    private let inset: CGFloat = 13
     private let rowHeight: CGFloat = 21
+    private let chartHeight: CGFloat = 104
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
 
-    // MARK: - 交互
-
-    /// 只有「近 7 天」这个按钮可点
-    override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        if toggleRect.contains(point) {
-            chartExpanded.toggle()
-            return
-        }
-        super.mouseDown(with: event)
-    }
-
-    override func resetCursorRects() {
-        super.resetCursorRects()
-        addCursorRect(toggleRect, cursor: .pointingHand)
-    }
-
     // MARK: - 布局
 
-    private func plan() -> (height: CGFloat, toggle: NSRect, today: NSRect, all: NSRect) {
+    private func plan() -> (height: CGFloat, today: NSRect, chart: NSRect, all: NSRect) {
         guard let snap = snapshot, snap.ok else {
             return (160, .zero, .zero, .zero)
         }
         let width = (bounds.width > 0 ? bounds.width : kPanelWidth) - pad * 2
         var y: CGFloat = 0
-        y += 82
-
-        let toggle = NSRect(x: pad, y: y, width: 156, height: 25)
-        y += 25 + 10
-        if chartExpanded { y += 152 }
+        y += 68
 
         let modelsToday = snap.modelsToday?.count ?? 0
         let agentsToday = snap.agentsToday?.count ?? 0
-        let todayHeight = 12 + 18 + CGFloat(max(modelsToday, 1)) * rowHeight
-            + 8 + 18 + CGFloat(max(agentsToday, 1)) * rowHeight + 12
+        let todayHeight = 12 + 17 + CGFloat(max(modelsToday, 1)) * rowHeight
+            + 6 + 17 + CGFloat(max(agentsToday, 1)) * rowHeight + 11
         let today = NSRect(x: pad, y: y, width: width, height: todayHeight)
         y += todayHeight + 10
 
+        let chart = NSRect(x: pad, y: y, width: width, height: chartHeight)
+        y += chartHeight + 10
+
         let modelsAll = snap.models?.count ?? 0
         let agentsAll = snap.agents?.count ?? 0
-        let allHeight = 42 + 18 + CGFloat(max(modelsAll, 1)) * rowHeight
-            + 8 + 18 + CGFloat(max(agentsAll, 1)) * rowHeight + 24
+        let allHeight = 38 + 17 + CGFloat(max(modelsAll, 1)) * rowHeight
+            + 6 + 17 + CGFloat(max(agentsAll, 1)) * rowHeight + 21
         let all = NSRect(x: pad, y: y, width: width, height: allHeight)
-        y += allHeight + 12
+        y += allHeight + 6
 
-        return (y, toggle, today, all)
+        return (y, today, chart, all)
     }
 
     private func relayout() {
@@ -284,7 +258,7 @@ final class ChartView: NSView {
 
     private func card(_ rect: NSRect) {
         Palette.card.setFill()
-        NSBezierPath(roundedRect: rect, xRadius: 12, yRadius: 12).fill()
+        NSBezierPath(roundedRect: rect, xRadius: 11, yRadius: 11).fill()
     }
 
     private func sectionLabel(_ string: String, _ point: NSPoint) {
@@ -292,18 +266,14 @@ final class ChartView: NSView {
     }
 
     private func row(_ box: NSRect, top: CGFloat, name: String, tokens: Double, cost: Double,
-                     color: NSColor, symbol: String, subscription: Bool = false) {
-        color.withAlphaComponent(0.9).setFill()
-        NSBezierPath(roundedRect: NSRect(x: box.minX + inset, y: top + 4,
-                                         width: 3, height: 11),
-                     xRadius: 1.5, yRadius: 1.5).fill()
-        text(name, NSPoint(x: box.minX + inset + 10, y: top), size: 11.5,
-             width: box.width - 190)
-        text(cn(tokens), NSPoint(x: box.maxX - inset - 152, y: top + 1), size: 10.5,
-             color: Palette.muted, align: .right, width: 86)
+                     symbol: String, subscription: Bool = false) {
+        text(name, NSPoint(x: box.minX + inset, y: top), size: 11,
+             width: box.width - 168)
+        text(cn(tokens), NSPoint(x: box.maxX - inset - 148, y: top + 1), size: 10,
+             color: Palette.muted, align: .right, width: 84)
         text(costText(cost, tokens: tokens, symbol, subscription: subscription),
-             NSPoint(x: box.maxX - inset - 66, y: top), size: 11.5,
-             color: Palette.text, align: .right, width: 66)
+             NSPoint(x: box.maxX - inset - 62, y: top), size: 11,
+             color: Palette.text, align: .right, width: 62)
     }
 
     // MARK: - 绘制
@@ -316,152 +286,135 @@ final class ChartView: NSView {
             return
         }
         let symbol = snap.symbol ?? "¥"
-        let today = snap.windows?["today"]
         let layout = plan()
-        toggleRect = layout.toggle
 
-        drawHeadline(snap, today: today, symbol: symbol)
-        drawToggle(layout.toggle, week: snap.windows?["week"], symbol: symbol)
-        if chartExpanded {
-            drawWeekChart(snap, top: layout.toggle.maxY + 10, symbol: symbol)
-        }
+        drawHeadline(snap, today: snap.windows?["today"], symbol: symbol)
         drawTodayCard(layout.today, snap: snap, symbol: symbol)
+        drawWeekChart(snap, box: layout.chart, symbol: symbol)
         drawAllCard(layout.all, snap: snap, symbol: symbol)
     }
 
     private func drawHeadline(_ snap: Snapshot, today: Snapshot.Window?, symbol: String) {
-        text("今日用量", NSPoint(x: pad, y: 10), size: 11, color: Palette.muted)
-        text(cn(today?.tokens ?? 0), NSPoint(x: pad - 1, y: 25), size: 25,
+        text("今日用量", NSPoint(x: pad, y: 7), size: 10, color: Palette.muted)
+        text(cn(today?.tokens ?? 0), NSPoint(x: pad - 1, y: 20), size: 23,
              weight: .semibold, color: Palette.mint)
-        text(money(today?.cost ?? 0, symbol), NSPoint(x: 0, y: 28), size: 21,
+        text(money(today?.cost ?? 0, symbol), NSPoint(x: 0, y: 23), size: 20,
              weight: .semibold, color: Palette.mint, align: .right,
              width: bounds.width - pad)
         let rate = Int(((snap.cacheRate ?? 0) * 100).rounded())
         text("缓存命中 \(rate)% · \(today?.events ?? 0) 次请求",
-             NSPoint(x: pad, y: 57), size: 10, color: Palette.muted)
+             NSPoint(x: pad, y: 48), size: 9.5, color: Palette.muted)
     }
 
-    private func drawToggle(_ rect: NSRect, week: Snapshot.Window?, symbol: String) {
-        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
-        Palette.card.setFill()
-        path.fill()
-        Palette.line.setStroke()
-        path.lineWidth = 1
-        path.stroke()
-        text("近 7 天", NSPoint(x: rect.minX + 13, y: rect.minY + 5), size: 11,
-             weight: .medium, color: Palette.text)
-        text(money(week?.cost ?? 0, symbol), NSPoint(x: rect.maxX - 70, y: rect.minY + 6),
-             size: 10.5, color: Palette.mint, align: .right, width: 46)
-        text(chartExpanded ? "▴" : "▾", NSPoint(x: rect.maxX - 22, y: rect.minY + 4),
-             size: 10, color: Palette.muted, align: .center, width: 12)
+    private func drawTodayCard(_ box: NSRect, snap: Snapshot, symbol: String) {
+        card(box)
+        var y = box.minY + 11
+
+        sectionLabel("按模型", NSPoint(x: box.minX + inset, y: y))
+        y += 17
+        let models = snap.modelsToday ?? []
+        if models.isEmpty {
+            text("今天还没有用量", NSPoint(x: box.minX + inset, y: y + 1),
+                 size: 10.5, color: Palette.muted)
+        }
+        for (index, slice) in models.enumerated() {
+            row(box, top: y + CGFloat(index) * rowHeight, name: slice.model ?? "?",
+                tokens: slice.tokens, cost: slice.cost, symbol: symbol,
+                subscription: slice.subscription ?? false)
+        }
+        y += CGFloat(max(models.count, 1)) * rowHeight + 6
+
+        sectionLabel("按 Agent", NSPoint(x: box.minX + inset, y: y))
+        y += 17
+        let agents = snap.agentsToday ?? []
+        for (index, slice) in agents.enumerated() {
+            row(box, top: y + CGFloat(index) * rowHeight, name: slice.agent ?? "?",
+                tokens: slice.tokens, cost: slice.cost, symbol: symbol,
+                subscription: slice.subscription ?? false)
+        }
     }
 
-    private func drawWeekChart(_ snap: Snapshot, top: CGFloat, symbol: String) {
-        let box = NSRect(x: pad, y: top, width: bounds.width - pad * 2, height: 142)
+    /// 近 7 天：常驻显示，做得紧凑一点
+    private func drawWeekChart(_ snap: Snapshot, box: NSRect, symbol: String) {
         card(box)
         let days = snap.daily ?? []
         guard !days.isEmpty else { return }
 
+        text("近 7 天", NSPoint(x: box.minX + inset, y: box.minY + 7), size: 9.5,
+             color: Palette.muted)
+        let week = snap.windows?["week"]
+        text(money(week?.cost ?? 0, symbol),
+             NSPoint(x: box.maxX - inset - 70, y: box.minY + 7), size: 9.5,
+             color: Palette.mint, align: .right, width: 70)
+
         let labelX = box.minX + inset
-        let chartX = box.minX + 52
+        let chartX = box.minX + 40
         let chartW = box.maxX - inset - chartX
         let slot = chartW / CGFloat(days.count)
-        let barsTop = box.minY + 14
-        let barsBottom = box.minY + 82
+        let barsTop = box.minY + 22
+        let barsBottom = box.minY + 60
         let maxValue = max(1, days.map { $0.tokens }.max() ?? 1)
 
         for (index, day) in days.enumerated() {
             let centerX = chartX + CGFloat(index) * slot + slot / 2
             let height = max(day.tokens > 0 ? 2 : 1,
                              CGFloat(day.tokens / maxValue) * (barsBottom - barsTop))
-            let bar = NSRect(x: centerX - (slot - 14) / 2, y: barsBottom - height,
-                             width: max(2, slot - 14), height: height)
+            let bar = NSRect(x: centerX - (slot - 9) / 2, y: barsBottom - height,
+                             width: max(2, slot - 9), height: height)
             (index == days.count - 1 ? Palette.mint : Palette.mint.withAlphaComponent(0.45)).setFill()
-            NSBezierPath(roundedRect: bar, xRadius: 3, yRadius: 3).fill()
+            NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
 
             let cellX = chartX + CGFloat(index) * slot
             let hasData = day.tokens > 0
             text(hasData ? cnTiny(day.tokens) : "—",
-                 NSPoint(x: cellX, y: box.minY + 84), size: 8.5,
+                 NSPoint(x: cellX, y: box.minY + 62), size: 8,
                  color: hasData ? Palette.text : Palette.muted, align: .center, width: slot)
             text(hasData ? costText(day.cost ?? 0, tokens: day.tokens, symbol) : "—",
-                 NSPoint(x: cellX, y: box.minY + 99), size: 8.5,
+                 NSPoint(x: cellX, y: box.minY + 74), size: 8,
                  color: hasData ? Palette.mint : Palette.muted, align: .center, width: slot)
-            text(shortDate(day.date), NSPoint(x: cellX, y: box.minY + 116), size: 8,
+            text(shortDate(day.date), NSPoint(x: cellX, y: box.minY + 86), size: 7.5,
                  color: Palette.muted, align: .center, width: slot)
         }
 
-        text("Token", NSPoint(x: labelX, y: box.minY + 84), size: 8, color: Palette.muted)
-        text("金额", NSPoint(x: labelX, y: box.minY + 99), size: 8, color: Palette.muted)
-        text("日期", NSPoint(x: labelX, y: box.minY + 116), size: 8, color: Palette.muted)
-    }
-
-    private func drawTodayCard(_ box: NSRect, snap: Snapshot, symbol: String) {
-        card(box)
-        var y = box.minY + 12
-
-        sectionLabel("按模型", NSPoint(x: box.minX + inset, y: y))
-        y += 18
-        let models = snap.modelsToday ?? []
-        if models.isEmpty {
-            text("今天还没有用量", NSPoint(x: box.minX + inset, y: y + 2),
-                 size: 11, color: Palette.muted)
-        }
-        for (index, slice) in models.enumerated() {
-            row(box, top: y + CGFloat(index) * rowHeight, name: slice.model ?? "?",
-                tokens: slice.tokens, cost: slice.cost,
-                color: Palette.series[index % Palette.series.count], symbol: symbol,
-                subscription: slice.subscription ?? false)
-        }
-        y += CGFloat(max(models.count, 1)) * rowHeight + 8
-
-        sectionLabel("按 Agent", NSPoint(x: box.minX + inset, y: y))
-        y += 18
-        let agents = snap.agentsToday ?? []
-        for (index, slice) in agents.enumerated() {
-            row(box, top: y + CGFloat(index) * rowHeight, name: slice.agent ?? "?",
-                tokens: slice.tokens, cost: slice.cost,
-                color: Palette.series[(index + 2) % Palette.series.count], symbol: symbol,
-                subscription: slice.subscription ?? false)
-        }
+        text("Token", NSPoint(x: labelX, y: box.minY + 62), size: 7.5, color: Palette.muted)
+        text("金额", NSPoint(x: labelX, y: box.minY + 74), size: 7.5, color: Palette.muted)
+        text("日期", NSPoint(x: labelX, y: box.minY + 86), size: 7.5, color: Palette.muted)
     }
 
     private func drawAllCard(_ box: NSRect, snap: Snapshot, symbol: String) {
         card(box)
         let cost = (snap.models ?? []).reduce(0.0) { $0 + $1.cost }
 
-        text("全部历史", NSPoint(x: box.minX + inset, y: box.minY + 14), size: 11.5,
+        text("全部历史", NSPoint(x: box.minX + inset, y: box.minY + 12), size: 11,
              weight: .semibold)
-        text(money(cost, symbol), NSPoint(x: box.maxX - inset - 70, y: box.minY + 13),
-             size: 13, weight: .semibold, color: Palette.mint, align: .right, width: 70)
+        text(money(cost, symbol), NSPoint(x: box.maxX - inset - 64, y: box.minY + 11),
+             size: 12, weight: .semibold, color: Palette.mint, align: .right, width: 64)
         text(cn(snap.allTokens ?? 0),
-             NSPoint(x: box.maxX - inset - 70 - 96, y: box.minY + 13),
-             size: 13, weight: .semibold, color: Palette.mint, align: .right, width: 92)
+             NSPoint(x: box.maxX - inset - 64 - 86, y: box.minY + 11),
+             size: 12, weight: .semibold, color: Palette.mint, align: .right, width: 84)
 
-        var y = box.minY + 42
+        var y = box.minY + 38
         sectionLabel("按模型", NSPoint(x: box.minX + inset, y: y))
-        y += 18
+        y += 17
         let models = snap.models ?? []
         for (index, slice) in models.enumerated() {
             row(box, top: y + CGFloat(index) * rowHeight, name: slice.model ?? "?",
-                tokens: slice.tokens, cost: slice.cost,
-                color: Palette.series[index % Palette.series.count], symbol: symbol,
+                tokens: slice.tokens, cost: slice.cost, symbol: symbol,
                 subscription: slice.subscription ?? false)
         }
-        y += CGFloat(max(models.count, 1)) * rowHeight + 8
+        y += CGFloat(max(models.count, 1)) * rowHeight + 6
 
         sectionLabel("按 Agent", NSPoint(x: box.minX + inset, y: y))
-        y += 18
+        y += 17
         let agents = snap.agents ?? []
         for (index, slice) in agents.enumerated() {
             row(box, top: y + CGFloat(index) * rowHeight, name: slice.agent ?? "?",
-                tokens: slice.tokens, cost: slice.cost,
-                color: Palette.series[(index + 1) % Palette.series.count], symbol: symbol,
+                tokens: slice.tokens, cost: slice.cost, symbol: symbol,
                 subscription: slice.subscription ?? false)
         }
 
         text("共 \(snap.allEvents ?? 0) 次请求",
-             NSPoint(x: box.minX + inset, y: box.maxY - 22), size: 9.5, color: Palette.muted)
+             NSPoint(x: box.minX + inset, y: box.maxY - 20), size: 9, color: Palette.muted)
     }
 
     private func shortDate(_ text: String) -> String {
@@ -560,11 +513,11 @@ final class PanelController: NSViewController {
         for (title, action) in buttons {
             let button = PanelButton.make(title, target: self, action: action)
             button.sizeToFit()
-            button.frame = NSRect(x: x, y: 10, width: button.frame.width + 18, height: 23)
+            button.frame = NSRect(x: x, y: 9, width: button.frame.width + 16, height: 22)
             footer.addSubview(button)
             x += button.frame.width + 8
         }
-        footerStatus.frame = NSRect(x: x + 4, y: 14,
+        footerStatus.frame = NSRect(x: x + 4, y: 13,
                                     width: kPanelWidth - x - 20, height: 16)
         footer.addSubview(footerStatus)
 
@@ -676,7 +629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     logLine("取数失败")
                     return
                 }
-                let title = cn(today.tokens)
+                let title = cn(today.tokens) + " · " + moneyCompact(today.cost, snapshot.symbol ?? "¥")
                 self.statusItem.button?.title = title
                 if !self.loggedFirstTitle {
                     self.loggedFirstTitle = true
@@ -752,10 +705,6 @@ struct TokenLensBarMain {
         let panel = PanelController()
         _ = panel.view
         panel.snapshot = PyBridge().load()
-        // 截图核对版式时用：TOKENLENS_PANEL_CHART=1 渲染展开的近 7 天图表
-        if ProcessInfo.processInfo.environment["TOKENLENS_PANEL_CHART"] == "1" {
-            panel.chart.chartExpanded = true
-        }
         let size = panel.view.bounds.size
         let scale: CGFloat = 2
         guard let rep = NSBitmapImageRep(
