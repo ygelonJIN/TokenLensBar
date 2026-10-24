@@ -6,15 +6,31 @@
 <title>tokenlens · 本地用量看板</title>
 <style>
   :root {
-    --bg: #0d1117;
-    --panel: #161b22;
-    --panel-2: #1c2230;
-    --line: #262d3a;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --accent: #38d39f;
-    --accent-2: #7c8cff;
-    --warn: #f0b429;
+    color-scheme: light dark;
+    --bg: #f5f5f7;
+    --panel: #ffffff;
+    --panel-2: #f0f0f2;
+    --line: #d9d9de;
+    --text: #1d1d1f;
+    --muted: #6e6e73;
+    --accent: #007aff;
+    --accent-2: #5e5ce6;
+    --warn: #b25000;
+    --hover: rgba(0, 0, 0, .035);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1c1e;
+      --panel: #2c2c2e;
+      --panel-2: #3a3a3c;
+      --line: #3a3a3c;
+      --text: #f2f2f7;
+      --muted: #8e8e93;
+      --accent: #0a84ff;
+      --accent-2: #5e5ce6;
+      --warn: #ff9f0a;
+      --hover: rgba(255, 255, 255, .06);
+    }
   }
   * { box-sizing: border-box; }
   body {
@@ -31,12 +47,12 @@
   h1 span { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 10px; }
   .tabs { display: flex; gap: 6px; }
   .tabs button {
-    background: var(--panel); color: var(--muted); border: 1px solid var(--line);
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
     border-radius: 7px; padding: 5px 13px; font-size: 13px; cursor: pointer;
-    transition: all .15s;
+    transition: background .15s, color .15s, border-color .15s;
   }
-  .tabs button:hover { color: var(--text); border-color: #39445a; }
-  .tabs button.on { background: var(--accent); color: #06231a; border-color: var(--accent); font-weight: 600; }
+  .tabs button:hover { color: var(--text); background: var(--hover); }
+  .tabs button.on { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
 
   .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 26px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 15px 17px; }
@@ -49,45 +65,49 @@
   section h2 { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
   section .hint { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
 
-  .chart { display: flex; align-items: flex-end; gap: 3px; height: 132px; padding-top: 8px; }
-  .chart .bar { flex: 1; min-width: 2px; position: relative; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
-  .chart .bar i { display: block; background: linear-gradient(180deg, var(--accent), #1d7f63); border-radius: 2px 2px 0 0; min-height: 2px; transition: opacity .12s; }
-  .chart .bar:hover i { opacity: .65; }
-  .chart .bar:hover::after {
-    content: attr(data-tip); position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
-    background: #0b0f16; border: 1px solid var(--line); color: var(--text);
-    padding: 4px 9px; border-radius: 6px; font-size: 11px; white-space: nowrap; z-index: 5;
-  }
+  .treemap { position: relative; height: 300px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .tm { position: absolute; box-sizing: border-box; overflow: hidden; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; border: 1px solid var(--line); border-radius: 4px; }
+  .tm-model { background: color-mix(in srgb, var(--c) 18%, var(--panel)); border-color: color-mix(in srgb, var(--c) 40%, var(--line)); }
+  .tm-agent { background: color-mix(in srgb, var(--c) 36%, var(--panel)); border-color: color-mix(in srgb, var(--c) 65%, var(--line)); }
+  .tm .n { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tm .v { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tm-small { padding: 3px 5px; }
+  .tm-small .n { font-size: 10px; font-weight: 500; }
+  .tm-small .v { display: none; }
 
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
   th { text-align: right; font-weight: 500; color: var(--muted); font-size: 12px; padding: 0 10px 9px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; }
-  td { text-align: right; padding: 9px 10px; border-bottom: 1px solid #1b2029; white-space: nowrap; }
+  td { text-align: right; padding: 9px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   tbody tr:last-child td { border-bottom: none; }
-  tbody tr:hover td { background: #1a2029; }
+  tbody tr:hover td { background: var(--hover); }
 
   .name { color: var(--text); font-weight: 500; }
   .agents { color: var(--muted); font-size: 11px; margin-left: 8px; }
   .share { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
-  .share .track { width: 62px; height: 5px; background: #222a36; border-radius: 3px; overflow: hidden; }
+  .share .track { width: 62px; height: 5px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
   .share .fill { height: 100%; background: var(--accent-2); border-radius: 3px; }
   .cost { color: var(--accent); }
 
-  .warn { background: rgba(240,180,41,.09); border: 1px solid rgba(240,180,41,.35); color: var(--warn);
+  .warn { background: color-mix(in srgb, var(--warn) 9%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); color: var(--warn);
           border-radius: 10px; padding: 12px 16px; font-size: 13px; margin-bottom: 18px; }
   .warn b { font-weight: 600; }
 
   footer { color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
   .empty { text-align: center; color: var(--muted); padding: 60px 0; }
   tbody tr.dim td { color: var(--muted); }
-  tbody tr.dim td .cost { color: #6f8f83; }
-  @media (max-width: 860px) { .cards { grid-template-columns: repeat(2, 1fr); } body { padding: 20px 14px 40px; } }
+  tbody tr.dim td .cost { color: var(--muted); }
+  @media (max-width: 860px) {
+    .cards { grid-template-columns: repeat(2, 1fr); }
+    body { padding: 20px 14px 40px; }
+    .treemap { height: 240px; }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>tokenlens <span>本地 token 用量 · 不联网 · 不读 API Key</span></h1>
+    <h1>tokenlens <span>本地 token 用量 · 数据不出本机 · 余额查询可选</span></h1>
     <div class="tabs" id="tabs">
       <button data-days="7">7 天</button>
       <button data-days="30" class="on">30 天</button>
@@ -121,6 +141,85 @@ async function load(days) {
   const res = await fetch('/api/summary?days=' + days);
   const d = await res.json();
   render(d);
+}
+
+
+const TREE_COLORS = ['#0a84ff', '#5e5ce6', '#ff9f0a', '#ff375f', '#30d158', '#64d2ff'];
+let treeColorFor = new Map();
+
+function buildTree(d) {
+  const models = new Map();
+  (d.matrix || []).forEach(c => {
+    const model = c.model || '(未知)';
+    const agent = c.agent || '(未知)';
+    if (!models.has(model)) models.set(model, { name: model, tokens: 0, cost: 0, children: new Map() });
+    const m = models.get(model);
+    m.tokens += c.total;
+    m.cost += c.cost;
+    if (!m.children.has(agent)) m.children.set(agent, { name: agent, tokens: 0, cost: 0 });
+    const a = m.children.get(agent);
+    a.tokens += c.total;
+    a.cost += c.cost;
+  });
+  return [...models.values()]
+    .map(m => ({ ...m, children: [...m.children.values()] }))
+    .filter(m => m.tokens > 0)
+    .sort((a, b) => b.tokens - a.tokens);
+}
+
+function layoutTree(items, x, y, w, h, depth, out, inheritedColor) {
+  const total = items.reduce((sum, item) => sum + item.tokens, 0);
+  if (!items.length || total <= 0) return;
+
+  if (items.length === 1) {
+    const item = items[0];
+    const color = inheritedColor || treeColorFor.get(item.name) || TREE_COLORS[0];
+    if (depth === 0 && item.children && item.children.length > 1) {
+      const header = Math.min(7, Math.max(3, h * 0.20));
+      out.push({ kind: 'model', item, x, y, w, h, color });
+      layoutTree(item.children, x, y + header, w, h - header, depth + 1, out, color);
+    } else {
+      out.push({ kind: depth === 0 ? 'model' : 'agent', item, x, y, w, h, color });
+    }
+    return;
+  }
+
+  let split = 1;
+  let acc = 0;
+  for (; split < items.length; split++) {
+    acc += items[split - 1].tokens;
+    if (acc >= total / 2) break;
+  }
+  if (split >= items.length) split = items.length - 1;
+
+  const first = items.slice(0, split);
+  const second = items.slice(split);
+  const ratio = first.reduce((sum, item) => sum + item.tokens, 0) / total;
+
+  if (w >= h) {
+    layoutTree(first, x, y, w * ratio, h, depth, out, inheritedColor);
+    layoutTree(second, x + w * ratio, y, w * (1 - ratio), h, depth, out, inheritedColor);
+  } else {
+    layoutTree(first, x, y, w, h * ratio, depth, out, inheritedColor);
+    layoutTree(second, x, y + h * ratio, w, h * (1 - ratio), depth, out, inheritedColor);
+  }
+}
+
+function renderTreemap(tree) {
+  const total = tree.reduce((sum, item) => sum + item.tokens, 0);
+  if (!total) return '<div class="empty">暂无数据</div>';
+  treeColorFor = new Map(tree.map((m, i) => [m.name, TREE_COLORS[i % TREE_COLORS.length]]));
+  const out = [];
+  layoutTree(tree, 0, 0, 100, 100, 0, out, undefined);
+  return `<div class="treemap">${out.map(r => {
+    const share = (r.item.tokens / total * 100).toFixed(1);
+    const small = (r.w * r.h) < 90 ? ' tm-small' : '';
+    const value = r.kind === 'model'
+      ? `${fmt(r.item.tokens)} · ${share}%`
+      : fmt(r.item.tokens);
+    const cls = r.kind === 'model' ? 'tm-model' : 'tm-agent';
+    return `<div class="tm ${cls}${small}" style="left:${r.x}%;top:${r.y}%;width:${r.w}%;height:${r.h}%;--c:${r.color}"><span class="n">${esc(r.item.name)}</span><span class="v">${value}</span></div>`;
+  }).join('')}</div>`;
 }
 
 function render(d) {
@@ -164,18 +263,13 @@ function render(d) {
       —— token 已计入总量，但成本算不出来。补到 <code>~/.tokenlens/prices.json</code> 即可。
     </div>` : '';
 
-  const daily = d.daily || [];
-  const maxDay = Math.max(1, ...daily.map(x => x.tokens));
-  const chart = `
+  const treeData = buildTree(d);
+  const tree = treeData.length ? `
     <section>
-      <h2>每日用量</h2>
-      <div class="hint">共 ${daily.length} 天有记录，峰值 ${fmt(maxDay)} tokens/天</div>
-      <div class="chart">
-        ${daily.map(x => `<div class="bar" data-tip="${x.date} · ${fmt(x.tokens)} · ${x.count} 次">
-             <i style="height:${Math.max(2, x.tokens / maxDay * 100)}%"></i>
-           </div>`).join('')}
-      </div>
-    </section>`;
+      <h2>用量树状图</h2>
+      <div class="hint">矩形面积 = Token；外层模型，内层 Agent</div>
+      ${renderTreemap(treeData)}
+    </section>` : '';
 
   const grand = t.tokens || 1;
   const modelRows = d.models.map(m => `
@@ -261,7 +355,7 @@ function render(d) {
       </table>
     </section>` : '';
 
-  box.innerHTML = cars + warn + chart + models + agents + matrix + outsideBlock;
+  box.innerHTML = cars + warn + tree + models + agents + matrix + outsideBlock;
 
   document.getElementById('src').textContent =
     '数据源：' + d.sources.map(s => `${s.agent}(${s.files})`).join('  ') + ' · 本机 SQLite';

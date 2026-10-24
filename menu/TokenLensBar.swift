@@ -1,6 +1,5 @@
 import Cocoa
 import SwiftUI
-import Charts
 import Combine
 
 // 菜单栏外壳 + 点开的图表面板。
@@ -212,7 +211,7 @@ func logLine(_ message: String) {
     }
 }
 
-let kPanelHeight: CGFloat = 560
+let kPanelHeight: CGFloat = 460
 
 func shortDate(_ text: String) -> String {
     let parts = text.split(separator: "-")
@@ -231,6 +230,17 @@ func balanceText(_ value: Double, currency: String) -> String {
     let number = formatter.string(from: NSNumber(value: abs(value)))
         ?? String(format: "%.2f", abs(value))
     return (value < 0 ? "-" : "") + symbol + number
+}
+
+func balanceSummary(_ snapshot: Snapshot?) -> String {
+    guard let balances = snapshot?.balances, balances.configured == true,
+          let providers = balances.providers, !providers.isEmpty else { return "—" }
+    let values = providers.flatMap { provider in
+        (provider.items ?? []).map {
+            balanceText($0.total ?? 0, currency: $0.currency ?? "CNY")
+        }
+    }
+    return values.isEmpty ? "—" : values.joined(separator: " · ")
 }
 
 func clockText(_ epoch: Double) -> String {
@@ -307,7 +317,6 @@ final class PanelModel: ObservableObject {
 enum PanelTab: String, CaseIterable, Identifiable {
     case overview = "概览"
     case history = "历史"
-    case balance = "余额"
 
     var id: String { rawValue }
 }
@@ -327,22 +336,18 @@ struct PanelView: View {
             VStack(spacing: 0) {
                 topBar
                 if model.snapshot?.ok == true {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 0) {
-                            switch tab {
-                            case .overview:
-                                OverviewSections(model: model)
-                            case .history:
-                                HistorySections(model: model)
-                            case .balance:
-                                BalanceSections(model: model)
-                            }
+                    if tab == .overview {
+                        OverviewSections(model: model)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity,
+                                   alignment: .top)
+                            .padding(.bottom, 62)
+                    } else {
+                        ScrollView {
+                            HistorySections(model: model)
+                                .padding(.bottom, 62)
                         }
-                        .padding(.vertical, 2)
-                        .padding(.bottom, 30)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    .frame(height: max(120, geo.size.height - 84))
-                    .clipped()
                 } else {
                     Spacer(minLength: 0)
                     emptyState
@@ -358,37 +363,24 @@ struct PanelView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("tokenlens").font(.headline)
-                Text("本地 token 用量").font(.caption).foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Text("余额")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(balanceSummary(model.snapshot))
+                    .font(.headline)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
             }
-            Spacer()
-            Menu {
-                Button {
-                    model.scan()
-                } label: {
-                    Label("立即采集", systemImage: "arrow.clockwise")
-                }
-                Button {
-                    model.openDashboard()
-                } label: {
-                    Label("打开看板", systemImage: "rectangle.on.rectangle")
-                }
-                Divider()
-                Button(role: .destructive) {
-                    model.quit()
-                } label: {
-                    Label("退出", systemImage: "power")
-                }
-            } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 14))
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("操作")
+            Text("本地 token 用量")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
         .padding(.top, 10)
         .padding(.bottom, 8)
@@ -415,6 +407,36 @@ struct PanelView: View {
         VStack(spacing: 0) {
             Divider()
             HStack(spacing: 8) {
+                Button {
+                    model.scan()
+                } label: {
+                    Label("立即采集", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                Button {
+                    model.openDashboard()
+                } label: {
+                    Label("打开看板", systemImage: "rectangle.on.rectangle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    model.quit()
+                } label: {
+                    Label("退出", systemImage: "power")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 6)
+
+            HStack(spacing: 8) {
                 Text(model.status)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -430,7 +452,7 @@ struct PanelView: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.vertical, 4)
         }
         .background(.bar)
     }
@@ -442,7 +464,7 @@ struct PanelView: View {
                 ContentUnavailableView {
                     Label("读取失败", systemImage: "exclamationmark.triangle")
                 } description: {
-                    Text("点右上角齿轮里的“立即采集”重试")
+                    Text("点下面的“立即采集”重试")
                 } actions: {
                     Button("立即采集") { model.scan() }
                 }
@@ -453,7 +475,7 @@ struct PanelView: View {
             ContentUnavailableView {
                 Label("还没有数据", systemImage: "chart.bar")
             } description: {
-                Text("点右上角齿轮里的“立即采集”")
+                Text("点下面的“立即采集”")
             } actions: {
                 Button("立即采集") { model.scan() }
             }
@@ -477,8 +499,8 @@ struct NativeSection<Content: View>: View {
                 .fontWeight(.semibold)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
-                .padding(.top, 10)
-                .padding(.bottom, 4)
+                .padding(.top, 8)
+                .padding(.bottom, 3)
             content
         }
     }
@@ -488,67 +510,33 @@ struct NativeSection<Content: View>: View {
 
 struct OverviewSections: View {
     @ObservedObject var model: PanelModel
-    @State private var selectedDate: String?
 
     @ViewBuilder
     var body: some View {
         if let snap = model.snapshot, snap.ok {
-            NativeSection("今日") {
-                SummaryRow(label: "金额",
-                           value: money(snap.windows?["today"]?.cost ?? 0,
-                                        snap.symbol ?? "¥"))
-                SummaryRow(label: "Token",
-                           value: cn(snap.windows?["today"]?.tokens ?? 0))
-                SummaryRow(label: "缓存命中",
-                           value: "\(Int(((snap.cacheRate ?? 0) * 100).rounded()))%")
-                SummaryRow(label: "请求",
-                           value: countText(snap.windows?["today"]?.events ?? 0))
-            }
-
-            NativeSection("近 7 天") {
-                Chart(snap.daily ?? [], id: \.date) { day in
-                    BarMark(
-                        x: .value("日期", shortDate(day.date)),
-                        y: .value("Token", day.tokens)
-                    )
-                    .foregroundStyle(Color.accentColor)
-                    .cornerRadius(2)
+            VStack(alignment: .leading, spacing: 0) {
+                NativeSection("今日") {
+                    SummaryRow(label: "金额",
+                               value: money(snap.windows?["today"]?.cost ?? 0,
+                                            snap.symbol ?? "¥"))
+                    SummaryRow(label: "Token",
+                               value: cn(snap.windows?["today"]?.tokens ?? 0))
+                    SummaryRow(label: "缓存命中",
+                               value: "\(Int(((snap.cacheRate ?? 0) * 100).rounded()))%")
+                    SummaryRow(label: "请求",
+                               value: countText(snap.windows?["today"]?.events ?? 0))
                 }
-                .chartYAxis(.hidden)
-                .chartXAxis {
-                    AxisMarks { _ in
-                        AxisGridLine().foregroundStyle(.clear)
-                        AxisTick().foregroundStyle(.clear)
-                        AxisValueLabel()
-                    }
-                }
-                .frame(height: 110)
-                .padding(.vertical, 4)
-                .chartXSelection(value: $selectedDate)
-                if let selected = selectedDate,
-                   let day = (snap.daily ?? []).first(where: { shortDate($0.date) == selected }) {
-                    Text("\(selected) · \(cn(day.tokens)) · \(costText(day.cost ?? 0, tokens: day.tokens, snap.symbol ?? "¥"))")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 6)
-                } else {
-                    Text("柱高：Token；点柱子看当天明细")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 6)
-                }
-            }
 
-            NativeSection("按模型") {
-                SliceRows(slices: snap.modelsToday ?? [], symbol: snap.symbol ?? "¥",
-                          empty: "今天还没有用量")
-            }
+                NativeSection("按模型") {
+                    SliceRows(slices: snap.modelsToday ?? [], symbol: snap.symbol ?? "¥",
+                              empty: "今天还没有用量")
+                }
 
-            NativeSection("按 Agent") {
-                SliceRows(slices: snap.agentsToday ?? [], symbol: snap.symbol ?? "¥",
-                          empty: "今天还没有用量", agent: true)
+                NativeSection("按 Agent") {
+                    SliceRows(slices: snap.agentsToday ?? [], symbol: snap.symbol ?? "¥",
+                              empty: "今天还没有用量", agent: true)
+                }
+
             }
         }
     }
@@ -583,47 +571,6 @@ struct HistorySections: View {
     }
 }
 
-// MARK: - 余额
-
-struct BalanceSections: View {
-    @ObservedObject var model: PanelModel
-
-    @ViewBuilder
-    var body: some View {
-        if let balances = model.snapshot?.balances, balances.configured == true,
-           let providers = balances.providers, !providers.isEmpty {
-            NativeSection("账户余额") {
-                BalanceRows(providers: providers)
-            }
-            VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    model.scan()
-                } label: {
-                    Label("刷新余额", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                Text("余额 10 分钟刷新一次；失败会保留上次的值。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-        } else {
-            NativeSection("账户余额") {
-                Text("未启用余额查询")
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 3)
-                Text("在 ~/.tokenlens/balances.json 启用 DeepSeek，并在 secrets.json 填入 Key。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 3)
-            }
-        }
-    }
-}
-
 // MARK: - 复用行
 
 struct SummaryRow: View {
@@ -637,10 +584,9 @@ struct SummaryRow: View {
                 Spacer()
                 Text(value)
                     .monospacedDigit()
-                    .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 3)
+            .padding(.vertical, 2)
             Divider()
                 .padding(.leading, 12)
         }
@@ -680,75 +626,16 @@ struct SliceRow: View {
                 Text(agent ? (slice.agent ?? "?") : (slice.model ?? "?"))
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text(costText(slice.cost, tokens: slice.tokens, symbol,
-                                  subscription: slice.subscription ?? false))
-                        .monospacedDigit()
-                    Text(cn(slice.tokens))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
+                Text(costText(slice.cost, tokens: slice.tokens, symbol,
+                              subscription: slice.subscription ?? false))
+                    .monospacedDigit()
+                Text(cn(slice.tokens))
+                    .monospacedDigit()
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 3)
+            .padding(.vertical, 2)
             Divider()
                 .padding(.leading, 12)
-        }
-    }
-}
-
-struct BalanceRows: View {
-    let providers: [Snapshot.BalanceProvider]
-
-    var body: some View {
-        ForEach(providers, id: \.id) { provider in
-            if let items = provider.items, !items.isEmpty {
-                ForEach(items, id: \.currency) { item in
-                    VStack(spacing: 0) {
-                        HStack {
-                            Text((provider.name ?? provider.id ?? "?") +
-                                 ((item.currency ?? "").isEmpty ? "" : " · " + (item.currency ?? "")))
-                            Spacer()
-                            Text(balanceText(item.total ?? 0,
-                                             currency: item.currency ?? "CNY"))
-                                .monospacedDigit()
-                                .foregroundStyle(item.available == false ? .red : .secondary)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 3)
-                        Divider()
-                            .padding(.leading, 12)
-                    }
-                }
-            } else {
-                VStack(spacing: 0) {
-                    HStack {
-                        Text(provider.name ?? provider.id ?? "?")
-                        Spacer()
-                        Text(provider.error ?? "读取中…")
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 3)
-                    Divider()
-                        .padding(.leading, 12)
-                }
-            }
-            if let fetched = provider.fetchedAt {
-                Text("更新于 \(clockText(fetched))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 2)
-            }
-            if let error = provider.error {
-                Label(error, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 2)
-            }
         }
     }
 }
