@@ -181,6 +181,13 @@ enum Palette {
     static let series: [NSColor] = [mint, periwinkle, amber, rose, sky]
 }
 
+func countText(_ value: Int) -> String {
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    formatter.groupingSeparator = ","
+    return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+}
+
 // MARK: - 图表
 
 final class ChartView: NSView {
@@ -208,7 +215,7 @@ final class ChartView: NSView {
         }
         let width = (bounds.width > 0 ? bounds.width : kPanelWidth) - pad * 2
         var y: CGFloat = 0
-        y += 74
+        y += 101
 
         let modelsToday = snap.modelsToday?.count ?? 0
         let agentsToday = snap.agentsToday?.count ?? 0
@@ -302,16 +309,34 @@ final class ChartView: NSView {
 
     private func drawHeadline(_ snap: Snapshot, today: Snapshot.Window?, symbol: String) {
         text("今日用量", NSPoint(x: pad, y: 12), size: 11, weight: .semibold)
-        // 金额在左、Token 在右，同一个字号
-        let moneyText = money(today?.cost ?? 0, symbol)
-        text(moneyText, NSPoint(x: pad - 1, y: 27), size: 23,
-             weight: .semibold, color: Palette.mint)
-        text(cn(today?.tokens ?? 0),
-             NSPoint(x: pad - 1 + width(moneyText, size: 23, weight: .semibold) + 9, y: 27),
-             size: 23, weight: .semibold, color: Palette.mint)
+
+        // 和卡片里的「标签 + 数值」同一套层级：小号灰色标签，大号薄荷色数值
+        let columnGap: CGFloat = 158
+        let labelY: CGFloat = 31
+        let valueY: CGFloat = 45
+        sectionLabel("金额", NSPoint(x: pad, y: labelY))
+        sectionLabel("Token", NSPoint(x: pad + columnGap, y: labelY))
+        text(money(today?.cost ?? 0, symbol), NSPoint(x: pad - 1, y: valueY),
+             size: 20, weight: .semibold, color: Palette.mint)
+        text(cn(today?.tokens ?? 0), NSPoint(x: pad - 1 + columnGap, y: valueY),
+             size: 20, weight: .semibold, color: Palette.mint)
+
+        // 缓存命中率用主题色，请求数加千分位
         let rate = Int(((snap.cacheRate ?? 0) * 100).rounded())
-        text("缓存命中 \(rate)% · \(today?.events ?? 0) 次请求",
-             NSPoint(x: pad, y: 55), size: 9.5, color: Palette.muted)
+        let caption = NSMutableAttributedString()
+        caption.append(NSAttributedString(string: "缓存命中 ", attributes: [
+            .font: NSFont.systemFont(ofSize: 9.5),
+            .foregroundColor: Palette.muted,
+        ]))
+        caption.append(NSAttributedString(string: "\(rate)%", attributes: [
+            .font: NSFont.systemFont(ofSize: 9.5, weight: .medium),
+            .foregroundColor: Palette.mint,
+        ]))
+        caption.append(NSAttributedString(string: " · \(countText(today?.events ?? 0)) 次请求", attributes: [
+            .font: NSFont.systemFont(ofSize: 9.5),
+            .foregroundColor: Palette.muted,
+        ]))
+        caption.draw(in: NSRect(x: pad, y: 77, width: bounds.width - pad * 2, height: 17))
     }
 
     private func drawTodayCard(_ box: NSRect, snap: Snapshot, symbol: String) {
@@ -419,7 +444,7 @@ final class ChartView: NSView {
                 subscription: slice.subscription ?? false)
         }
 
-        text("共 \(snap.allEvents ?? 0) 次请求",
+        text("共 \(countText(snap.allEvents ?? 0)) 次请求",
              NSPoint(x: box.minX + inset, y: box.maxY - 20), size: 9, color: Palette.muted)
     }
 
@@ -765,6 +790,7 @@ final class PanelController: NSViewController {
         let container = NSView(frame: NSRect(x: 0, y: 0, width: kPanelWidth,
                                              height: 660 + kFooterHeight))
         container.wantsLayer = true
+        container.appearance = NSAppearance(named: .darkAqua)
 
         footer.frame = NSRect(x: 0, y: 0, width: kPanelWidth, height: kFooterHeight)
         footer.wantsLayer = true
@@ -868,6 +894,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var loggedFirstTitle = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 整个 App 固定深色主题：面板、弹窗的箭头和描边都跟着变深色。
+        // 只设 popover.appearance 时，浅色系统模式下弹窗箭头/边框仍是浅色。
+        NSApp.appearance = NSAppearance(named: .darkAqua)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "…"
         statusItem.button?.toolTip = "tokenlens：本地 token 用量"
@@ -875,6 +904,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.action = #selector(togglePopover)
 
         popover = NSPopover()
+        // 面板是固定深色主题；不指定的话，系统浅色模式下 NSPopover 会继承
+        // VibrantLight，自绘 NSButton 会被当成 vibrancy 遮罩，整块变黑。
+        popover.appearance = NSAppearance(named: .darkAqua)
         popover.behavior = .transient
         popover.animates = false
         popover.contentViewController = panel
