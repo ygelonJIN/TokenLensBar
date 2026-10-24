@@ -681,7 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureStatusIcon() {
-        guard let symbol = NSImage(systemSymbolName: "chart.bar.fill",
+        guard let symbol = NSImage(systemSymbolName: "hexagon.fill",
                                    accessibilityDescription: "Token 用量") else { return }
         let configuration = NSImage.SymbolConfiguration(pointSize: 10, weight: .medium)
         let image = symbol.withSymbolConfiguration(configuration)
@@ -694,12 +694,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func statusTitle(_ today: Snapshot.Window, symbol: String) -> NSAttributedString {
         let tokenFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         let moneyFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        let separatorFont = NSFont.systemFont(ofSize: 11, weight: .ultraLight)
         let title = NSMutableAttributedString()
         title.append(NSAttributedString(string: cn(today.tokens),
                                         attributes: [.font: tokenFont]))
-        title.append(NSAttributedString(string: "\u{2002}\u{2502}\u{2002}",
-                                        attributes: [.font: separatorFont]))
+        title.append(NSAttributedString(string: "  ",
+                                        attributes: [.font: tokenFont]))
         title.append(NSAttributedString(string: moneyCompact(today.cost, symbol),
                                         attributes: [.font: moneyFont]))
         return title
@@ -712,7 +711,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let symbol = snapshot.symbol ?? "¥"
         statusItem.button?.attributedTitle = statusTitle(today, symbol: symbol)
-        let plain = cn(today.tokens) + " │ " + moneyCompact(today.cost, symbol)
+        let plain = cn(today.tokens) + "  " + moneyCompact(today.cost, symbol)
         if !loggedFirstTitle {
             loggedFirstTitle = true
             logLine("首次刷新成功：菜单栏标题=\(plain)")
