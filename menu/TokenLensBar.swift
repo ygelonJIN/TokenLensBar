@@ -392,6 +392,7 @@ struct PanelView: View {
                             .monospacedDigit()
                             .lineLimit(1)
                             .minimumScaleFactor(0.7)
+                            .help(provider.error ?? "")
                     }
                 }
             }

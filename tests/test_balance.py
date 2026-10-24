@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """余额功能的回归测试：python3 tests/test_balance.py
 
-不联网：DeepSeek 的 HTTP 响应和 refresh 的 fetcher 都是假的。
+不联网：DeepSeek / 小米 MiMo 的 HTTP 响应和 refresh 的 fetcher 都是假的。
 """
 
 import json
@@ -166,6 +166,72 @@ def main():
             tl.urllib.request.urlopen = original_open
         passed &= check("空余额返回 0 元", empty[0]["total"], 0.0)
         passed &= check("空余额标记不可用", empty[0]["available"], False)
+
+        # 9. 小米 MiMo：Cookie 鉴权（没有 API Key 余额接口）
+        write_json(config, {
+            "refresh_seconds": 600,
+            "providers": [{"id": "mimo", "type": "mimo_cookie",
+                           "secret": "mimo_cookie", "enabled": True}],
+        })
+        write_json(secrets, {"mimo_cookie": "api-platform_serviceToken=tok; userId=42"})
+        mimo_seen = {}
+
+        def mimo_fetch(entry, key):
+            mimo_seen["cookie"] = key
+            return sample_items(total=88.5)
+
+        result = tl.refresh_balances(db, force=True, config_path=config,
+                                     secrets_path=secrets, fetcher=mimo_fetch, now=2000)
+        passed &= check("MiMo 读的是 Cookie", mimo_seen["cookie"],
+                        "api-platform_serviceToken=tok; userId=42")
+        payload = tl.balance_payload(db, config_path=config, now=2000)
+        passed &= check("MiMo 默认名字", payload["providers"][0]["name"], "Xiaomi MiMo")
+        passed &= check("MiMo 金额", payload["providers"][0]["items"][0]["total"], 88.5)
+
+        # 9b. 解析控制台返回，并核对请求头
+        seen = {}
+
+        def fake_mimo_open(request, timeout=0):
+            seen["cookie"] = request.get_header("Cookie")
+            return FakeResponse({"data": {"currency": "CNY", "balance": "88.50",
+                                          "availableBalance": "88.50"}})
+
+        original_open = tl.urllib.request.urlopen
+        tl.urllib.request.urlopen = fake_mimo_open
+        try:
+            items = tl.fetch_mimo_balance(
+                {"type": "mimo_cookie"},
+                "Cookie: api-platform_serviceToken=tok; userId=42")
+        finally:
+            tl.urllib.request.urlopen = original_open
+        passed &= check("MiMo 余额数值", items[0]["total"], 88.5)
+        passed &= check("MiMo 币种", items[0]["currency"], "CNY")
+        passed &= check("MiMo 发 Cookie 头", seen["cookie"],
+                        "api-platform_serviceToken=tok; userId=42")
+
+        # 9c. 401 和缺字段的报错要说人话
+        def fake_mimo_401(request, timeout=0):
+            raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", None, None)
+
+        original_open = tl.urllib.request.urlopen
+        tl.urllib.request.urlopen = fake_mimo_401
+        try:
+            try:
+                tl.fetch_mimo_balance({"type": "mimo_cookie"},
+                                      "api-platform_serviceToken=bad")
+                mimo_401 = ""
+            except tl.BalanceError as exc:
+                mimo_401 = str(exc)
+        finally:
+            tl.urllib.request.urlopen = original_open
+        passed &= check("MiMo 401 提示重新登录", "重新登录" in mimo_401, True)
+
+        try:
+            tl.fetch_mimo_balance({"type": "mimo_cookie"}, "userId=42")
+            mimo_missing = ""
+        except tl.BalanceError as exc:
+            mimo_missing = str(exc)
+        passed &= check("MiMo 缺 serviceToken 报错", "serviceToken" in mimo_missing, True)
 
         # 8. 401 不泄露 Key
         def fake_401(request, timeout=0):

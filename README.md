@@ -58,36 +58,52 @@ launchctl kickstart gui/$(id -u)/com.tokenlensbar.scan     # 立刻采集一次
 
 ## 账户余额（可选）
 
-默认不联网。开启后余额直接显示在面板标题右上角，目前支持 DeepSeek。
+默认不联网。开启后余额显示在面板标题右上角并写明 provider（如 `DeepSeek: ¥110.00`，多个按行排列）。目前支持：
 
-安装时已经生成 `~/.tokenlensbar/balances.json`（DeepSeek 已启用）。填入 Key 即可：
+| provider | 凭据 | 说明 |
+| --- | --- | --- |
+| DeepSeek | API Key（`sk-`） | 官方余额接口，Bearer 鉴权 |
+| Xiaomi MiMo | 控制台 Cookie | 小米没有 API Key 余额接口，只能用控制台会话 |
 
-安装时已经生成 `~/.tokenlensbar/secrets.json`（权限 600），直接编辑它：
+安装时已经生成 `~/.tokenlensbar/balances.json` 和 `~/.tokenlensbar/secrets.json`（权限 600）。
+
+### DeepSeek
 
 ```bash
-# 文件不存在时才需要这行：
-# cp ~/.tokenlensbar/secrets.example.json ~/.tokenlensbar/secrets.json
-
 # 编辑 ~/.tokenlensbar/secrets.json：
 # {"deepseek": "sk-你的完整Key"}
 
 chmod 600 ~/.tokenlensbar/secrets.json
 ```
 
-然后在面板里点「立即采集」，或直接刷新：
+### Xiaomi MiMo（Cookie）
 
-```bash
-python3 ~/.tokenlensbar/tokenlensbar.py balance --refresh
+小米的按量付费余额只有控制台能查：`https://platform.xiaomimimo.com/api/v1/balance`，
+鉴权用控制台 Cookie（`api-platform_serviceToken` + `userId`），**不是 API Key**——
+API Key 只用于推理，查不了余额。
+
+1. 浏览器登录 `https://platform.xiaomimimo.com/#/console/balance`
+2. DevTools → Network → 任选一个 `api/v1` 请求 → Request Headers → 复制 `Cookie:` 整行
+3. 填进 `secrets.json` 的 `mimo_cookie`，把 `balances.json` 里 mimo 的 `enabled` 改成 `true`
+4. 点面板「立即采集」，或 `python3 ~/.tokenlensbar/tokenlensbar.py balance --refresh`
+
+编辑完 `secrets.json` 形如：
+
+```json
+{"deepseek": "sk-...", "mimo_cookie": "api-platform_serviceToken=...; userId=..."}
 ```
 
-说明：
+注意：
 
-- Key 是**整串**，通常 `sk-` 开头；不用拆前后缀，不需要账号密码。代码会自己加 `Bearer`。
-- 只 GET `https://api.deepseek.com/user/balance`，不发送本地用量；查询余额不消耗 token。
-- Key 有调用 API 的权限，不是只读的。建议在 DeepSeek 控制台单独建一个 `TokenLensBar` Key，不用了直接删。
-- 余额缓存 10 分钟；面板每 60 秒读缓存，不会因为网络卡住。失败时保留上次余额并标「更新失败」。
-- 不想要余额：把 `balances.json` 里的 `enabled` 改成 `false`，或删掉这个文件；之后就完全不发请求。
-- 目前只内置 DeepSeek。Kimi、OpenRouter 等 Bearer 余额接口可以按同样的 adapter 结构扩展；小米 MiMo 的 Token Plan 额度目前更像控制台 Cookie 接口，不稳定，暂不内置。
+- Cookie 是整账号会话，权限比单个 API Key 大；只存这两个 Cookie，别提交到 git。
+- 过期后接口返回 401，面板显示 `Xiaomi MiMo: —`，鼠标悬停会提示「Cookie 已失效」，重新粘一次即可。
+- 这是控制台内部接口，小米改版就可能失效；失效时把 `enabled` 改成 `false` 即可，不影响 token 统计。
+
+### 通用说明
+
+- 余额缓存 10 分钟；面板每 60 秒读缓存，不会因为网络卡住。失败时保留上次余额。
+- 不想要余额：把对应 provider 的 `enabled` 改成 `false`，或删掉 `balances.json`；之后就完全不发请求。
+- 想接 Kimi、OpenRouter 等：它们也是 Bearer 余额接口，照着 `fetch_deepseek_balance` 加一个 adapter 即可（约 30 行）。
 
 ## 它是怎么工作的
 

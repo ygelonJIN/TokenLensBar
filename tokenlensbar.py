@@ -38,6 +38,9 @@ BALANCES_PATH = Path(os.environ.get("TOKENLENSBAR_BALANCES", "~/.tokenlensbar/ba
 SECRETS_PATH = Path(os.environ.get("TOKENLENSBAR_SECRETS", "~/.tokenlensbar/secrets.json")).expanduser()
 DEEPSEEK_BALANCE_URL = os.environ.get(
     "TOKENLENSBAR_DEEPSEEK_BALANCE_URL", "https://api.deepseek.com/user/balance")
+# 小米 MiMo 没有 API Key 余额接口，只有控制台会话接口（Cookie 鉴权）。
+MIMO_BALANCE_URL = os.environ.get(
+    "TOKENLENSBAR_MIMO_BALANCE_URL", "https://platform.xiaomimimo.com/api/v1/balance")
 
 MTOK = 1_000_000.0
 
@@ -1358,12 +1361,14 @@ def load_balances_config(path=None):
         pid = str(entry.get("id") or ptype).strip()
         if not pid or not ptype:
             continue
-        default_name = "DeepSeek" if ptype == "deepseek" else pid
+        default_names = {"deepseek": "DeepSeek", "mimo": "Xiaomi MiMo",
+                         "mimo_cookie": "Xiaomi MiMo"}
         providers.append({
             "id": pid,
             "type": ptype,
-            "name": str(entry.get("name") or default_name),
+            "name": str(entry.get("name") or default_names.get(ptype, pid)),
             "url": str(entry.get("url") or "").strip(),
+            "secret": str(entry.get("secret") or "").strip(),
         })
     return {"configured": bool(providers), "refresh_seconds": refresh,
             "providers": providers, "error": None}
@@ -1395,18 +1400,23 @@ def _balance_number(value):
         return None
 
 
-def _http_json(url, key, timeout=6.0):
-    request = urllib.request.Request(url, headers={
-        "Authorization": "Bearer " + key,
+def _http_json(url, key=None, cookie=None, timeout=6.0,
+               auth_error="Key 无效或没有权限"):
+    headers = {
         "Accept": "application/json",
         "User-Agent": "TokenLensBar/1.0",
-    })
+    }
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    if cookie:
+        headers["Cookie"] = cookie
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read(2_000_000)
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
-            raise BalanceError("Key 无效或没有权限")
+            raise BalanceError(auth_error)
         if exc.code == 429:
             raise BalanceError("请求过于频繁")
         raise BalanceError("HTTP %s" % exc.code)
@@ -1457,10 +1467,55 @@ def fetch_deepseek_balance(entry, key, timeout=6.0):
     return items
 
 
+def _cookie_header(value):
+    """把粘贴的 Cookie 头收拾干净：去掉 `Cookie:` 前缀和换行。"""
+    text = " ".join(str(value or "").split())
+    if text.lower().startswith("cookie:"):
+        text = text[len("cookie:"):].strip()
+    return text
+
+
+def fetch_mimo_balance(entry, cookie, timeout=6.0):
+    """小米 MiMo 账户余额。控制台接口只认 Cookie，不认 API Key。"""
+    header = _cookie_header(cookie)
+    if not header:
+        raise BalanceError("未配置 Cookie")
+    if "serviceToken" not in header:
+        raise BalanceError("Cookie 里缺少 api-platform_serviceToken")
+    url = entry.get("url") or MIMO_BALANCE_URL
+    data = _http_json(url, cookie=header, timeout=timeout,
+                      auth_error="Cookie 已失效，请重新登录后粘贴")
+    if not isinstance(data, dict):
+        raise BalanceError("返回格式异常")
+    payload = data.get("data")
+    if isinstance(payload, list):
+        payload = payload[0] if payload else None
+    if not isinstance(payload, dict):
+        message = data.get("message") or data.get("msg")
+        if message:
+            raise BalanceError(str(message))
+        code = data.get("code")
+        if code not in (None, 0, 200, "0", "200"):
+            raise BalanceError("HTTP %s" % code)
+        raise BalanceError("返回里没有余额数据")
+    total = _balance_number(payload.get("balance"))
+    if total is None:
+        total = _balance_number(payload.get("availableBalance"))
+    if total is None:
+        total = _balance_number(payload.get("available_balance"))
+    if total is None:
+        raise BalanceError("返回里没有余额数据")
+    currency = str(payload.get("currency") or "CNY").strip().upper()
+    return [{"currency": currency, "total": total, "granted": None,
+             "topped_up": None, "available": True}]
+
+
 def _provider_key(secrets, entry):
-    key = secrets.get(entry["id"])
+    key = secrets.get(entry.get("secret") or entry["id"])
     if not key and entry["type"] == "deepseek":
         key = os.environ.get("DEEPSEEK_API_KEY")
+    if not key and entry["type"] in ("mimo", "mimo_cookie"):
+        key = os.environ.get("MIMO_COOKIE")
     return (key or "").strip()
 
 
@@ -1489,7 +1544,9 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
 
         key = _provider_key(secrets, entry)
         if not key:
-            message = secret_error or "未配置 Key"
+            missing = ("未配置 Cookie" if entry["type"] in ("mimo", "mimo_cookie")
+                       else "未配置 Key")
+            message = secret_error or missing
             con.execute(
                 "insert or replace into balance_state"
                 " (provider, last_attempt, last_success, error) values (?,?,?,?)",
@@ -1505,6 +1562,8 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
                 items = fetcher(entry, key)
             elif entry["type"] == "deepseek":
                 items = fetch_deepseek_balance(entry, key)
+            elif entry["type"] in ("mimo", "mimo_cookie"):
+                items = fetch_mimo_balance(entry, key)
             else:
                 raise BalanceError("暂不支持 %s" % entry["type"])
             if not items:
