@@ -657,7 +657,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "tokenlens：本地 token 用量"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
-        configureStatusIcon()
 
         popover = NSPopover()
         popover.behavior = .transient
@@ -678,17 +677,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
-    }
-
-    private func configureStatusIcon() {
-        guard let symbol = NSImage(systemSymbolName: "hexagon.fill",
-                                   accessibilityDescription: "Token 用量") else { return }
-        let configuration = NSImage.SymbolConfiguration(pointSize: 10, weight: .medium)
-        let image = symbol.withSymbolConfiguration(configuration)
-        image?.isTemplate = true
-        statusItem.button?.image = image
-        statusItem.button?.imagePosition = .imageLeading
-        statusItem.button?.imageHugsTitle = true
     }
 
     private func statusTitle(_ today: Snapshot.Window, symbol: String) -> NSAttributedString {
