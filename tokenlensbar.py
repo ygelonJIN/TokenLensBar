@@ -184,6 +184,15 @@ def resolve_rate(model, ts, prices):
     return best_name, best_version
 
 
+def model_label(model, ts, prices):
+    """展示用型号名：价格表认得的用表里的正式名，认不得就保留日志原名。"""
+    raw = model or "(未知)"
+    if not prices:
+        return raw
+    name, _version = resolve_rate(model or "", ts, prices)
+    return name or raw
+
+
 def is_off_peak(ts, prices):
     """这条请求发生时是不是空闲时段。
 
@@ -994,7 +1003,7 @@ def aggregate(rows, prices, since=0.0):
         if row[0] < since:
             continue
         cost, matched, stored = row_cost(row, prices)
-        model = row[3] or "(未知)"
+        model = model_label(row[3], row[0], prices)
         agent = agent_label(row[1])
         provider = row[2] or "(未记录)"
         day = datetime.fromtimestamp(row[0]).strftime("%Y-%m-%d")
@@ -1027,7 +1036,7 @@ def breakdown(rows, prices, since):
         if row[0] < since:
             continue
         cost, _, _ = row_cost(row, prices)
-        key = (agent_label(row[1]), row[3] or "(未知)")
+        key = (agent_label(row[1]), model_label(row[3], row[0], prices))
         add(cells.setdefault(key, zero_bucket()), row, cost)
     out = []
     for (agent, model), bucket in cells.items():
@@ -1059,7 +1068,7 @@ def outside_cells(db_path, window_cells, prices):
     pairs = {(cell["agent"], cell["model"]) for cell in window_cells}
     last = {}
     for row in all_rows:
-        key = (agent_label(row[1]), row[3] or "(未知)")
+        key = (agent_label(row[1]), model_label(row[3], row[0], prices))
         if row[0] > last.get(key, 0.0):
             last[key] = row[0]
     out = []
@@ -1074,11 +1083,11 @@ def outside_cells(db_path, window_cells, prices):
     return out
 
 
-def models_seen(rows):
+def models_seen(rows, prices=None):
     """本机所有出现过的模型 + 出现在哪些 Agent + 是否已定价。"""
     seen = {}
     for row in rows:
-        model = row[3] or "(未知)"
+        model = model_label(row[3], row[0], prices)
         item = seen.setdefault(model, {"model": model, "tokens": 0, "agents": set()})
         item["tokens"] += row[9]
         item["agents"].add(agent_label(row[1]))
@@ -1195,7 +1204,7 @@ def enrich(rows, prices):
             "ts": row[0],
             "agent": agent_label(row[1]),
             "provider": row[2] or "(未记录)",
-            "model": row[3] or "(未知)",
+            "model": model_label(row[3], row[0], prices),
             "input": row[4] or 0,
             "output": row[5] or 0,
             "cache_read": row[6] or 0,
@@ -1887,7 +1896,7 @@ def api_payload(db_path, days):
     rows, sources = fetch_rows(db_path, since) if db_path.exists() else ([], [])
     agg = aggregate(rows, prices, since)
     totals = agg["totals"]
-    seen = models_seen(rows)
+    seen = models_seen(rows, prices)
 
     models = []
     for model, bucket in sorted(agg["by_model"].items(), key=lambda kv: -kv[1]["total"]):

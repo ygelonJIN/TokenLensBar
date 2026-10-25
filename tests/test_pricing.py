@@ -46,6 +46,14 @@ def check(name, actual, expected, tolerance=1e-9):
     return ok
 
 
+def check_text(name, actual, expected):
+    ok = actual == expected
+    print("%s %s" % ("✓" if ok else "✗", name))
+    if not ok:
+        print("   期望 %r，实际 %r" % (expected, actual))
+    return ok
+
+
 def main():
     passed = True
 
@@ -102,6 +110,37 @@ def main():
     passed &= check("完全不认识的型号不瞎猜",
                     tl.resolve_rate("unknown-model", epoch("2026-10-24 12:00"), prices)[0] is None,
                     True)
+
+    # 4b. 展示用正式名：日志里的别名归到价格表里的型号名
+    prices = tl.load_prices(write_prices({
+        "currency": "CNY", "symbol": "¥",
+        "models": {"deepseek-v4.1-flash": {
+            "match": ["deepseek-flash", "DeepSeek-V4.1-Flash"],
+            "input_cache_hit": 0.04, "input_cache_miss": 2.0, "output": 8.0}},
+    }))
+    passed &= check_text("日志原名映射到正式名",
+                         tl.model_label("deepseek-flash", epoch("2026-10-24 12:00"), prices),
+                         "deepseek-v4.1-flash")
+    passed &= check_text("认不得的型号保留原名",
+                         tl.model_label("unknown-model", epoch("2026-10-24 12:00"), prices),
+                         "unknown-model")
+    rows = [
+        (epoch("2026-10-24 12:00"), "dsh", "deepseek", "deepseek-flash",
+         1000, 100, 500, 0, 0, 1100, 0.0, 1),
+        (epoch("2026-10-24 12:01"), "dsh", "deepseek", "DeepSeek-V4.1-Flash",
+         2000, 200, 1000, 0, 0, 2200, 0.0, 1),
+    ]
+    agg = tl.aggregate(rows, prices, 0)
+    passed &= check_text("两个别名合并成一行正式名",
+                         list(agg["by_model"]), ["deepseek-v4.1-flash"])
+    passed &= check_text("models_seen 也用正式名",
+                         list(tl.models_seen(rows, prices)), ["deepseek-v4.1-flash"])
+    passed &= check_text("面板 enrich 用正式名",
+                         [item["model"] for item in tl.enrich(rows, prices)],
+                         ["deepseek-v4.1-flash", "deepseek-v4.1-flash"])
+    passed &= check_text("breakdown 用正式名",
+                         [cell["model"] for cell in tl.breakdown(rows, prices, 0)],
+                         ["deepseek-v4.1-flash"])
 
     # 5. 未定价模型会被点名
     prices = tl.load_prices(write_prices({"models": {}}))
