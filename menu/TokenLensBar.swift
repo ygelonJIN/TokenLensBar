@@ -8,7 +8,14 @@ import Combine
 
 let kRefreshInterval: TimeInterval = 60
 let kDashboardPort = 8787
-let kPanelWidth: CGFloat = 320
+let kPanelWidth: CGFloat = 280
+let kPanelDefaultHeight: CGFloat = 300
+
+/// 面板最高不超过屏幕可见区；超出的内容在面板里滚动，不写死总高度。
+func panelMaxHeight() -> CGFloat {
+    let visible = NSScreen.main?.visibleFrame.height ?? 900
+    return max(320, visible - 120)
+}
 
 // MARK: - 取数
 
@@ -299,8 +306,6 @@ func logLine(_ message: String) {
     }
 }
 
-let kPanelHeight: CGFloat = 530
-
 func shortDate(_ text: String) -> String {
     let parts = text.split(separator: "-")
     guard parts.count == 3 else { return text }
@@ -548,6 +553,13 @@ enum PanelTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private struct PanelContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct PanelView: View {
     @ObservedObject var model: PanelModel
     @State private var tab: PanelTab = {
@@ -557,35 +569,45 @@ struct PanelView: View {
         }
         return .overview
     }()
+    @State private var contentHeight: CGFloat = kPanelDefaultHeight
+
+    private var maxScrollHeight: CGFloat {
+        max(160, panelMaxHeight() - 118)
+    }
 
     var body: some View {
-        GeometryReader { geo in
-            VStack(spacing: 0) {
-                topBar
-                if model.snapshot?.ok == true {
-                    if tab == .overview {
-                        ScrollView {
+        VStack(spacing: 0) {
+            topBar
+            if model.snapshot?.ok == true {
+                ScrollView(.vertical, showsIndicators: contentHeight > maxScrollHeight + 1) {
+                    Group {
+                        if tab == .overview {
                             OverviewSections(model: model)
-                                .padding(.bottom, 62)
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else {
-                        ScrollView {
+                        } else {
                             HistorySections(model: model)
-                                .padding(.bottom, 62)
                         }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                } else {
-                    Spacer(minLength: 0)
-                    emptyState
-                    Spacer(minLength: 0)
+                    .padding(.bottom, 6)
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.preference(key: PanelContentHeightKey.self,
+                                                   value: proxy.size.height)
+                        }
+                    )
                 }
+                .frame(height: min(max(contentHeight, 1), maxScrollHeight))
+            } else {
+                emptyState
+                    .frame(height: 250)
             }
-            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
-            .overlay(alignment: .bottom) { bottomBar }
+            bottomBar
         }
-        .frame(width: kPanelWidth, height: kPanelHeight)
+        .frame(width: kPanelWidth)
+        .onPreferenceChange(PanelContentHeightKey.self) { height in
+            if abs(height - contentHeight) > 0.5 {
+                contentHeight = height
+            }
+        }
         .background(Color.clear)
         .preferredColorScheme(model.colorScheme)
     }
@@ -643,22 +665,24 @@ struct PanelView: View {
     private var bottomBar: some View {
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Button {
                     model.scan()
                 } label: {
-                    Label("立即采集", systemImage: "arrow.clockwise")
+                    Label("采集", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
+                .help("立即采集一次")
 
                 Button {
                     model.openDashboard()
                 } label: {
-                    Label("打开看板", systemImage: "rectangle.on.rectangle")
+                    Label("看板", systemImage: "rectangle.on.rectangle")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .help("打开浏览器看板")
 
                 Button {
                     model.quit()
@@ -670,7 +694,7 @@ struct PanelView: View {
 
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 10)
             .padding(.top, 6)
             .padding(.bottom, 8)
         }
@@ -684,7 +708,7 @@ struct PanelView: View {
                 ContentUnavailableView {
                     Label("读取失败", systemImage: "exclamationmark.triangle")
                 } description: {
-                    Text("点下面的“立即采集”重试")
+                    Text("点下面的「采集」重试")
                 } actions: {
                     Button("立即采集") { model.scan() }
                 }
@@ -781,17 +805,6 @@ struct OverviewSections: View {
                     .padding(.vertical, 4)
                 }
 
-                if let balances = snap.balances, balances.configured == true,
-                   let providers = balances.providers, !providers.isEmpty {
-                    NativeSection("余额") {
-                        ForEach(Array(providers.enumerated()), id: \.offset) { _, provider in
-                            SummaryRow(label: provider.name ?? provider.id ?? "余额",
-                                       value: providerBalanceText(provider),
-                                       help: provider.error)
-                        }
-                    }
-                }
-
                 if let entries = snap.todaySpend?.manual?.entries, !entries.isEmpty {
                     NativeSection("手动补记") {
                         ForEach(entries, id: \.id) { entry in
@@ -816,6 +829,18 @@ struct OverviewSections: View {
                     NativeSection("按 Agent（估算）") {
                         SliceRows(slices: snap.agentsToday ?? [], symbol: snap.symbol ?? "¥",
                                   empty: "今天没有按 Agent 的记录", agent: true)
+                    }
+                }
+
+                // 余额放在按模型 / 按 Agent 下面，先看用量再看账户。
+                if let balances = snap.balances, balances.configured == true,
+                   let providers = balances.providers, !providers.isEmpty {
+                    NativeSection("余额") {
+                        ForEach(Array(providers.enumerated()), id: \.offset) { _, provider in
+                            SummaryRow(label: provider.name ?? provider.id ?? "余额",
+                                       value: providerBalanceText(provider),
+                                       help: provider.error)
+                        }
                     }
                 }
             }
@@ -1062,6 +1087,7 @@ struct SliceRow: View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = PanelModel()
     private var panel: NSHostingController<PanelView>?
+    private var panelSizeObservation: NSKeyValueObservation?
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var timer: Timer?
@@ -1185,9 +1211,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let host = NSHostingController(rootView: PanelView(model: model))
         host.view.wantsLayer = true
         host.view.layer?.backgroundColor = NSColor.clear.cgColor
-        host.preferredContentSize = NSSize(width: kPanelWidth, height: kPanelHeight)
+        // 高度跟着内容走：SwiftUI 算完再回写 popover，不再写死 530。
+        host.sizingOptions = [.preferredContentSize]
+        panelSizeObservation = host.observe(\.preferredContentSize, options: [.new]) {
+            [weak self] _, change in
+            guard let self, let size = change.newValue, size.height > 100 else { return }
+            self.applyPanelSize(size)
+        }
         panel = host
         return host
+    }
+
+    /// 内容高度自适应；超过屏幕可见区就停在最大值，由面板内部滚动。
+    private func applyPanelSize(_ size: NSSize) {
+        let height = min(max(size.height, 200), panelMaxHeight())
+        let target = NSSize(width: kPanelWidth, height: height)
+        guard abs(popover.contentSize.height - target.height) > 0.5
+            || abs(popover.contentSize.width - target.width) > 0.5 else { return }
+        popover.contentSize = target
     }
 
     /// 系统浅色/深色（不跟菜单栏的壁纸自适应走）。
@@ -1217,7 +1258,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let host = ensurePanel()
         applyPanelAppearance()
         popover.contentViewController = host
-        popover.contentSize = NSSize(width: kPanelWidth, height: kPanelHeight)
+        host.view.layoutSubtreeIfNeeded()
+        let preferred = host.preferredContentSize
+        let height = preferred.height > 100
+            ? min(preferred.height, panelMaxHeight()) : kPanelDefaultHeight
+        popover.contentSize = NSSize(width: kPanelWidth, height: height)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
         DispatchQueue.main.async { [weak self] in
@@ -1257,31 +1302,41 @@ struct TokenLensBarMain {
             .environment(\.colorScheme, scheme)
             .background(Color(nsColor: .windowBackgroundColor))
         let host = NSHostingController(rootView: root)
-        let size = NSSize(width: kPanelWidth, height: kPanelHeight)
-        host.view.frame = NSRect(origin: .zero, size: size)
+        host.sizingOptions = [.preferredContentSize]
         let appearanceName = ProcessInfo.processInfo.environment["TOKENLENSBAR_APPEARANCE"] == "light"
             ? NSAppearance.Name.aqua : NSAppearance.Name.darkAqua
         host.view.appearance = NSAppearance(named: appearanceName)
         host.view.wantsLayer = true
         host.view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
-        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
-                              styleMask: [.borderless], backing: .buffered, defer: false)
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero,
+                                size: NSSize(width: kPanelWidth, height: kPanelDefaultHeight)),
+            styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentViewController = host
         window.appearance = NSAppearance(named: appearanceName)
         window.orderFrontRegardless()
         host.view.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
 
+        // 内容量出来后再把窗口定到实际高度。
+        let preferred = host.preferredContentSize
+        let size = NSSize(width: kPanelWidth,
+                          height: min(max(preferred.height, 120), panelMaxHeight()))
+        window.setContentSize(size)
+        host.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
+
+        let captureSize = host.view.bounds.size.width > 1 ? host.view.bounds.size : size
         let scale: CGFloat = 2
         guard let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil,
-            pixelsWide: Int(size.width * scale),
-            pixelsHigh: Int(size.height * scale),
+            pixelsWide: Int(captureSize.width * scale),
+            pixelsHigh: Int(captureSize.height * scale),
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
         ) else { return }
-        rep.size = size
+        rep.size = captureSize
         host.view.cacheDisplay(in: host.view.bounds, to: rep)
         if let data = rep.representation(using: .png, properties: [:]) {
             try? data.write(to: URL(fileURLWithPath: path))
