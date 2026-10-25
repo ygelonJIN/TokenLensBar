@@ -1,8 +1,13 @@
 # TokenLensBar
 
-纯本地、零网络的 token 用量监控（余额查询是可选功能）。采集器 ~900 行 Python（只用标准库）+ 原生菜单栏 App + 本地看板。
+纯本地、零网络的 token 用量监控（余额查询是可选功能）。采集器约 2,500 行 Python（只用标准库）+ 原生菜单栏 App + 本地看板。
 
-菜单栏点开是原生面板（概览 / 历史）：概览是今日、余额、按模型/按 Agent（余额在今日下面，按 provider 写明金额）；右上角显示采集状态和更新时间；历史看全部汇总。面板跟随系统的浅色/深色，切换后开着也会跟着变。
+菜单栏点开是原生面板（概览 / 历史）：概览是消费、Token、余额、按模型/按 Agent；右上角显示采集状态和更新时间；历史看全部汇总。面板跟随系统的浅色/深色，切换后开着也会跟着变。
+
+「消费」按已启用余额的平台自动算：**当天第一条余额样本就是起点**，之后只累计余额下降；
+充值/退款等余额上涨不计入。余额栏仍然只显示当前余额，不改成“今日减少”。
+跨天缺口不提示，能用 Hermes 等日志的会话结束日归到正确的一天，归不了就静默忽略。
+手动补记保留但入口很弱：面板「今日」里有一个「补记」按钮，金额、Token、Agent、Model 都可选。
 
 ![面板](docs/panel.png)
 
@@ -36,6 +41,7 @@ python3 tokenlensbar.py serve          # 浏览器看板 http://127.0.0.1:8787
 | 数据 | `~/.tokenlensbar/usage.db` |
 | 单价表 | `~/.tokenlensbar/prices.json` |
 | 余额配置 | `~/.tokenlensbar/balances.json`（可选） |
+| 余额样本/手动补记 | 同在 `~/.tokenlensbar/usage.db` |
 | 余额 Key | `~/.tokenlensbar/secrets.json`（可选，权限 600） |
 | 每 5 分钟采集 | `~/Library/LaunchAgents/com.tokenlensbar.scan.plist` |
 | 登录自启 | `~/Library/LaunchAgents/com.tokenlensbar.bar.plist` |
@@ -44,7 +50,7 @@ python3 tokenlensbar.py serve          # 浏览器看板 http://127.0.0.1:8787
 ## 启动 / 停止
 
 菜单栏 App 是 `LSUIElement`（无 Dock 图标、不进 Cmd+Tab），装完即启动，
-右上角状态栏显示今日 token 数，点一下展开明细。
+右上角状态栏显示今日 token 数和消费，点一下展开明细。
 
 ```bash
 open -a TokenLensBar            # 手动启动（没出现时用这个）
@@ -115,6 +121,73 @@ API Key 只用于推理，查不了余额。
 - 余额缓存 10 分钟；面板每 60 秒读缓存，不会因为网络卡住。失败时保留上次余额。
 - 不想要余额：把对应 provider 的 `enabled` 改成 `false`，或删掉 `balances.json`；之后就完全不发请求。
 - 想接 Kimi、OpenRouter 等：它们也是 Bearer 余额接口，照着 `fetch_deepseek_balance` 加一个 adapter 即可（约 30 行）。
+
+## 消费（按余额自动）
+
+开启余额后，面板「今日」里的「消费」会自动算：
+
+- **起点**：当天第一条有效余额样本。8 点开盖、8 点第一条样本，就从 8 点起算。
+- **金额**：相邻样本之间所有余额下降之和。余额上涨（充值/退款/赠送）直接忽略，不记录、不显示。
+- **升级当天**：还没有更早的余额历史，会先用 `balances` 表里最近一次余额补一条起点；今天的消费从那个时间开始算。
+- **采样**：平时每 5 分钟扫描一次（余额缓存 10 分钟）；电脑唤醒时立即补一次，打开面板时如果超过 2 分钟也会后台补一次。
+- **跨天缺口**：不提示。能用 Hermes 等日志归因的，按日志里的会话结束日归到昨天/今天；归不了就静默忽略。
+- **2:00 的 Hermes 消费算今天**。日志时间是会话结束时间，所以一个跨 0 点的会话整段算到它结束的那天，不再拆会话。
+- **余额栏不变**：仍然只显示当前余额（如 `DeepSeek ¥20.62`），不会改成“今日减少多少”。
+
+举例：
+
+```text
+昨天 23:00 余额 100
+今天 08:00 余额 95   ← 今天第一条样本，起点 95
+今天 09:00 余额 94   → 消费 1
+
+跨天缺口 5：
+  Hermes 23:30 会话 -> 归昨天
+  Hermes 02:00 会话 -> 归今天
+```
+
+### 手动补记（基本不用，入口很弱）
+
+面板「今日」里有个「补记」按钮，点开可以填：
+
+- 金额（可为负数）
+- Token
+- Agent（可空）
+- Model（可空）
+
+金额和 Token 至少填一个；Agent / Model 可以都不填。补记金额加到「消费」，
+补记 Token 加到今日 Token，并在「手动补记」里单独列出。
+
+命令行：
+
+```bash
+python3 ~/.tokenlensbar/tokenlensbar.py manual add --amount 2
+python3 ~/.tokenlensbar/tokenlensbar.py manual add --amount 2 --tokens 12000 \
+  --agent Foo --model bar
+python3 ~/.tokenlensbar/tokenlensbar.py manual add --tokens 12000 --agent Foo
+python3 ~/.tokenlensbar/tokenlensbar.py manual list
+python3 ~/.tokenlensbar/tokenlensbar.py manual delete 1
+python3 ~/.tokenlensbar/tokenlensbar.py balance --today
+```
+
+补记是**额外项**：只补余额没覆盖的消费。余额已经算过的消费不要再补，否则会重复；
+要冲减就填负数。
+
+### 平台范围
+
+- 有余额接口的平台自动：目前是 DeepSeek、Xiaomi MiMo。
+- 没有余额接口的平台不出现、不计入；以后要加就在 `balances.json` 里加 provider
+  并写一个 fetch 函数，聚合和面板不用改。
+- 只有余额、没有日志的平台也能算金额；跨天缺口没有日志可归因，就按上面的规则静默忽略。
+
+### 口径边界
+
+- 余额法不是账单。服务商余额有延迟、临时冻结，充值+消费落在同一个采样间隔时也可能少算。
+- 多币种分开显示，不自动换汇。
+- Hermes 是**会话级**：本机新版精确到 `session × model × task`，树莓派老版精确到 `session`。
+  跨 0 点会话只能整段归到结束日，不能精确到请求。
+- 历史页仍显示 Token 估算；面板里的「消费」才是余额法。
+- 手动补记不会连平台，也不读余额接口。
 
 ## 它是怎么工作的
 
@@ -339,12 +412,14 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 | `python3 tokenlensbar.py breakdown --days 30` | Agent × 模型 交叉明细（`--days 0` = 全部） |
 | `python3 tokenlensbar.py models` | 所有见过的模型 + 定价状态 |
 | `python3 tokenlensbar.py health` | 体检：数据源还在不在、有没有静默停止解析 |
+| `python3 tokenlensbar.py manual add --amount 2` | 手动补记（金额/Token/Agent/Model 可选） |
+| `python3 tokenlensbar.py balance --today` | 消费：余额下降 + 跨天归因 + 手动补记 |
 | `python3 tokenlensbar.py reset --agent dsh` | 清掉某个来源重扫（改了 Adapter 解析逻辑时用） |
+| `python3 tokenlensbar.py status --json` | 结构化摘要（菜单栏用） |
 
 > 内部 key 用 `dsh` / `codex` / `hermes`，界面上显示为 **DeepSeek Harness** / **Codex** /
 > **Hermes (MacBook)**（`AGENT_LABELS` 映射；树莓派那台是 **Hermes (pi)**）。
 > 改显示名不会动历史事件的 id，所以不会重复计数。
-| `python3 tokenlensbar.py status --json` | 结构化摘要（菜单栏用） |
 | `python3 tokenlensbar.py serve` | 本地看板，只监听 127.0.0.1 |
 | `python3 tokenlensbar.py sources` | 本机发现了哪些数据源 |
 | `python3 tests/test_pricing.py` | 定价逻辑回归测试 |
@@ -463,7 +538,8 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 | [install.sh](install.sh) | 一条命令安装（运行时 + App + 两个 LaunchAgent） |
 | [tests/test_pricing.py](tests/test_pricing.py) | 定价回归测试 |
 | [tests/test_scan.py](tests/test_scan.py) | 扫描链路回归测试（zstd 定位、DSH 解析） |
-| [tests/test_balance.py](tests/test_balance.py) | 余额缓存/解析/错误处理回归测试 |
+| [tests/test_balance.py](tests/test_balance.py) | 余额采样/缓存/解析/错误处理回归测试 |
+| [tests/test_spend.py](tests/test_spend.py) | 今日消费、跨天归因、手动补记回归测试 |
 | [prices.json](prices.json) | 单价表模板（已填你的价格，安装时复制到 `~/.tokenlensbar/`） |
 | [prices.example.json](prices.example.json) | 三种写法的结构示例 |
 | [balances.example.json](balances.example.json) | 余额 provider 配置模板 |

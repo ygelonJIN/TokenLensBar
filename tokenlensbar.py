@@ -20,6 +20,7 @@ TokenLensBar — 本地 token 用量采集器
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -562,7 +563,8 @@ class HermesAdapter(Adapter):
             rows = con.execute(
                 "select session_id, model, billing_provider, task, input_tokens, output_tokens,"
                 " cache_read_tokens, cache_write_tokens, reasoning_tokens,"
-                " estimated_cost_usd, last_seen from session_model_usage"
+                " estimated_cost_usd, coalesce(last_seen, first_seen, 0)"
+                " from session_model_usage"
             )
         except sqlite3.Error:
             con.close()
@@ -609,12 +611,19 @@ try:
         out["rows"] = con.execute(
             "select session_id, model, billing_provider, task, input_tokens,"
             " output_tokens, cache_read_tokens, cache_write_tokens,"
-            " reasoning_tokens, estimated_cost_usd, last_seen"
+            " reasoning_tokens, estimated_cost_usd,"
+            " coalesce(last_seen, first_seen, 0)"
             " from session_model_usage").fetchall()
     elif "sessions" in tables:
-        # 老版 Hermes：用量只在 sessions 表里，按会话一条
+        # 老版 Hermes：用量只在 sessions 表里，按会话一条。
+        # 会话没正常结束时，用最后一条消息时间当结束时间；仍没有才退回 started_at。
         cols = {row[1] for row in con.execute("pragma table_info(sessions)")}
-        stamp = "coalesce(ended_at, started_at)" if "ended_at" in cols else "started_at"
+        last_msg = ("(select max(timestamp) from messages m"
+                    " where m.session_id = sessions.id)") if "messages" in tables else "null"
+        if "ended_at" in cols:
+            stamp = "coalesce(ended_at, %s, started_at)" % last_msg
+        else:
+            stamp = "coalesce(%s, started_at)" % last_msg
         provider = "billing_provider" if "billing_provider" in cols else "''"
         out["mode"] = "sessions"
         out["rows"] = con.execute(
@@ -792,6 +801,27 @@ CREATE TABLE IF NOT EXISTS balance_state (
     last_success REAL,
     error        TEXT
 );
+CREATE TABLE IF NOT EXISTS balance_samples (
+    provider   TEXT NOT NULL,
+    currency   TEXT NOT NULL,
+    ts         REAL NOT NULL,
+    total      REAL NOT NULL,
+    granted    REAL,
+    topped_up  REAL,
+    available  INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (provider, currency, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_balance_samples_ts ON balance_samples(ts);
+CREATE TABLE IF NOT EXISTS manual_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    day        TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    amount     REAL,
+    tokens     INTEGER,
+    agent      TEXT,
+    model      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_manual_entries_day ON manual_entries(day);
 """
 
 
@@ -1104,6 +1134,12 @@ def money(value, symbol="$"):
     return symbol + "%.2f" % value
 
 
+def money_exact(value, symbol="¥"):
+    """固定两位小数，负数写成 -¥2.00（手工补记/合计用）。"""
+    sign = "-" if value < 0 else ""
+    return "%s%s%.2f" % (sign, symbol, abs(value))
+
+
 def report(db_path, days, group_by):
     if not db_path.exists():
         print("还没有数据，先运行：python3 tokenlensbar.py scan")
@@ -1177,7 +1213,7 @@ def report(db_path, days, group_by):
     print()
 
 
-def daily_filled(items, days):
+def daily_filled(items, days, now=None):
     """最近 N 天，缺的日子补 0；token 和金额一起返回。"""
     buckets = {}
     for item in items:
@@ -1185,7 +1221,8 @@ def daily_filled(items, days):
         bucket = buckets.setdefault(day, {"tokens": 0.0, "cost": 0.0})
         bucket["tokens"] += item["total"]
         bucket["cost"] += item["cost"]
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = datetime.fromtimestamp(time.time() if now is None else now).replace(
+        hour=0, minute=0, second=0, microsecond=0)
     out = []
     for offset in range(days - 1, -1, -1):
         day = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
@@ -1215,22 +1252,34 @@ def enrich(rows, prices):
     return out
 
 
-def status_json(db_path, prices=None):
+# --------------------------------------------------------------------------
+# 日期工具
+# --------------------------------------------------------------------------
+
+def _day_key(value):
+    """把 YYYY-MM-DD 归一化；不合法返回 None。"""
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+
+
+def status_json(db_path, prices=None, now=None, config_path=None):
     """给菜单栏用的结构化摘要。成本在这里即时算，不落库。"""
     prices = prices if prices is not None else load_prices()
     symbol = prices.get("symbol") or "$"
     if not db_path.exists():
         return {"ok": False, "symbol": symbol, "reason": "no-database"}
 
-    now = time.time()
+    now = time.time() if now is None else now
     # 面板要显示"全部历史"，所以这里取全量（几千行，一次遍历几十毫秒）
     rows, _ = fetch_rows(db_path, 0)
     if not rows:
         return {"ok": False, "symbol": symbol, "reason": "no-events"}
 
     items = enrich(rows, prices)
-    today_start = datetime.now().replace(hour=0, minute=0, second=0,
-                                         microsecond=0).timestamp()
+    today_start = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0,
+                                                      microsecond=0).timestamp()
     week_start = now - 7 * 86400
     month_start = now - 30 * 86400
 
@@ -1274,6 +1323,7 @@ def status_json(db_path, prices=None):
     all_models = group(0, "model")
     all_agents = group(0, "agent")
     all_total = sum(b["tokens"] for b in all_models.values()) or 1
+    all_cost = sum(b["cost"] for b in all_models.values())
     today_models = group(today_start, "model")
     today_agents = group(today_start, "agent")
     today_total = sum(b["tokens"] for b in today_models.values()) or 1
@@ -1284,10 +1334,17 @@ def status_json(db_path, prices=None):
     week_cache = sum(item["cache_read"] for item in items if item["ts"] >= week_start)
 
     try:
-        balances = balance_payload(db_path)
+        balances = balance_payload(db_path, config_path=config_path)
     except Exception:
         balances = {"configured": False, "refresh_seconds": 600,
                     "providers": [], "error": "余额读取失败"}
+    try:
+        spend = today_spend(db_path, prices, items=items, now=now,
+                            config_path=config_path)
+    except Exception as exc:
+        spend = {"configured": False, "day": _local_day(now), "currencies": [],
+                 "manual": {"amount": 0, "tokens": 0, "entries": []},
+                 "tokens": 0, "error": str(exc)}
 
     return {
         "ok": True,
@@ -1311,7 +1368,7 @@ def status_json(db_path, prices=None):
              "subscription": agent_is_subscription(name)}
             for name, b in sorted(today_agents.items(), key=lambda kv: -kv[1]["tokens"])
         ],
-        "daily": daily_filled(items, 7),
+        "daily": daily_filled(items, 7, now=now),
         "models": [
             {"model": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
              "share": round(b["tokens"] / all_total, 4),
@@ -1328,22 +1385,25 @@ def status_json(db_path, prices=None):
         "unpriced": unpriced,
         "all_tokens": all_total,
         "all_events": len(items),
+        "all_cost": round(all_cost, 6),
+        "today_spend": spend,
         "last_event": rows[-1][0],
         "priced": bool(prices),
         "balances": balances,
     }
 
 
-def status(db_path, days_list=(1, 7, 30)):
+def status(db_path, days_list=(1, 7, 30), now=None):
     """一行式摘要，给脚本用。"""
     prices = load_prices()
     symbol = prices.get("symbol") or "$"
-    since = time.time() - max(days_list) * 86400
+    now = time.time() if now is None else now
+    since = now - max(days_list) * 86400
     rows, _ = fetch_rows(db_path, since) if db_path.exists() else ([], [])
     out = []
-    now = time.time()
     for days in days_list:
-        agg = aggregate(rows, prices, now - days * 86400)
+        start = now - days * 86400
+        agg = aggregate(rows, prices, start)
         out.append({
             "days": days,
             "tokens": agg["totals"]["total"],
@@ -1575,6 +1635,18 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
     secrets, secret_error = load_secrets(secrets_path)
     con = connect(db_path)
     now = time.time() if now is None else now
+    # 升级到“余额历史”版本时，balances 表里已有最近一次余额；先补成样本，
+    # 这样今天第一次刷新就能和它算出差额，而不是从 0 开始。
+    for row in con.execute(
+            "select provider, currency, total, granted, topped_up, available, fetched_at"
+            " from balances"):
+        if row[6] and row[5] and row[2] is not None:
+            con.execute(
+                "insert or ignore into balance_samples"
+                " (provider, currency, ts, total, granted, topped_up, available)"
+                " values (?,?,?,?,?,?,1)",
+                (row[0], row[1], row[6], row[2], row[3], row[4]))
+    con.commit()
     for entry in config["providers"]:
         provider = entry["id"]
         state = con.execute(
@@ -1637,13 +1709,25 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
 
         con.execute("delete from balances where provider=?", (provider,))
         for item in items:
+            currency = item.get("currency") or "CNY"
+            total = _balance_number(item.get("total"))
+            available = bool(item.get("available", True))
             con.execute(
                 "insert or replace into balances"
                 " (provider, currency, total, granted, topped_up, available, fetched_at)"
                 " values (?,?,?,?,?,?,?)",
-                (provider, item.get("currency") or "CNY", float(item.get("total") or 0),
+                (provider, currency, float(total or 0),
                  item.get("granted"), item.get("topped_up"),
-                 1 if item.get("available", True) else 0, now))
+                 1 if available else 0, now))
+            # 只有“确实拿到了余额”的样本才进入历史；接口不可用/空数不能当成 0，
+            # 否则第二天的余额差会凭空多出一大笔“消费”。
+            if available and total is not None:
+                con.execute(
+                    "insert or replace into balance_samples"
+                    " (provider, currency, ts, total, granted, topped_up, available)"
+                    " values (?,?,?,?,?,?,1)",
+                    (provider, currency, now, float(total),
+                     item.get("granted"), item.get("topped_up")))
         con.execute(
             "insert or replace into balance_state"
             " (provider, last_attempt, last_success, error) values (?,?,?,?)",
@@ -1698,8 +1782,308 @@ def balance_payload(db_path, config_path=None, now=None):
 
 
 # --------------------------------------------------------------------------
+# 今日消费：余额下降 + 跨天会话归因 + 手动补记
+# --------------------------------------------------------------------------
+
+def _local_day(ts=None):
+    return datetime.fromtimestamp(time.time() if ts is None else ts).strftime("%Y-%m-%d")
+
+
+def _day_bounds(day):
+    start = datetime.strptime(day, "%Y-%m-%d").timestamp()
+    return start, start + 86400
+
+
+def _currency_symbol(currency):
+    code = (currency or "CNY").upper()
+    return {"CNY": "¥", "USD": "$"}.get(code, code + " ")
+
+
+def add_manual_entry(amount=None, tokens=None, agent=None, model=None,
+                     day=None, db_path=None, now=None):
+    """补记一条手动消费/Token。金额和 Token 至少填一个。"""
+    day = _day_key(day) if day else _local_day(now)
+    if day is None:
+        raise ValueError("日期格式应为 YYYY-MM-DD")
+    amount_value = None
+    if amount is not None and str(amount).strip() != "":
+        try:
+            amount_value = float(amount)
+        except (TypeError, ValueError):
+            raise ValueError("金额必须是数字")
+        if not math.isfinite(amount_value):
+            raise ValueError("金额必须是有限数字")
+    tokens_value = None
+    if tokens is not None and str(tokens).strip() != "":
+        try:
+            tokens_value = int(tokens)
+        except (TypeError, ValueError):
+            raise ValueError("Token 必须是整数")
+        if tokens_value < 0:
+            raise ValueError("Token 不能是负数")
+    if amount_value is None and tokens_value is None:
+        raise ValueError("金额和 Token 至少填一个")
+    agent = (str(agent).strip() if agent else "") or None
+    model = (str(model).strip() if model else "") or None
+    con = connect(db_path or DEFAULT_DB)
+    cur = con.execute(
+        "insert into manual_entries (day, created_at, amount, tokens, agent, model)"
+        " values (?,?,?,?,?,?)",
+        (day, time.time() if now is None else now, amount_value,
+         tokens_value, agent, model))
+    con.commit()
+    entry_id = cur.lastrowid
+    con.close()
+    return entry_id
+
+
+def manual_entries_for(db_path, day=None, now=None):
+    day = _day_key(day) if day else _local_day(now)
+    if day is None:
+        return []
+    con = connect(db_path)
+    rows = con.execute(
+        "select id, created_at, amount, tokens, agent, model"
+        " from manual_entries where day=? order by id", (day,)).fetchall()
+    con.close()
+    return [{
+        "id": row[0],
+        "created_at": row[1],
+        "amount": row[2],
+        "tokens": row[3],
+        "agent": row[4],
+        "model": row[5],
+    } for row in rows]
+
+
+def delete_manual_entry(entry_id, db_path=None):
+    con = connect(db_path or DEFAULT_DB)
+    cur = con.execute("delete from manual_entries where id=?", (int(entry_id),))
+    con.commit()
+    deleted = cur.rowcount
+    con.close()
+    return deleted > 0
+
+
+def _provider_aliases(entry):
+    aliases = {
+        str(entry.get("id") or "").lower(),
+        str(entry.get("type") or "").lower(),
+        str(entry.get("name") or "").lower(),
+    }
+    ptype = str(entry.get("type") or "").lower()
+    if ptype == "deepseek":
+        aliases.add("deepseek")
+    if ptype in ("mimo", "mimo_cookie"):
+        aliases.update({"xiaomi", "mimo", "xiaomi mimo"})
+    return {item for item in aliases if item}
+
+
+def _event_matches_provider(item, entry):
+    aliases = _provider_aliases(entry)
+    provider = (item.get("provider") or "").lower()
+    if provider and provider not in ("(未记录)", "unknown", "unknown-provider"):
+        for alias in aliases:
+            if alias == provider or alias in provider or provider in alias:
+                return True
+    model = (item.get("model") or "").lower()
+    if "deepseek" in aliases and "deepseek" in model:
+        return True
+    if "mimo" in aliases and ("mimo" in model or "xiaomi" in model):
+        return True
+    return False
+
+
+def _gap_weights(items, entry, gap_start, gap_end):
+    """跨天缺口里的消费按“会话结束日”归到日历日。
+
+    Hermes 的事件时间已经是会话/任务的 last_seen（远端老库是 ended_at），
+    所以这里不需要再拆会话；每个会话整段算到它结束的那一天。
+    """
+    weights = {}
+    for item in items or []:
+        ts = item.get("ts") or 0
+        if not (gap_start < ts <= gap_end):
+            continue
+        if not _event_matches_provider(item, entry):
+            continue
+        day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        weight = item.get("cost") or 0.0
+        if weight <= 0:
+            weight = float(item.get("total") or 1.0)
+        weights[day] = weights.get(day, 0.0) + weight
+    return weights
+
+
+def today_spend(db_path, prices=None, items=None, now=None, config_path=None):
+    """今日消费：余额下降为金额，跨天缺口按日志的会话结束日归因。
+
+    余额栏本身不改；这里只给「今日消费」提供结构化数据。
+    """
+    prices = prices if prices is not None else load_prices()
+    now = time.time() if now is None else now
+    day = _local_day(now)
+    day_start, day_end = _day_bounds(day)
+    day_end = min(day_end, now + 1.0)
+    primary_currency = (prices.get("currency") or "CNY").upper()
+    config = load_balances_config(config_path)
+    entries = manual_entries_for(db_path, day, now=now) if db_path.exists() else []
+    manual_amount = sum(float(row["amount"] or 0) for row in entries)
+    manual_tokens = sum(int(row["tokens"] or 0) for row in entries)
+
+    series = {}
+    if config["configured"] and db_path.exists():
+        con = connect(db_path)
+        for entry in config["providers"]:
+            rows = con.execute(
+                "select currency, ts, total from balance_samples"
+                " where provider=? and available=1 and ts>=? and ts<=?"
+                " order by currency, ts",
+                (entry["id"], day_start, day_end)).fetchall()
+            for currency, ts, total in rows:
+                series.setdefault((entry["id"], currency), []).append((ts, total))
+        # 每个 provider 即使今天还没样本，也要出现在结果里
+        for entry in config["providers"]:
+            existing = {currency for (pid, currency) in series if pid == entry["id"]}
+            latest = con.execute(
+                "select distinct currency from balances where provider=?", (entry["id"],)).fetchall()
+            for (currency,) in latest:
+                if currency not in existing:
+                    series[(entry["id"], currency)] = []
+        con.close()
+
+    currency_buckets = {}
+    provider_info = {entry["id"]: entry for entry in config["providers"]}
+    for (pid, currency), samples in series.items():
+        entry = provider_info.get(pid) or {"id": pid, "name": pid, "type": pid}
+        bucket = currency_buckets.setdefault(currency, {
+            "currency": (currency or "CNY").upper(),
+            "symbol": _currency_symbol(currency),
+            "automatic": None,
+            "manual": 0.0,
+            "total": 0.0,
+            "providers": [],
+        })
+        spent = None
+        start_ts = None
+        gap_share = 0.0
+        if samples:
+            samples.sort(key=lambda item: item[0])
+            start_ts = samples[0][0]
+            spent = 0.0
+            for previous, current in zip(samples, samples[1:]):
+                spent += max(0.0, previous[1] - current[1])
+            con = connect(db_path)
+            previous = con.execute(
+                "select ts, total from balance_samples"
+                " where provider=? and currency=? and available=1 and ts<?"
+                " order by ts desc limit 1", (pid, currency, day_start)).fetchone()
+            con.close()
+            if previous and previous[1] > samples[0][1]:
+                gap_drop = previous[1] - samples[0][1]
+                weights = _gap_weights(items, entry, previous[0], samples[0][0])
+                total_weight = sum(weights.values())
+                if total_weight > 0:
+                    gap_share = gap_drop * weights.get(day, 0.0) / total_weight
+                    spent += gap_share
+        bucket["providers"].append({
+            "id": pid,
+            "name": entry.get("name") or pid,
+            "currency": bucket["currency"],
+            "spent": None if spent is None else round(spent, 6),
+            "start_ts": start_ts,
+            "samples": len(samples),
+            "gap": round(gap_share, 6),
+        })
+        if spent is not None:
+            bucket["automatic"] = round((bucket["automatic"] or 0.0) + spent, 6)
+        bucket["total"] = round((bucket["automatic"] or 0.0), 6)
+
+    # 手动补记统一记到主币种（通常是 CNY）
+    if entries or manual_amount:
+        bucket = currency_buckets.setdefault(primary_currency, {
+            "currency": primary_currency,
+            "symbol": _currency_symbol(primary_currency),
+            "automatic": None,
+            "manual": 0.0,
+            "total": 0.0,
+            "providers": [],
+        })
+        bucket["manual"] = round(manual_amount, 6)
+        bucket["total"] = round((bucket["automatic"] or 0.0) + manual_amount, 6)
+
+    currencies = sorted(currency_buckets.values(),
+                        key=lambda item: (item["currency"] != primary_currency,
+                                          item["currency"]))
+    return {
+        "configured": bool(config["configured"]),
+        "day": day,
+        "currencies": currencies,
+        "manual": {
+            "amount": round(manual_amount, 6),
+            "tokens": manual_tokens,
+            "entries": entries,
+        },
+        "tokens": manual_tokens,
+    }
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
+def cmd_manual(args):
+    """手动补记：金额、Token、Agent、Model 都可选，但金额和 Token 至少一个。"""
+    action = getattr(args, "manual_action", None) or "list"
+    day = getattr(args, "date", None)
+    json_output = getattr(args, "json", False)
+    if day and _day_key(day) is None:
+        print("日期格式应为 YYYY-MM-DD，例如 2026-10-25")
+        return 2
+
+    if action == "add":
+        try:
+            entry_id = add_manual_entry(
+                amount=args.amount, tokens=args.tokens,
+                agent=args.agent, model=args.model, day=day)
+        except (OSError, ValueError) as exc:
+            print("补记失败：%s" % exc)
+            return 1
+        print("已补记 #%d" % entry_id)
+        return 0
+
+    if action == "delete":
+        try:
+            deleted = delete_manual_entry(args.id)
+        except (OSError, ValueError) as exc:
+            print("删除失败：%s" % exc)
+            return 1
+        print("已删除 #%d" % args.id if deleted else "没有这条记录")
+        return 0
+
+    entries = manual_entries_for(DEFAULT_DB, day)
+    if json_output:
+        print(json.dumps(entries, ensure_ascii=False))
+        return 0
+    if not entries:
+        print("今天还没有手动补记。用法：tokenlensbar.py manual add --amount 2")
+        return 0
+    symbol = (load_prices() or {}).get("symbol") or "¥"
+    print()
+    for entry in entries:
+        parts = []
+        if entry["amount"] is not None:
+            parts.append(money_exact(entry["amount"], symbol))
+        if entry["tokens"] is not None:
+            parts.append("%s tokens" % format(entry["tokens"], ","))
+        if entry["agent"]:
+            parts.append(entry["agent"])
+        if entry["model"]:
+            parts.append(entry["model"])
+        print("  #%-4d %s" % (entry["id"], "  ".join(parts)))
+    print()
+    return 0
+
 
 def cmd_sources(_args):
     print()
@@ -1889,10 +2273,11 @@ def cmd_breakdown(args):
             print()
 
 
-def api_payload(db_path, days):
-    prices = load_prices()
+def api_payload(db_path, days, now=None, prices=None):
+    prices = prices if prices is not None else load_prices()
     symbol = prices.get("symbol") or "$"
-    since = time.time() - days * 86400
+    now = time.time() if now is None else now
+    since = now - days * 86400
     rows, sources = fetch_rows(db_path, since) if db_path.exists() else ([], [])
     agg = aggregate(rows, prices, since)
     totals = agg["totals"]
@@ -2023,8 +2408,23 @@ def main(argv=None):
     status_parser = sub.add_parser("status", help="一行式摘要")
     status_parser.add_argument("--json", action="store_true")
 
+    manual_parser = sub.add_parser("manual", help="手动补记金额/Token/Agent/Model")
+    manual_sub = manual_parser.add_subparsers(dest="manual_action")
+    manual_add = manual_sub.add_parser("add", help="新增一条补记")
+    manual_add.add_argument("--amount", type=float, help="金额，可为负数")
+    manual_add.add_argument("--tokens", type=int, help="Token 数")
+    manual_add.add_argument("--agent", help="Agent 名称，可空")
+    manual_add.add_argument("--model", help="模型名称，可空")
+    manual_add.add_argument("--date", help="日期 YYYY-MM-DD，默认今天")
+    manual_list = manual_sub.add_parser("list", help="查看补记")
+    manual_list.add_argument("--date", help="日期 YYYY-MM-DD，默认今天")
+    manual_list.add_argument("--json", action="store_true")
+    manual_delete = manual_sub.add_parser("delete", help="删除一条补记")
+    manual_delete.add_argument("id", type=int)
+
     balance_parser = sub.add_parser("balance", help="查看账户余额")
     balance_parser.add_argument("--refresh", action="store_true", help="立即请求余额接口")
+    balance_parser.add_argument("--today", action="store_true", help="查看今日消费")
     balance_parser.add_argument("--json", action="store_true")
 
     serve_parser = sub.add_parser("serve", help="启动本地看板")
@@ -2057,6 +2457,32 @@ def main(argv=None):
                 return 1
             if not result["configured"]:
                 print("余额查询未启用：先配置 %s" % BALANCES_PATH)
+        if args.today:
+            prices = load_prices()
+            rows, _ = fetch_rows(DEFAULT_DB, 0) if DEFAULT_DB.exists() else ([], [])
+            items = enrich(rows, prices)
+            spend = today_spend(DEFAULT_DB, prices, items=items)
+            if args.json:
+                print(json.dumps(spend, ensure_ascii=False))
+                return 0
+            print()
+            for bucket in spend["currencies"]:
+                print("  %s" % money_exact(bucket["total"], bucket["symbol"]))
+                for provider in bucket["providers"]:
+                    if provider["spent"] is not None:
+                        started = (datetime.fromtimestamp(provider["start_ts"])
+                                   .strftime("%H:%M") if provider["start_ts"] else "—")
+                        print("    %-12s %s%.2f（%s 起）" % (
+                            provider["name"], bucket["symbol"],
+                            provider["spent"], started))
+                    else:
+                        print("    %-12s —（今天还没采到余额）" % provider["name"])
+                if bucket["manual"]:
+                    print("    手动补记     %s%.2f" % (bucket["symbol"], bucket["manual"]))
+            if not spend["currencies"]:
+                print("  今天还没有消费数据。")
+            print()
+            return 0
         try:
             payload = balance_payload(DEFAULT_DB)
         except Exception as exc:
@@ -2082,9 +2508,12 @@ def main(argv=None):
             data = status(DEFAULT_DB)
             symbol = (load_prices() or {}).get("symbol") or "$"
             print("  ".join(
-                "近%d天 %s tokens %s%.2f" % (d["days"], human(d["tokens"]), symbol, d["cost"])
+                "近%d天 %s tokens %s%.2f" % (
+                    d["days"], human(d["tokens"]), symbol, d["cost"])
                 for d in data
             ))
+    elif args.command == "manual":
+        return cmd_manual(args)
     elif args.command == "models":
         cmd_models(args)
     elif args.command == "health":

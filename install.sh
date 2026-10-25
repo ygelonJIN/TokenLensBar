@@ -120,6 +120,7 @@ echo "  数据     $RUNTIME/usage.db"
 echo "  单价表   $RUNTIME/prices.json"
 echo "  余额     $RUNTIME/balances.json（DeepSeek 已启用）"
 echo "  余额 Key $RUNTIME/secrets.json（编辑它，把占位符换成完整 Key；权限 600）"
+echo "  手动补记 面板「今日」里的「补记」按钮，或 tokenlensbar.py manual add --amount 2"
 echo "  看板     python3 $RUNTIME/tokenlensbar.py serve"
 echo
 echo "菜单栏右上角会出现一个 token 用量数字。没出现就手动开一次："

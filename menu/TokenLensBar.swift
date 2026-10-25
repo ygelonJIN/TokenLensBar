@@ -69,6 +69,55 @@ struct Snapshot: Decodable {
             case refreshSeconds = "refresh_seconds"
         }
     }
+    struct TodaySpend: Decodable {
+        struct Provider: Decodable {
+            let id: String?
+            let name: String?
+            let currency: String?
+            let spent: Double?
+            let startTs: Double?
+            let samples: Int?
+            let gap: Double?
+
+            enum CodingKeys: String, CodingKey {
+                case id, name, currency, spent, samples, gap
+                case startTs = "start_ts"
+            }
+        }
+        struct Currency: Decodable {
+            let currency: String?
+            let symbol: String?
+            let automatic: Double?
+            let manual: Double?
+            let total: Double
+            let providers: [Provider]?
+        }
+        struct ManualEntry: Decodable {
+            let id: Int?
+            let amount: Double?
+            let tokens: Int?
+            let agent: String?
+            let model: String?
+            let createdAt: Double?
+
+            enum CodingKeys: String, CodingKey {
+                case id, amount, tokens, agent, model
+                case createdAt = "created_at"
+            }
+        }
+        struct Manual: Decodable {
+            let amount: Double?
+            let tokens: Int?
+            let entries: [ManualEntry]?
+        }
+
+        let configured: Bool?
+        let day: String?
+        let currencies: [Currency]?
+        let manual: Manual?
+        let tokens: Int?
+        let error: String?
+    }
 
     let ok: Bool
     let symbol: String?
@@ -81,6 +130,8 @@ struct Snapshot: Decodable {
     let cacheRate: Double?
     let allTokens: Double?
     let allEvents: Int?
+    let allCost: Double?
+    let todaySpend: TodaySpend?
     let unpriced: [String]?
     let priced: Bool?
     let balances: Balances?
@@ -91,6 +142,8 @@ struct Snapshot: Decodable {
         case cacheRate = "cache_rate"
         case allTokens = "all_tokens"
         case allEvents = "all_events"
+        case allCost = "all_cost"
+        case todaySpend = "today_spend"
         case modelsToday = "models_today"
         case agentsToday = "agents_today"
     }
@@ -122,6 +175,30 @@ final class PyBridge {
     }
 
     func scan() { _ = run(arguments: ["scan", "--force-balance"]) }
+
+    /// 电脑唤醒/打开面板时补一次余额，让今天的起点尽量贴近开盖时刻。
+    func refreshBalance() { _ = run(arguments: ["balance", "--refresh"]) }
+
+    /// 手动补记。金额和 Token 至少传一个。
+    func addManual(amount: Double?, tokens: Int?, agent: String?, model: String?) {
+        var args = ["manual", "add"]
+        if let amount {
+            let text = String(format: "%.4f", amount)
+                .replacingOccurrences(of: ",", with: ".")
+            args += ["--amount", text]
+        }
+        if let tokens {
+            args += ["--tokens", String(tokens)]
+        }
+        if let agent, !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            args += ["--agent", agent]
+        }
+        if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            args += ["--model", model]
+        }
+        guard args.count > 2 else { return }
+        _ = run(arguments: args)
+    }
 
     /// 打开看板：服务已经在跑就直接开浏览器，没跑就先起服务再开。
     /// 原来不管服务在不在都 blindly 起一个 serve，端口被占用时进程直接退出，
@@ -176,6 +253,11 @@ func moneyCompact(_ value: Double, _ symbol: String) -> String {
     return symbol + String(format: "%.3f", value)
 }
 
+func moneyCompactSigned(_ value: Double, _ symbol: String) -> String {
+    if value < 0 { return "-" + moneyCompact(-value, symbol) }
+    return moneyCompact(value, symbol)
+}
+
 /// 订阅制显示"订阅"；有 token 但没配单价显示横杠；其余按金额
 func costText(_ cost: Double, tokens: Double, _ symbol: String,
               subscription: Bool = false) -> String {
@@ -198,6 +280,12 @@ func money(_ value: Double, _ symbol: String) -> String {
     return symbol + String(format: "%.2f", value)
 }
 
+/// 允许负数的金额显示（手工补记可以填负数来做冲减）。
+func signedMoney(_ value: Double, _ symbol: String) -> String {
+    if value < 0 { return "-" + money(-value, symbol) }
+    return money(value, symbol)
+}
+
 func logLine(_ message: String) {
     let path = (kDbPath as NSString).deletingLastPathComponent + "/bar.log"
     let stamp = ISO8601DateFormatter().string(from: Date())
@@ -211,7 +299,7 @@ func logLine(_ message: String) {
     }
 }
 
-let kPanelHeight: CGFloat = 490
+let kPanelHeight: CGFloat = 530
 
 func shortDate(_ text: String) -> String {
     let parts = text.split(separator: "-")
@@ -257,6 +345,7 @@ final class PanelModel: ObservableObject {
 
     private let bridge = PyBridge()
     private var clearItem: DispatchWorkItem?
+    private var lastBalanceRefresh: Date?
 
     func reload() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -291,6 +380,143 @@ final class PanelModel: ObservableObject {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: item)
             }
         }
+    }
+
+    /// 补一次余额。唤醒时强制，打开面板时隔一段时间才补，避免每次点开都打接口。
+    func refreshBalance(force: Bool = false) {
+        let now = Date()
+        if !force, let last = lastBalanceRefresh,
+           now.timeIntervalSince(last) < 120 {
+            return
+        }
+        lastBalanceRefresh = now
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.bridge.refreshBalance()
+            let snap = self.bridge.load()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.snapshot = snap
+                self.loadFailed = (snap == nil)
+                self.lastLoaded = Date()
+                self.flash("余额已更新", seconds: 3)
+            }
+        }
+    }
+
+    /// 打开面板时如果今天还没样本，或上次余额刷新较久，后台补一次。
+    func refreshBalanceIfNeeded() {
+        refreshBalance(force: false)
+    }
+
+    func addManual(amount: Double?, tokens: Int?, agent: String?, model: String?) {
+        guard amount != nil || tokens != nil else {
+            status = "金额和 Token 至少填一个"
+            return
+        }
+        status = "正在补记…"
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.bridge.addManual(amount: amount, tokens: tokens,
+                                  agent: agent, model: model)
+            let snap = self.bridge.load()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.snapshot = snap
+                self.loadFailed = (snap == nil)
+                self.lastLoaded = Date()
+                self.flash("已补记", seconds: 4)
+            }
+        }
+    }
+
+    /// 手动补记入口：故意做得不显眼，字段都可选，金额/Token 至少一个。
+    func presentManualEntry() {
+        let alert = NSAlert()
+        alert.messageText = "手动补记"
+        alert.informativeText = "金额和 Token 至少填一个；Agent / Model 可空。\n只补余额没覆盖的消费，余额已经算过的不要再补。"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        let amountField = NSTextField(string: "")
+        let tokensField = NSTextField(string: "")
+        let agentField = NSTextField(string: "")
+        let modelField = NSTextField(string: "")
+        amountField.placeholderString = "例如 2.00，可为负数"
+        tokensField.placeholderString = "例如 12000"
+        agentField.placeholderString = "可空"
+        modelField.placeholderString = "可空"
+        for field in [amountField, tokensField, agentField, modelField] {
+            field.widthAnchor.constraint(equalToConstant: 180).isActive = true
+        }
+
+        let grid = NSGridView(views: [
+            [NSTextField(labelWithString: "金额"), amountField],
+            [NSTextField(labelWithString: "Token"), tokensField],
+            [NSTextField(labelWithString: "Agent"), agentField],
+            [NSTextField(labelWithString: "Model"), modelField],
+        ])
+        grid.rowSpacing = 8
+        grid.columnSpacing = 10
+        grid.column(at: 0).xPlacement = .trailing
+        grid.frame = NSRect(x: 0, y: 0, width: 270, height: 120)
+        alert.accessoryView = grid
+        alert.window.initialFirstResponder = amountField
+        NSApp.activate(ignoringOtherApps: true)
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        func amountValue(_ text: String) -> Double? {
+            let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "，", with: ".")
+                .replacingOccurrences(of: ",", with: ".")
+            guard !normalized.isEmpty else { return nil }
+            return Double(normalized)
+        }
+        func tokenValue(_ text: String) -> Int? {
+            let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: ",", with: "")
+            guard !normalized.isEmpty else { return nil }
+            return Int(normalized)
+        }
+
+        let amountText = amountField.stringValue
+        let tokenText = tokensField.stringValue
+        let amount = amountValue(amountText)
+        let tokens = tokenValue(tokenText)
+        if !amountText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, amount == nil {
+            status = "金额格式不对"
+            return
+        }
+        if let amount, !amount.isFinite {
+            status = "金额格式不对"
+            return
+        }
+        if !tokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, tokens == nil {
+            status = "Token 必须是整数"
+            return
+        }
+        if let tokens, tokens < 0 {
+            status = "Token 不能是负数"
+            return
+        }
+        guard amount != nil || tokens != nil else {
+            status = "金额和 Token 至少填一个"
+            return
+        }
+        addManual(amount: amount, tokens: tokens,
+                  agent: agentField.stringValue, model: modelField.stringValue)
+    }
+
+    private func flash(_ message: String, seconds: Double) {
+        status = message
+        clearItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            if self?.status == message { self?.status = "" }
+        }
+        clearItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
     }
 
     func openDashboard() {
@@ -532,15 +758,27 @@ struct OverviewSections: View {
         if let snap = model.snapshot, snap.ok {
             VStack(alignment: .leading, spacing: 0) {
                 NativeSection("今日") {
-                    SummaryRow(label: "金额",
-                               value: money(snap.windows?["today"]?.cost ?? 0,
-                                            snap.symbol ?? "¥"))
-                    SummaryRow(label: "Token",
-                               value: cn(snap.windows?["today"]?.tokens ?? 0))
+                    TodaySpendRow(snap: snap)
+                    SummaryRow(label: "Token", value: todayTokenText(snap))
                     SummaryRow(label: "缓存命中",
                                value: "\(Int(((snap.cacheRate ?? 0) * 100).rounded()))%")
                     SummaryRow(label: "请求",
                                value: countText(snap.windows?["today"]?.events ?? 0))
+
+                    HStack {
+                        Spacer()
+                        Button {
+                            model.presentManualEntry()
+                        } label: {
+                            Label("补记", systemImage: "square.and.pencil")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("手动补记金额 / Token / Agent / Model")
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
                 }
 
                 if let balances = snap.balances, balances.configured == true,
@@ -554,30 +792,166 @@ struct OverviewSections: View {
                     }
                 }
 
-                if todayIsEmpty(snap) {
-                    // 今天一条请求都没有时，两张表都没有内容。
-                    // 只留一条居中提示，不再把同一句话重复贴在左边缘。
-                    EmptyHint(title: "今天还没有用量",
-                              detail: "有请求后，这里会按模型和 Agent 拆分")
+                if let entries = snap.todaySpend?.manual?.entries, !entries.isEmpty {
+                    NativeSection("手动补记") {
+                        ForEach(entries, id: \.id) { entry in
+                            ManualEntryRow(entry: entry, symbol: snap.symbol ?? "¥")
+                        }
+                    }
+                }
+
+                if (snap.modelsToday ?? []).isEmpty && (snap.agentsToday ?? []).isEmpty {
+                    // 今天没有自动 token 记录。有手动补记时只显示上面的补记列表，
+                    // 不再重复贴“今天还没有用量”。
+                    if (snap.todaySpend?.manual?.entries ?? []).isEmpty {
+                        EmptyHint(title: "今天还没有用量",
+                                  detail: "有请求后，这里会按模型和 Agent 拆分")
+                    }
                 } else {
-                    NativeSection("按模型") {
+                    NativeSection("按模型（估算）") {
                         SliceRows(slices: snap.modelsToday ?? [], symbol: snap.symbol ?? "¥",
                                   empty: "今天没有按模型的记录")
                     }
 
-                    NativeSection("按 Agent") {
+                    NativeSection("按 Agent（估算）") {
                         SliceRows(slices: snap.agentsToday ?? [], symbol: snap.symbol ?? "¥",
                                   empty: "今天没有按 Agent 的记录", agent: true)
                     }
                 }
-
             }
         }
     }
 
-    /// 今天的模型 / Agent 两张表都空，说明今天还没有任何请求。
-    private func todayIsEmpty(_ snap: Snapshot) -> Bool {
-        (snap.modelsToday ?? []).isEmpty && (snap.agentsToday ?? []).isEmpty
+    private func todayTokenText(_ snap: Snapshot) -> String {
+        let manual = Double(snap.todaySpend?.tokens ?? 0)
+        return cn((snap.windows?["today"]?.tokens ?? 0) + manual)
+    }
+}
+
+/// 今日消费：余额下降为金额；没有余额平台时退回 Token 估算。
+struct TodaySpendRow: View {
+    let snap: Snapshot
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("消费")
+                Text(note)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Text(value)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .help(help)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 2)
+            Divider()
+                .padding(.leading, 12)
+        }
+    }
+
+    private var spend: Snapshot.TodaySpend? { snap.todaySpend }
+
+    private var primary: Snapshot.TodaySpend.Currency? {
+        spend?.currencies?.first
+    }
+
+    private var value: String {
+        guard let primary else {
+            return money(snap.windows?["today"]?.cost ?? 0, snap.symbol ?? "¥")
+        }
+        let hasSample = primary.providers?.contains { $0.spent != nil } == true
+        let hasManual = (spend?.manual?.amount ?? 0) != 0
+            || (spend?.manual?.tokens ?? 0) > 0
+        if !hasSample && !hasManual {
+            return "—"
+        }
+        let symbol = primary.symbol ?? snap.symbol ?? "¥"
+        var text = signedMoney(primary.total, symbol)
+        for other in (spend?.currencies ?? []).dropFirst() {
+            text += " + " + signedMoney(other.total, other.symbol ?? other.currency ?? "")
+        }
+        return text
+    }
+
+    private var note: String {
+        guard let primary else { return "Token 估算" }
+        let starts = (primary.providers ?? []).compactMap { $0.startTs }
+        if let earliest = starts.min() {
+            return "\(clockText(earliest)) 起"
+        }
+        if (spend?.manual?.tokens ?? 0) > 0 || (spend?.manual?.amount ?? 0) != 0 {
+            return "手动补记"
+        }
+        return "今天还没采到余额"
+    }
+
+    private var help: String {
+        guard let spend else {
+            return "还没有余额数据；这是按本地单价表算出的 Token 估算。"
+        }
+        if let primary = spend.currencies?.first {
+            var lines: [String] = []
+            for provider in primary.providers ?? [] {
+                let symbol = primary.symbol ?? snap.symbol ?? "¥"
+                let spent = provider.spent.map { signedMoney($0, symbol) } ?? "—"
+                let start = provider.startTs.map { clockText($0) + " 起" } ?? ""
+                lines.append("\(provider.name ?? provider.id ?? "?"): \(spent)"
+                             + (start.isEmpty ? "" : "（\(start)）"))
+            }
+            if let manual = spend.manual, (manual.amount ?? 0) != 0 || (manual.tokens ?? 0) > 0 {
+                let symbol = primary.symbol ?? snap.symbol ?? "¥"
+                lines.append("手动补记: \(signedMoney(manual.amount ?? 0, symbol))"
+                             + ((manual.tokens ?? 0) > 0 ? " · \(countText(manual.tokens ?? 0)) tokens" : ""))
+            }
+            if lines.isEmpty {
+                lines.append("今天还没采到余额。")
+            }
+            return lines.joined(separator: "\n")
+        }
+        return "还没有余额数据；这是按本地单价表算出的 Token 估算。"
+    }
+}
+
+struct ManualEntryRow: View {
+    let entry: Snapshot.TodaySpend.ManualEntry
+    let symbol: String
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Text(value)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 2)
+            Divider()
+                .padding(.leading, 12)
+        }
+    }
+
+    private var title: String {
+        let parts = [entry.agent, entry.model].compactMap { $0 }.filter { !$0.isEmpty }
+        return parts.isEmpty ? "手动补记" : parts.joined(separator: " · ")
+    }
+
+    private var value: String {
+        var parts: [String] = []
+        if let amount = entry.amount, amount != 0 {
+            parts.append(signedMoney(amount, symbol))
+        }
+        if let tokens = entry.tokens, tokens > 0 {
+            parts.append("\(countText(tokens)) tokens")
+        }
+        return parts.isEmpty ? "—" : parts.joined(separator: " · ")
     }
 }
 
@@ -590,9 +964,8 @@ struct HistorySections: View {
     var body: some View {
         if let snap = model.snapshot, snap.ok {
             NativeSection("全部历史") {
-                SummaryRow(label: "总金额",
-                           value: money((snap.models ?? []).reduce(0.0) { $0 + $1.cost },
-                                        snap.symbol ?? "¥"))
+                SummaryRow(label: "总金额（Token 估算）",
+                           value: money(modelCost(snap), snap.symbol ?? "¥"))
                 SummaryRow(label: "总 Token", value: cn(snap.allTokens ?? 0))
                 SummaryRow(label: "请求", value: countText(snap.allEvents ?? 0))
             }
@@ -607,6 +980,10 @@ struct HistorySections: View {
                           empty: "还没有历史数据", agent: true)
             }
         }
+    }
+
+    private func modelCost(_ snap: Snapshot) -> Double {
+        (snap.models ?? []).reduce(0.0) { $0 + $1.cost }
     }
 }
 
@@ -691,6 +1068,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var loggedFirstTitle = false
     private var themeObserver: NSObjectProtocol?
+    private var wakeObservers: [NSObjectProtocol] = []
+    private var lastWakeRefresh = Date.distantPast
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -712,6 +1091,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.applyPanelAppearance()
         }
 
+        // 开盖/唤醒时立刻补一次余额，让今天的起点尽量贴近开盖时刻。
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification,
+                     NSWorkspace.screensDidWakeNotification] {
+            wakeObservers.append(workspaceCenter.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                let now = Date()
+                guard now.timeIntervalSince(self.lastWakeRefresh) > 5 else { return }
+                self.lastWakeRefresh = now
+                self.model.refreshBalance(force: true)
+            })
+        }
+
         model.$snapshot
             .receive(on: RunLoop.main)
             .sink { [weak self] snapshot in
@@ -729,15 +1123,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.timer = timer
     }
 
-    private func statusTitle(_ today: Snapshot.Window, symbol: String) -> NSAttributedString {
+    private func statusTitle(_ today: Snapshot.Window, tokens: Double, cost: Double,
+                             symbol: String) -> NSAttributedString {
         let tokenFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         let moneyFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         let title = NSMutableAttributedString()
-        title.append(NSAttributedString(string: cn(today.tokens),
+        title.append(NSAttributedString(string: cn(tokens),
                                         attributes: [.font: tokenFont]))
         title.append(NSAttributedString(string: "  ",
                                         attributes: [.font: tokenFont]))
-        title.append(NSAttributedString(string: moneyCompact(today.cost, symbol),
+        title.append(NSAttributedString(string: moneyCompactSigned(cost, symbol),
                                         attributes: [.font: moneyFont]))
         return title
     }
@@ -748,14 +1143,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let symbol = snapshot.symbol ?? "¥"
-        statusItem.button?.attributedTitle = statusTitle(today, symbol: symbol)
-        let plain = cn(today.tokens) + "  " + moneyCompact(today.cost, symbol)
+        let spend = snapshot.todaySpend
+        let primary = spend?.currencies?.first
+        let hasSample = primary?.providers?.contains { $0.spent != nil } == true
+        let hasManual = (spend?.manual?.amount ?? 0) != 0 || (spend?.manual?.tokens ?? 0) > 0
+        let showSpend = primary != nil && (hasSample || hasManual)
+        let cost = showSpend ? (primary?.total ?? 0) : today.cost
+        let totalTokens = today.tokens + Double(spend?.tokens ?? 0)
+
+        statusItem.button?.attributedTitle = statusTitle(
+            today, tokens: totalTokens, cost: cost, symbol: symbol)
+        let plain = cn(totalTokens) + "  " + moneyCompactSigned(cost, symbol)
         if !loggedFirstTitle {
             loggedFirstTitle = true
             logLine("首次刷新成功：菜单栏标题=\(plain)")
         }
+
+        var spendHelp = money(today.cost, symbol)
+        if let primary {
+            var parts: [String] = []
+            for provider in primary.providers ?? [] {
+                let value = provider.spent.map {
+                    money($0, primary.symbol ?? symbol)
+                } ?? "—"
+                parts.append("\(provider.name ?? provider.id ?? "?"): \(value)")
+            }
+            if let manual = spend?.manual, (manual.amount ?? 0) != 0 {
+                parts.append("手动: \(money(manual.amount ?? 0, primary.symbol ?? symbol))")
+            }
+            if !parts.isEmpty {
+                spendHelp = "消费 \(money(primary.total, primary.symbol ?? symbol))（"
+                    + parts.joined(separator: " / ") + "）"
+            }
+        }
         statusItem.button?.toolTip =
-            "今日 \(cn(today.tokens)) tokens · \(money(today.cost, symbol)) · \(countText(today.events)) 次请求"
+            "今日 \(cn(totalTokens)) tokens · \(spendHelp) · \(countText(today.events)) 次请求"
     }
 
     private func ensurePanel() -> NSHostingController<PanelView> {
@@ -791,6 +1213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         model.reload()
+        model.refreshBalanceIfNeeded()
         let host = ensurePanel()
         applyPanelAppearance()
         popover.contentViewController = host
@@ -882,6 +1305,21 @@ struct TokenLensBarMain {
         for (key, label) in [("today", "今日"), ("week", "近 7 天"), ("month", "近 30 天")] {
             guard let window = windows[key] else { continue }
             print("  \(label)  \(cn(window.tokens)) tokens  \(money(window.cost, symbol))  (\(window.events) 条)")
+        }
+        if let spend = snapshot.todaySpend {
+            for bucket in spend.currencies ?? [] {
+                print("\n消费 \(bucket.symbol ?? symbol)\(String(format: "%.2f", bucket.total))")
+                for provider in bucket.providers ?? [] {
+                    if let value = provider.spent {
+                        print("  \(provider.name ?? provider.id ?? "?")  \(String(format: "%.2f", value))")
+                    } else {
+                        print("  \(provider.name ?? provider.id ?? "?")  —")
+                    }
+                }
+                if let manual = spend.manual, (manual.amount ?? 0) != 0 {
+                    print("  手动补记  \(String(format: "%.2f", manual.amount ?? 0))")
+                }
+            }
         }
         if let daily = snapshot.daily {
             print("\n近 14 天")

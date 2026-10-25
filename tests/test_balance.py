@@ -102,6 +102,11 @@ def main():
         passed &= check("余额数值正确", item["total"], 110.0)
         passed &= check("币种正确", item["currency"], "CNY")
         passed &= check("刷新成功后错误清空", payload["providers"][0]["error"], None)
+        con = tl.connect(db)
+        sample_count = con.execute(
+            "select count(*) from balance_samples where provider='deepseek'").fetchone()[0]
+        con.close()
+        passed &= check("刷新同时写入余额历史样本", sample_count, 1)
 
         # 4. 刷新间隔内不重复请求；force 才请求
         result = tl.refresh_balances(db, force=False, config_path=config,

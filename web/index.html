@@ -163,9 +163,9 @@ function render(d) {
         <div class="sub">${t.events.toLocaleString()} 次请求</div>
       </div>
       <div class="card">
-        <div class="k">成本</div>
+        <div class="k">成本（Token 估算）</div>
         <div class="v">${sym}${t.cost.toFixed(2)}</div>
-        <div class="sub">${d.priced ? '按本地单价表' : '未配置单价表'}</div>
+        <div class="sub">${d.priced ? '按本地单价表，不含余额差异' : '未配置单价表'}</div>
       </div>
       <div class="card">
         <div class="k">缓存命中率</div>
