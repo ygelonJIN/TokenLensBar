@@ -34,6 +34,8 @@ def fixture_records():
         {"type": "session", "id": "s1"},
         {"type": "model/selection",
          "data": {"provider": "deepseek-account", "model": "deepseek-flash"}},
+        {"type": "step/start", "time": 1792891700000,
+         "data": {"turn": 1, "step": 1}},
         {"type": "assistant/message", "time": 1792891704250,
          "data": {"turn": 1, "step": 1,
                   "usage": {"inputTokens": 687, "outputTokens": 217,
@@ -86,6 +88,34 @@ def main():
             passed &= check("缓存命中", event["cache_read"], 8320)
             passed &= check("输出", event["output"], 217)
             passed &= check("总量", event["total"], 9224)
+            # 峰谷按发起时刻算：step/start 在 1792891700，消息在 1792891704.25
+            passed &= check("按 step/start 的时刻计时", event["ts"], 1792891700.0)
+
+        # 4. 没有 step/start 的旧会话回退到消息时刻
+        legacy_source = work / "session.legacy.jsonl"
+        legacy_source.write_text(
+            "\n".join(json.dumps(obj, ensure_ascii=False)
+                      for obj in fixture_records() if obj.get("type") != "step/start") + "\n",
+            encoding="utf-8")
+        legacy_compressed = work / "session.legacy.jsonl.zstd"
+        subprocess.run([binary, "-q", "-f", "-o", str(legacy_compressed), str(legacy_source)],
+                       check=True, stdout=subprocess.DEVNULL)
+        legacy_events = list(tl.DshAdapter().parse(legacy_compressed))
+        passed &= check("缺 step/start 时回退消息时刻", legacy_events[0]["ts"], 1792891704.25)
+
+        # 5. 重扫要能改写已经入库的 ts（口径切换后靠这个迁移）
+        con = tl.connect(work / "events.db")
+        try:
+            event = dict(legacy_events[0])
+            event["id"] = "migrate:1"
+            event["ts"] = 100.0
+            tl.insert_event(con, event, "dsh")
+            event["ts"] = 200.0
+            tl.insert_event(con, event, "dsh")
+            row = con.execute("select ts from events where id='migrate:1'").fetchone()
+            passed &= check("重扫改写已有 ts", row[0], 200.0)
+        finally:
+            con.close()
     finally:
         if saved_path is None:
             os.environ.pop("PATH", None)

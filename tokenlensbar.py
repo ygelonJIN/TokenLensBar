@@ -496,10 +496,19 @@ class DshAdapter(Adapter):
         session_id = ""
         provider = ""
         model = ""
+        step_started = {}
         for obj in iter_jsonl(text):
             kind = obj.get("type")
             if kind == "session":
                 session_id = obj.get("id") or ""
+            elif kind == "step/start":
+                # 峰的档位按"请求发出"的时刻算，不是按答完的时刻。
+                data = obj.get("data") or {}
+                turn = data.get("turn")
+                step = data.get("step")
+                started = obj.get("time")
+                if turn is not None and step is not None and started:
+                    step_started[(turn, step)] = started / 1000.0
             elif kind == "model/selection":
                 data = obj.get("data") or {}
                 provider = (data.get("provider") or "").replace("-account", "")
@@ -528,7 +537,8 @@ class DshAdapter(Adapter):
                 }
                 yield make_event(
                     event_id="dsh:%s:%s:%s" % (session_id, data.get("turn"), data.get("step")),
-                    ts=(obj.get("time") or 0) / 1000.0,
+                    ts=step_started.get((data.get("turn"), data.get("step")))
+                    or (obj.get("time") or 0) / 1000.0,
                     agent=self.name,
                     provider=provider,
                     model=model,
@@ -846,10 +856,14 @@ def connect(db_path):
 
 
 INSERT_SQL = (
-    "insert or ignore into events"
+    "insert into events"
     " (id, ts, agent, provider, model, input, output, cache_read, cache_write,"
     "  reasoning, total, cost_usd, cached_in_input, origin)"
     " values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    # 峰谷口径改成按 step/start 计费后，重扫要能改写已有行的 ts；
+    # 其它字段保持原样，避免把手工修正过的内容覆盖掉。
+    " on conflict(id) do update set ts=excluded.ts"
+    " where excluded.ts <> events.ts"
 )
 
 
