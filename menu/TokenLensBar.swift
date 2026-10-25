@@ -502,6 +502,28 @@ struct NativeSection<Content: View>: View {
 
 // MARK: - 概览
 
+struct EmptyHint: View {
+    let title: String
+    var detail: String? = nil
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(title)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if let detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 18)
+    }
+}
+
 struct OverviewSections: View {
     @ObservedObject var model: PanelModel
 
@@ -532,18 +554,30 @@ struct OverviewSections: View {
                     }
                 }
 
-                NativeSection("按模型") {
-                    SliceRows(slices: snap.modelsToday ?? [], symbol: snap.symbol ?? "¥",
-                              empty: "今天还没有用量")
-                }
+                if todayIsEmpty(snap) {
+                    // 今天一条请求都没有时，两张表都没有内容。
+                    // 只留一条居中提示，不再把同一句话重复贴在左边缘。
+                    EmptyHint(title: "今天还没有用量",
+                              detail: "有请求后，这里会按模型和 Agent 拆分")
+                } else {
+                    NativeSection("按模型") {
+                        SliceRows(slices: snap.modelsToday ?? [], symbol: snap.symbol ?? "¥",
+                                  empty: "今天没有按模型的记录")
+                    }
 
-                NativeSection("按 Agent") {
-                    SliceRows(slices: snap.agentsToday ?? [], symbol: snap.symbol ?? "¥",
-                              empty: "今天还没有用量", agent: true)
+                    NativeSection("按 Agent") {
+                        SliceRows(slices: snap.agentsToday ?? [], symbol: snap.symbol ?? "¥",
+                                  empty: "今天没有按 Agent 的记录", agent: true)
+                    }
                 }
 
             }
         }
+    }
+
+    /// 今天的模型 / Agent 两张表都空，说明今天还没有任何请求。
+    private func todayIsEmpty(_ snap: Snapshot) -> Bool {
+        (snap.modelsToday ?? []).isEmpty && (snap.agentsToday ?? []).isEmpty
     }
 }
 
@@ -608,8 +642,7 @@ struct SliceRows: View {
 
     var body: some View {
         if slices.isEmpty {
-            Text(empty)
-                .foregroundStyle(.secondary)
+            EmptyHint(title: empty)
         } else if agent {
             ForEach(slices, id: \.agent) { slice in
                 SliceRow(slice: slice, symbol: symbol, agent: true)
