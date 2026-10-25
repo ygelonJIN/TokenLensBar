@@ -17,6 +17,10 @@
 python3 tokenlensbar.py serve          # 浏览器看板 http://127.0.0.1:8787
 ```
 
+> DSH 的会话是 zstd 压缩的，需要系统里有 `zstd`（macOS 不自带：`brew install zstd`）。
+> 采集器会先查 PATH，再找 `/opt/homebrew/bin`、`/usr/local/bin`、`/opt/local/bin`，
+> 所以 launchd 的窄 PATH 不影响。
+
 ## 装在哪
 
 `./install.sh` 会把运行时从仓库复制出去，所以装完仓库可以挪走甚至删掉。
@@ -222,6 +226,12 @@ python3 tokenlensbar.py breakdown --days 30
 能。token 数字已经复制进自己的 SQLite，源文件删掉不影响历史。只是卸载之后不会再有新数据。
 唯一会丢的情况是：日志在第一次扫描之前就被删了。
 
+**今天的用量一直是 0，但明明刚用过？**
+先跑 `python3 ~/.tokenlensbar/tokenlensbar.py scan -v`，看 `dsh` 是 `0/14→0` 还是
+`14/14→N`。如果是前者，通常是 `zstd` 找不到：DSH 的会话是 zstd 压缩的，而 launchd
+只给 `/usr/bin:/bin:/usr/sbin:/sbin`，Homebrew 装的 zstd 不在里面。当前版本会自动找
+Homebrew 路径；完全没有 zstd 的话 `brew install zstd`，再点「立即采集」即可补回。
+
 **怎么保证以后不会静默丢数据？**
 `python3 tokenlensbar.py health` 会检查每个 Adapter：文件还在不在、解析出了多少事件、最后一条是什么时候。
 Agent 升级改了日志格式时，最典型的表现是「有文件但零事件」或「很久没有新事件」，这两条都会被点名，
@@ -336,6 +346,7 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 | `python3 tokenlensbar.py serve` | 本地看板，只监听 127.0.0.1 |
 | `python3 tokenlensbar.py sources` | 本机发现了哪些数据源 |
 | `python3 tests/test_pricing.py` | 定价逻辑回归测试 |
+| `python3 tests/test_scan.py` | 扫描链路：窄 PATH 下定位 zstd + DSH usage 解析 |
 
 ## 定价模型
 
@@ -447,6 +458,7 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 | [build.sh](build.sh) | 构建 App |
 | [install.sh](install.sh) | 一条命令安装（运行时 + App + 两个 LaunchAgent） |
 | [tests/test_pricing.py](tests/test_pricing.py) | 定价回归测试 |
+| [tests/test_scan.py](tests/test_scan.py) | 扫描链路回归测试（zstd 定位、DSH 解析） |
 | [tests/test_balance.py](tests/test_balance.py) | 余额缓存/解析/错误处理回归测试 |
 | [prices.json](prices.json) | 单价表模板（已填你的价格，安装时复制到 `~/.tokenlensbar/`） |
 | [prices.example.json](prices.example.json) | 三种写法的结构示例 |

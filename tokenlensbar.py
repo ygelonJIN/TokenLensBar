@@ -21,6 +21,7 @@ TokenLensBar — 本地 token 用量采集器
 import argparse
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -285,6 +286,31 @@ def iso_to_epoch(text):
         return 0.0
 
 
+# launchd 给的 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，Homebrew 的 zstd
+# 不在里面。以前 scan 找不到 zstd 就把 DSH 会话当成“正在写入”跳过，
+# 于是定时采集和面板的「立即采集」永远读不到 DSH 的用量。
+ZSTD_SEARCH_PATHS = (
+    "/opt/homebrew/bin/zstd",
+    "/usr/local/bin/zstd",
+    "/opt/local/bin/zstd",
+    "/usr/bin/zstd",
+)
+
+
+def find_zstd():
+    """先按 PATH 找 zstd，再查常见的 Homebrew / MacPorts / 系统路径。"""
+    override = os.environ.get("TOKENLENSBAR_ZSTD")
+    if override:
+        return override if os.access(override, os.X_OK) else None
+    found = shutil.which("zstd")
+    if found:
+        return found
+    for candidate in ZSTD_SEARCH_PATHS:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def zstd_decompress(path):
     """返回解压后的文本；本机没有 zstd 命令、或一个字节都读不出来时返回 None。
 
@@ -292,9 +318,12 @@ def zstd_decompress(path):
     部分是有效数据。所以只要 stdout 有内容就照常返回，让调用方自己跳过被截断的
     最后一行（json 解析失败会自动跳过）。返回 None 才是真的没法读。
     """
+    binary = find_zstd()
+    if binary is None:
+        return None
     try:
         proc = subprocess.run(
-            ["zstd", "-dc", str(path)],
+            [binary, "-dc", str(path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,
