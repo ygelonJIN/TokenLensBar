@@ -11,10 +11,10 @@ macOS 菜单栏 token 用量监控。Python 采集器（只用标准库）+ Swif
 个人仓库，`origin` 指向 GitHub 上的 `ygelonJIN/TokenLensBar`。
 
 ## 目录
-- `tokenlensbar.py` — 采集、归一化、计价、余额、消费、report 的全部逻辑
+- `tokenlensbar.py` — 采集、归一化、计价、余额（含 MiMo Cookie 自动续期）、消费、report 的全部逻辑
 - `menu/` — 菜单栏 App 的 Swift 源码；`GeneratedConfig.swift` 由 `build.sh` 生成
 - `web/index.html` — 本地看板，静态页，读同一份 SQLite
-- `tests/` — 余额 / 计价 / 扫描 / 消费四组回归，`python3 -m unittest discover tests`
+- `tests/` — 余额 / 计价 / 扫描 / 消费 / Cookie 五组回归，`python3 -m unittest discover tests`
 - `docs/` — 只放截图和图片，不放说明文档
 - `assets/` — 应用图标
 - `build.sh` / `install.sh` — 构建 App、装到本机
@@ -30,8 +30,8 @@ macOS 菜单栏 token 用量监控。Python 采集器（只用标准库）+ Swif
   - 不用读：只改菜单栏文案、图标、颜色
 
 - `经验文档/余额与消费.md`
-  - 什么时候读：接新平台余额、余额显示 0、消费金额对不上、加 provider
-  - 包含：两家的余额接口差异、缓存与刷新、余额差分法、它为什么不是账单、扩 adapter 的改法
+  - 什么时候读：接新平台余额、余额显示 0、消费金额对不上、加 provider、MiMo Cookie 过期或要配续期
+  - 包含：两家的余额接口差异、缓存与刷新、余额差分法、它为什么不是账单、扩 adapter 的改法、浏览器代查、Cookie 自动续期与手动兜底
   - 不用读：只调面板布局
 
 - `经验文档/采集与部署.md`

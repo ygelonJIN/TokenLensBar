@@ -117,7 +117,16 @@ API Key 只用于推理，查不了余额。
 
 - 这两个值缺一个都会 401；`userId` 通常在 Cookies 表里也有，没有就取地址栏 `?userId=`。
 - Cookie 是整账号会话，权限比单个 API Key 大；只存这两个值，别提交到 git。
-- 过期后接口返回 401，面板显示 `Xiaomi MiMo: —`，鼠标悬停会提示「Cookie 已失效」，重新粘一次即可。
+- 优先走**浏览器代查**（`via_browser`，默认开）：让已登录的 Safari 标签页自己调余额接口，
+  不取 Cookie、不碰存储。前提三件：Safari 开着控制台标签页；设置 → 高级 → 勾
+  「显示网页开发者功能」，「开发」菜单 → 勾「允许 Apple 事件中的 JavaScript」；
+  首次代查弹「允许控制 Safari」点允许。
+- Cookie 是约一天寿命的短效会话，过期是常态（浏览器自己在续期，复制出来的那份不会）。
+  过期后接口返回 401，面板会保留上一次余额；此时采集器会**自动从 Safari 读新 Cookie 续期**
+  （需在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」授权给跑采集的程序）。
+- 自动续期失败时手动兜底：把新 Cookie 放进剪贴板，跑
+  `python3 tokenlensbar.py cookie --from-clipboard`；`cookie --check` 只读体检看原因。
+- 不想让采集器碰浏览器 Cookie 库：`balances.json` 里给 mimo 加 `"auto_cookie": false`。
 - 这是控制台内部接口，小米改版就可能失效；失效时把 `enabled` 改成 `false` 即可，不影响 token 统计。
 
 ### 通用说明
@@ -418,6 +427,7 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 | `python3 tokenlensbar.py health` | 体检：数据源还在不在、有没有静默停止解析 |
 | `python3 tokenlensbar.py manual add --amount 2` | 手动补记（金额/Token/Agent/Model 可选） |
 | `python3 tokenlensbar.py balance --today` | 消费：余额下降 + 跨天归因 + 手动补记 |
+| `python3 tokenlensbar.py cookie` | MiMo Cookie 续期：自动读 Safari；`--from-clipboard` 手动兜底；`--check` 体检 |
 | `python3 tokenlensbar.py reset --agent dsh` | 清掉某个来源重扫（改了 Adapter 解析逻辑时用） |
 | `python3 tokenlensbar.py status --json` | 结构化摘要（菜单栏用） |
 
@@ -543,6 +553,7 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 | [tests/test_pricing.py](tests/test_pricing.py) | 定价回归测试 |
 | [tests/test_scan.py](tests/test_scan.py) | 扫描链路回归测试（zstd 定位、DSH 解析） |
 | [tests/test_balance.py](tests/test_balance.py) | 余额采样/缓存/解析/错误处理回归测试 |
+| [tests/test_cookie.py](tests/test_cookie.py) | MiMo Cookie 自动续期回归测试 |
 | [tests/test_spend.py](tests/test_spend.py) | 今日消费、跨天归因、手动补记回归测试 |
 | [prices.json](prices.json) | 单价表模板（已填你的价格，安装时复制到 `~/.tokenlensbar/`） |
 | [prices.example.json](prices.example.json) | 三种写法的结构示例 |

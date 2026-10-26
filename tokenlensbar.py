@@ -24,6 +24,7 @@ import math
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -1501,6 +1502,10 @@ class BalanceError(Exception):
     pass
 
 
+class BalanceAuthError(BalanceError):
+    """鉴权失败（401/403）。MiMo Cookie 过期走这里，可自动换新 Cookie 重试一次。"""
+
+
 def _is_placeholder_key(value):
     text = str(value or "").strip()
     upper = text.upper()
@@ -1542,6 +1547,9 @@ def load_balances_config(path=None):
             "name": str(entry.get("name") or default_names.get(ptype, pid)),
             "url": str(entry.get("url") or "").strip(),
             "secret": str(entry.get("secret") or "").strip(),
+            "enabled": entry.get("enabled", True) is not False,
+            "auto_cookie": entry.get("auto_cookie", True) is not False,
+            "via_browser": entry.get("via_browser", True) is not False,
         })
     return {"configured": bool(providers), "refresh_seconds": refresh,
             "providers": providers, "error": None}
@@ -1589,7 +1597,7 @@ def _http_json(url, key=None, cookie=None, timeout=6.0,
             body = response.read(2_000_000)
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
-            raise BalanceError(auth_error)
+            raise BalanceAuthError(auth_error)
         if exc.code == 429:
             raise BalanceError("请求过于频繁")
         raise BalanceError("HTTP %s" % exc.code)
@@ -1648,22 +1656,20 @@ def _cookie_header(value):
     return text
 
 
-def fetch_mimo_balance(entry, cookie, timeout=6.0):
-    """小米 MiMo 账户余额。控制台接口只认 Cookie，不认 API Key。
-
-    需要两个值：api-platform_serviceToken（Cookie）和 userId（控制台地址里的
-    ?userId=...，服务端要它，但控制台页面上不一定把它显示成 Cookie）。
-    """
-    header = _cookie_header(cookie)
+def validate_mimo_cookie(value):
+    """把 Cookie 头收拾干净并检查两个字段齐全；只返回值，不打印。"""
+    header = _cookie_header(value)
     if not header:
         raise BalanceError("未配置 Cookie")
     if "serviceToken" not in header:
         raise BalanceError("Cookie 里缺少 api-platform_serviceToken")
     if "userId" not in header:
         raise BalanceError("Cookie 里缺少 userId（Cookies 表里的 userId，或控制台地址 ?userId=...）")
-    url = entry.get("url") or MIMO_BALANCE_URL
-    data = _http_json(url, cookie=header, timeout=timeout,
-                      auth_error="Cookie 已失效或缺少 userId，请重新登录后粘贴")
+    return header
+
+
+def _mimo_balance_from_payload(data):
+    """MiMo 余额接口的返回结构（代查和 Cookie 两条路共用）。"""
     if not isinstance(data, dict):
         raise BalanceError("返回格式异常")
     payload = data.get("data")
@@ -1689,6 +1695,588 @@ def fetch_mimo_balance(entry, cookie, timeout=6.0):
              "topped_up": None, "available": True}]
 
 
+def fetch_mimo_balance(entry, cookie, timeout=6.0):
+    """小米 MiMo 账户余额。控制台接口只认 Cookie，不认 API Key。
+
+    需要两个值：api-platform_serviceToken（Cookie）和 userId（控制台地址里的
+    ?userId=...，服务端要它，但控制台页面上不一定把它显示成 Cookie）。
+    """
+    header = validate_mimo_cookie(cookie)
+    url = entry.get("url") or MIMO_BALANCE_URL
+    data = _http_json(url, cookie=header, timeout=timeout,
+                      auth_error="Cookie 已失效或缺少 userId，请重新登录后粘贴")
+    return _mimo_balance_from_payload(data)
+
+
+# --------------------------------------------------------------------------
+# MiMo 余额的“浏览器代查”：让已登录的 Safari 标签页直接调余额接口
+#
+# 新版 Safari 的会话 Cookie 只活在内存里（Cookies.binarycookies 里没有它），
+# 从磁盘拿不到；于是换思路——不取 Cookie，用 osascript 让 Safari 在自己的
+# 已登录页面里发 XHR，会话自动带上，我们只要结果。
+# 前提：Safari 开着 MiMo 控制台标签页；开发菜单勾选「允许 Apple 事件中的
+# JavaScript」；系统设置里允许本程序自动化控制 Safari（首次会弹框）。
+# --------------------------------------------------------------------------
+
+MIMO_SAFARI_JS = (
+    "(function(){try{var x=new XMLHttpRequest();"
+    "x.open('GET','/api/v1/balance',false);x.withCredentials=true;x.send();"
+    "return x.status+String.fromCharCode(10)+x.responseText;}"
+    "catch(e){return 'ERR:JS '+String(e);}})()"
+)
+MIMO_SAFARI_SCRIPT = (
+    'tell application "Safari"\n'
+    '  repeat with w in windows\n'
+    '    repeat with t in tabs of w\n'
+    '      if (URL of t contains "xiaomimimo") then\n'
+    '        return do JavaScript "%s" in t\n'
+    '      end if\n'
+    '    end repeat\n'
+    '  end repeat\n'
+    '  return "ERR:NO_TAB"\n'
+    'end tell' % MIMO_SAFARI_JS
+)
+MIMO_SAFARI_PROBE = (
+    'tell application "Safari"\n'
+    '  repeat with w in windows\n'
+    '    repeat with t in tabs of w\n'
+    '      if (URL of t contains "xiaomimimo") then\n'
+    '        return do JavaScript "1+1" in t\n'
+    '      end if\n'
+    '    end repeat\n'
+    '  end repeat\n'
+    '  return "ERR:NO_TAB"\n'
+    'end tell'
+)
+
+
+def _safari_error_hint(err):
+    text = str(err or "").strip()
+    if "Apple 事件" in text or "Apple events" in text or "-1743" in text:
+        return ("Safari 拒绝自动化：系统设置 → 隐私与安全性 → 自动化，"
+                "允许本程序控制 Safari")
+    if "JavaScript" in text or "do JavaScript" in text or "-1719" in text:
+        return ("Safari 未开 JS 授权：设置 → 高级 → 显示网页开发者功能，"
+                "再在「开发」菜单勾选「允许 Apple 事件中的 JavaScript」")
+    tail = text.splitlines()[-1] if text else ""
+    return "Safari 代查失败（%s）" % tail if tail else "Safari 代查失败"
+
+
+def _run_safari_js(script, timeout=10.0):
+    """在 Safari 的 MiMo 标签页里执行 JS；Safari 没开、没标签页都给明确错误。"""
+    try:
+        pgrep = subprocess.run(["/usr/bin/pgrep", "-x", "Safari"],
+                               capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pgrep = None
+    if pgrep is None or pgrep.returncode != 0:
+        raise BalanceError("Safari 没在运行（浏览器代查需要 Safari 开着控制台标签页）")
+    try:
+        proc = subprocess.run(["/usr/bin/osascript", "-e", script],
+                              capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise BalanceError("Safari 代查超时")
+    except OSError:
+        raise BalanceError("Safari 代查失败（osascript 不可用）")
+    text = proc.stdout.decode("utf-8", "replace").strip()
+    if proc.returncode != 0 or not text:
+        raise BalanceError(_safari_error_hint(proc.stderr.decode("utf-8", "replace")))
+    return text
+
+
+def fetch_mimo_balance_via_safari(timeout=10.0):
+    """浏览器代查余额：不取 Cookie，直接让已登录的 Safari 页面请求余额接口。"""
+    text = _run_safari_js(MIMO_SAFARI_SCRIPT, timeout=timeout)
+    if text.startswith("ERR:NO_TAB"):
+        raise BalanceError("Safari 里没有打开 MiMo 控制台标签页（开着就能代查）")
+    if text.startswith("ERR:JS"):
+        raise BalanceError(_safari_error_hint(text[6:].strip()))
+    status, _, body = text.partition("\n")
+    try:
+        code = int(status.strip())
+    except ValueError:
+        raise BalanceError("Safari 代查返回异常")
+    if code in (401, 403):
+        raise BalanceAuthError("Safari 里的登录会话已失效，请重新登录控制台")
+    if code != 200:
+        raise BalanceError("HTTP %s" % code)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise BalanceError("返回格式异常")
+    return _mimo_balance_from_payload(data)
+
+
+def _fetch_mimo_items(entry, key):
+    """MiMo 取数顺序：浏览器代查优先，Cookie 接口兜底；失败把两路原因都带上。"""
+    notes = []
+    if entry.get("via_browser", True):
+        try:
+            return fetch_mimo_balance_via_safari()
+        except BalanceError as exc:
+            notes.append(str(exc))
+    try:
+        return fetch_mimo_balance(entry, key)
+    except BalanceAuthError as exc:
+        # 保留鉴权语义（上层会换 Cookie 重试），但把代查失败的原因一起带上，
+        # 免得真正的病灶被 401 的报错盖住。
+        if notes:
+            raise BalanceAuthError("%s；%s" % (exc, "；".join(notes)))
+        raise
+    except BalanceError as exc:
+        if notes:
+            raise BalanceError("%s；%s" % (exc, "；".join(notes)))
+        raise
+
+
+# --------------------------------------------------------------------------
+# MiMo Cookie 自动续期：从 Safari 的 Cookie 库读新会话，写回 secrets.json
+#
+# Safari 的 Cookies.binarycookies 是二进制但不加密：魔数 "cook" + 若干页；
+# 页内是记录偏移表 + 记录本体；记录里有四个字符串偏移（域/名/路径/值）和两个日期。
+# 各 Safari 版本的字段布局有过细微差异，所以解析全程自校验：页大小之和、
+# 偏移边界、字符串可打印、日期区间。认不出来就报 CookieError，走手动兜底。
+# 这里只取 xiaomimimo 域指定的两个字段，值不打印、不写日志。
+# --------------------------------------------------------------------------
+
+MIMO_COOKIE_SECRET = "mimo_cookie"
+MIMO_COOKIE_DOMAIN = "xiaomimimo.com"
+MIMO_COOKIE_NAMES = ("api-platform_serviceToken", "userId")
+SAFARI_COOKIE_FILES = (
+    "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
+    "~/Library/Cookies/Cookies.binarycookies",
+)
+APPLE_EPOCH = 978307200  # Apple 的 2001-01-01 纪元换算到 Unix 纪元
+_BC_DATE_FIELDS = ((32, 40), (40, 48), (40, 52), (32, 48))
+
+
+class CookieError(Exception):
+    """Cookie 自动续期失败。消息里只有原因，不带任何凭据值。"""
+
+
+def _bc_cstr(buf, base, rel, limit):
+    """记录内 base+rel 处的 NUL 结尾字符串。空串合法、UTF-8 高位字节合法
+    （真实 Cookie 都有），只拒控制字符和越界。"""
+    start = base + rel
+    if rel <= 0 or start >= limit:
+        return None
+    end = buf.find(b"\x00", start, limit)
+    if end < 0:
+        return None
+    raw = buf[start:end]
+    if any(c < 0x20 or c == 0x7F for c in raw):
+        return None
+    return raw.decode("utf-8", "replace")
+
+
+def _bc_date(page, off, limit, endian):
+    for a, b in _BC_DATE_FIELDS:
+        if off + b + 8 > limit:
+            continue
+        first_date = struct.unpack_from(endian + "d", page, off + a)[0]
+        second_date = struct.unpack_from(endian + "d", page, off + b)[0]
+        if 0 < first_date < 4102444800 and 0 < second_date < 4102444800:
+            return max(first_date, second_date) + APPLE_EPOCH
+    return None
+
+
+def _bc_record(page, off):
+    """记录本体：数字头（大小 + 四个字符串偏移）+ 四段 NUL 字符串（域/名/路径/值）。
+    字节序和偏移字段位置可能有版本差异（真实文件见到 +8 和 +16 两种），
+    靠“字符串全可打印 + 偏移落在记录内”验证。"""
+    if off + 32 > len(page):
+        return None
+    for endian in ("<", ">"):
+        size = struct.unpack_from(endian + "I", page, off)[0]
+        limit = off + size if 32 <= size <= len(page) - off else len(page)
+        for first in (8, 12, 16):
+            fields = struct.unpack_from(endian + "IIII", page, off + first)
+            strings = [_bc_cstr(page, off, rel, limit) for rel in fields]
+            if any(text is None for text in strings):
+                continue
+            stamp = _bc_date(page, off, limit, endian)
+            if stamp is None:
+                stamp = _bc_date(page, off, limit, ">" if endian == "<" else "<")
+            return {"strings": strings, "ts": stamp}
+    return None
+
+
+def _bc_page_cookies(page):
+    """页头 = 未知字段 + 计数 + 记录偏移表；计数可能在 0 或 4，字节序也可能
+    和文件头不一致（文件头大端、页内小端是老规矩），四种组合都试。"""
+    for count_off in (0, 4):
+        for count_endian in ("<", ">"):
+            count = struct.unpack_from(count_endian + "I", page, count_off)[0]
+            if not 1 <= count <= 4096:
+                continue
+            table_off = count_off + 4
+            if table_off + 4 * count > len(page):
+                continue
+            for off_endian in ("<", ">"):
+                offsets = struct.unpack_from(
+                    off_endian + "%dI" % count, page, table_off)
+                if any(off < 0 or off + 32 > len(page) for off in offsets):
+                    continue
+                records = []
+                for off in offsets:
+                    rec = _bc_record(page, off)
+                    if rec is not None:
+                        records.append(rec)
+                # 真实 Cookie 里有空值/非 ASCII 的记录，个别认不出不拖垮整页
+                if records and len(records) * 2 >= count:
+                    return records
+    raise CookieError("Cookie 页结构不认识")
+
+
+def _bc_page_candidates(data):
+    """文件头布局在 Safari 版本间有差异：页数位置、字节序、页表是长度还是偏移、
+    页后有没有余量，都可能不同。这里产出所有说得通的分页方案，
+    记录级自校验（_bc_page_cookies）会把错误方案全部挡掉。"""
+    if len(data) < 16 or data[:4] != b"cook":
+        raise CookieError("不是 Safari 的 Cookie 文件")
+    out, seen = [], set()
+
+    def emit(key, pages):
+        if pages and key not in seen:
+            seen.add(key)
+            out.append(pages)
+
+    for endian in ("<", ">"):
+        for count_off in (4, 8, 12):
+            count = struct.unpack_from(endian + "I", data, count_off)[0]
+            if not 1 <= count <= 4096:
+                continue
+            table_off = count_off + 4
+            end = table_off + 4 * count
+            if end > len(data):
+                continue
+            table = struct.unpack_from(endian + "%dI" % count, data, table_off)
+            tail = len(data) - end
+            if all(0 < n <= len(data) for n in table):
+                # ① 页表是长度。页可能首尾相接，也可能按 2/4/8 字节对齐、页间留填充；
+                # 页后允许少量余量。切歪的方案过不了记录级校验。
+                for stride in (1, 2, 4, 8):
+                    cursor, pages = end, []
+                    for index, n in enumerate(table):
+                        pages.append(data[cursor:cursor + n])
+                        step = n if index == len(table) - 1 else -(-n // stride) * stride
+                        cursor += step
+                    if all(len(page) == n for page, n in zip(pages, table)) and (
+                            0 <= len(data) - cursor <= 4096):
+                        emit((endian, count_off, "sizes+pad%d" % stride), pages)
+            # ③ 页表是页偏移（首项正好是表尾，逐项递增）
+            if (all(0 < n <= len(data) for n in table) and list(table) == sorted(table)
+                    and table[0] == end and len(set(table)) == count):
+                bounds = list(table) + [len(data)]
+                pages = [data[a:b] for a, b in zip(bounds, bounds[1:])]
+                if all(pages):
+                    emit((endian, count_off, "offsets"), pages)
+    return out
+
+
+def _bc_probe(page):
+    """页内结构探针：只输出数字。数字区 = 第一段可打印串之前的字节（hex）；
+    串段只给（起点, 长度），不给内容——长度足够判断字段布局，且零泄露。"""
+    runs = []
+    i = 0
+    while i < min(len(page), 400):
+        if 0x20 <= page[i] <= 0x7E:
+            j = i
+            while j < len(page) and 0x20 <= page[j] <= 0x7E:
+                j += 1
+            if j < len(page) and page[j] == 0 and j - i >= 1:
+                runs.append((i, j - i))
+                i = j + 1
+                continue
+        i += 1
+    head_end = runs[0][0] if runs else min(len(page), 64)
+    head = page[:min(head_end, 64)]
+    return ["  数字区 %d 字节：%s" % (len(head), head.hex()),
+            "  串段（起点,长度）：%s" % (
+                " ".join("(%d,%d)" % item for item in runs[:12]) or "（无可打印串）")]
+
+
+def _bc_describe(data):
+    """解析失败时的结构诊断：只含字节数和页表数字，不含任何 Cookie 值。"""
+    lines = ["文件 %d 字节，头 8 字节 %s" % (len(data), data[:8].hex())]
+    if data[:4] != b"cook":
+        return lines
+    for endian in ("<", ">"):
+        for count_off in (4, 8, 12):
+            count = struct.unpack_from(endian + "I", data, count_off)[0]
+            if not 1 <= count <= 4096:
+                continue
+            end = count_off + 4 + 4 * count
+            if end > len(data):
+                continue
+            table = struct.unpack_from(endian + "%dI" % count, data, count_off + 4)
+            lines.append("  %s 页数在 %d：%d 页，页表和 %d，表后 %d 字节" % (
+                "小端" if endian == "<" else "大端", count_off,
+                count, sum(table), len(data) - end))
+    # 再看最像的那个分页方案的页内结构（纯数字：hex 只到第一段字符串为止）
+    try:
+        candidates = _bc_page_candidates(data)
+    except CookieError:
+        return lines
+    if candidates:
+        for index, page in enumerate(candidates[0][:2]):
+            lines.append("  页 %d（%d 字节）：" % (index, len(page)))
+            lines.extend(_bc_probe(page))
+    return lines
+
+
+def _mimo_host_ok(domain):
+    host = domain.strip().lower()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0].split(":", 1)[0].lstrip(".")
+    return host == MIMO_COOKIE_DOMAIN or host.endswith("." + MIMO_COOKIE_DOMAIN)
+
+
+def _cookie_roots():
+    """Safari/WebKit 可能存 Cookie 的目录根。"""
+    roots = []
+    library = Path(os.path.expanduser("~/Library"))
+    for folder in (library / "Containers", library / "Group Containers"):
+        try:
+            for entry in folder.iterdir():
+                name = entry.name.lower()
+                if "safari" in name or "webkit" in name:
+                    roots.append(entry)
+        except OSError:
+            pass
+    roots += [library / "WebKit", library / "Cookies", library / "Safari"]
+    return roots
+
+
+def _scan_needles(roots, needles, max_depth=10, max_size=30 * 1024 * 1024):
+    """在给定目录里逐个文件找字节串：只报路径和命中的串名，不输出内容。
+    用来定位名字不叫 cookie 的 Cookie 库。"""
+    hits, scanned = [], 0
+    for root in roots:
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d.lower() not in ("caches", "cache", "mediacache")]
+            if dirpath.count(os.sep) - str(root).count(os.sep) > max_depth:
+                dirnames[:] = []
+                continue
+            for filename in filenames:
+                path = Path(dirpath) / filename
+                try:
+                    if path.stat().st_size > max_size:
+                        continue
+                    data = path.read_bytes()
+                except OSError:
+                    continue
+                scanned += 1
+                matched = [needle.decode() for needle in needles if needle in data]
+                if matched:
+                    hits.append((path, matched))
+    return hits, scanned
+
+
+def _cookie_file_candidates(extra_roots=None):
+    """找出可能存 Cookie 的文件：静态路径 + Safari/WebKit 相关目录下名字带 cookie 的
+    文件（新版 Safari 会把 Cookie 分库放在 WebKit 容器 / 配置文件目录里）。"""
+    found, seen = [], set()
+
+    def add(path):
+        path = Path(path)
+        if path.is_file() and str(path) not in seen:
+            seen.add(str(path))
+            found.append(path)
+
+    for raw in SAFARI_COOKIE_FILES:
+        add(Path(raw).expanduser())
+    env = os.environ.get("TOKENLENSBAR_SAFARI_COOKIES")
+    if env:
+        add(Path(env).expanduser())
+    roots = [Path(raw).expanduser() for raw in (extra_roots or ())]
+    if extra_roots is None:
+        roots += _cookie_roots()
+    for root in roots:
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath.count(os.sep) - str(root).count(os.sep) > 5:
+                dirnames[:] = []
+                continue
+            for filename in filenames:
+                if "cookie" in filename.lower():
+                    add(Path(dirpath) / filename)
+    return found
+
+
+def _sqlite_cookie_records(path):
+    """WebKit 系的 Cookie 也可能在 SQLite 里（一般是 域/名/值 三列）。
+    返回和二进制库一样的记录形状；不碰网络，只读。"""
+    records = []
+    con = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    try:
+        tables = [row[0] for row in con.execute(
+            "select name from sqlite_master where type='table'")]
+        for table in tables:
+            quoted = '"%s"' % table.replace('"', '""')
+            cols = {row[1].lower() for row in con.execute(
+                "pragma table_info(%s)" % quoted)}
+            name_col = next((c for c in ("name", "key") if c in cols), None)
+            value_col = next((c for c in ("value", "val") if c in cols), None)
+            host_col = next((c for c in ("host", "domain", "host_key", "origin")
+                             if c in cols), None)
+            if not (name_col and value_col):
+                continue
+            query = "select %s, %s, %s from %s" % (
+                '"%s"' % host_col if host_col else "''",
+                '"%s"' % name_col, '"%s"' % value_col, quoted)
+            for host, name, value in con.execute(query):
+                records.append({"strings": [str(host or ""), str(name or ""),
+                                            "/", str(value or "")], "ts": None})
+    finally:
+        con.close()
+    return records
+
+
+def _cookie_records(data, path):
+    """按文件头认格式：SQLite 库或二进制 Cookie 库。"""
+    if data[:16].startswith(b"SQLite format 3"):
+        return _sqlite_cookie_records(path)
+    return _bc_records(data)
+
+
+def _mimo_picks(records):
+    """从记录里挑 MiMo 的两个字段；前两段字符串里名字和域名的顺序随版式变，顺序无关。"""
+    picks = {}
+    for rec in records:
+        strings = rec["strings"]
+        head = strings[:2]
+        name = next((text for text in head if text in MIMO_COOKIE_NAMES), None)
+        if name is None or not any(_mimo_host_ok(text) for text in head):
+            continue
+        value = strings[3]
+        old = picks.get(name)
+        if old is None or (rec["ts"] or -1) >= (old[0] or -1):
+            picks[name] = (rec["ts"], value)
+    return picks
+
+
+def read_safari_mimo_cookie(paths=None):
+    """从各 Cookie 库里拼出 MiMo Cookie 头。值只出现在返回值里。"""
+    candidates = list(paths) if paths else _cookie_file_candidates()
+    problems = []
+    best = None
+    for path in candidates:
+        path = Path(path).expanduser()
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            raise CookieError(
+                "没有权限读 Safari Cookie：系统设置 → 隐私与安全性 → 完全磁盘访问权限，"
+                "给运行它的程序（终端或 TokenLensBar）授权后重试")
+        except OSError as exc:
+            problems.append("%s：%s" % (path.name, exc))
+            continue
+        try:
+            fields = _mimo_picks(_cookie_records(data, path))
+        except (CookieError, sqlite3.Error) as exc:
+            problems.append("%s：%s" % (path.name, exc))
+            continue
+        missing = [n for n in MIMO_COOKIE_NAMES if n not in fields]
+        if missing:
+            problems.append("%s：缺 %s" % (path.name, "、".join(missing)))
+            continue
+        header = "api-platform_serviceToken=%s; userId=%s" % (
+            fields["api-platform_serviceToken"][1], fields["userId"][1])
+        stamp = fields["api-platform_serviceToken"][0] or 0
+        if best is None or stamp >= best[0]:
+            best = (stamp, header)
+    if best is not None:
+        return best[1]
+    raise CookieError("没找到 %s 的登录会话%s" % (
+        MIMO_COOKIE_DOMAIN, "（%s）" % "；".join(problems) if problems else
+        "（可能已退出登录，请重新登录控制台）"))
+
+
+def _bc_records(data):
+    """解析整个二进制 Cookie 库的所有记录。个别怪页/怪记录跳过，取认出记录最多的布局。"""
+    best = []
+    for pages in _bc_page_candidates(data):
+        got = []
+        for page in pages:
+            try:
+                got.extend(_bc_page_cookies(page))
+            except CookieError:
+                continue  # 个别怪页不拖垮整个文件
+        if len(got) > len(best):
+            best = got
+    return best
+
+
+def _mimo_cookie_fields(data):
+    """解析一份二进制 Cookie 库，返回 {字段名: (时间戳, 值)}，只收 MiMo 的两个字段。"""
+    records = _bc_records(data)
+    if not records:
+        raise CookieError("Cookie 结构不认识（Safari 改版？）")
+    return _mimo_picks(records)
+
+
+def _bc_domain_summary(records):
+    """只列域名和 Cookie 名（都不是秘密），用来判断“这文件里到底有没有 MiMo 会话”。"""
+    domains, mimo_names = [], []
+    for rec in records:
+        head = rec["strings"][:2]
+        for text in head:
+            if "." in text and "://" not in text and len(text) < 80 and text not in domains:
+                domains.append(text)
+        if any(_mimo_host_ok(text) for text in head):
+            for text in head:
+                if not _mimo_host_ok(text) and text not in mimo_names:
+                    mimo_names.append(text)
+    lines = ["  文件里的域（%d 个，只列前 12）：%s" % (
+        len(domains), "、".join(domains[:12]) or "（无）")]
+    if mimo_names:
+        lines.append("  mimo 相关 Cookie 名：%s" % "、".join(mimo_names[:12]))
+    return lines
+
+
+def mimo_cookie_secret_name(config_path=None):
+    config = load_balances_config(config_path)
+    for entry in config["providers"]:
+        if entry.get("type") in ("mimo", "mimo_cookie"):
+            return entry.get("secret") or entry["id"]
+    return MIMO_COOKIE_SECRET
+
+
+def save_mimo_cookie(header, secrets_path=None, secret_name=None):
+    """把 Cookie 写回 secrets.json：原子替换、600 权限、不动其它键。不打印值。"""
+    path = Path(secrets_path or SECRETS_PATH)
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise CookieError("%s 读不了，先修好再自动更新" % path.name)
+        if not isinstance(data, dict):
+            raise CookieError("%s 格式不对，先修好再自动更新" % path.name)
+    data[secret_name or MIMO_COOKIE_SECRET] = header
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def refresh_mimo_cookie(secrets_path=None, secret_name=None, paths=None):
+    """自动续期：Safari 取新 Cookie → 校验 → 写回 secrets.json，返回新 Cookie 头。"""
+    header = validate_mimo_cookie(read_safari_mimo_cookie(paths))
+    save_mimo_cookie(header, secrets_path, secret_name)
+    return header
+
+
 def _provider_key(secrets, entry):
     key = secrets.get(entry.get("secret") or entry["id"])
     if not key and entry["type"] == "deepseek":
@@ -1699,7 +2287,8 @@ def _provider_key(secrets, entry):
 
 
 def refresh_balances(db_path, force=False, verbose=False, config_path=None,
-                     secrets_path=None, fetcher=None, now=None):
+                     secrets_path=None, fetcher=None, now=None,
+                     cookie_refresher=None):
     """按需刷新余额。配置缺失/没 Key 时只写错误状态，不发请求。"""
     config = load_balances_config(config_path)
     result = {"configured": config["configured"], "refreshed": [],
@@ -1734,7 +2323,10 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
             continue
 
         key = _provider_key(secrets, entry)
-        if not key:
+        # 浏览器代查不需要 Key；开着代查时没配 Cookie 也照常取数。
+        browser_ready = (entry["type"] in ("mimo", "mimo_cookie")
+                         and entry.get("via_browser", True))
+        if not key and not browser_ready:
             missing = ("未配置 Cookie" if entry["type"] in ("mimo", "mimo_cookie")
                        else "未配置 Key")
             message = secret_error or missing
@@ -1748,19 +2340,49 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
                 print("  ! %s 余额：%s" % (entry["name"], message))
             continue
 
-        try:
+        def fetch_items(entry_key):
             if fetcher is not None:
-                items = fetcher(entry, key)
+                got = fetcher(entry, entry_key)
             elif entry["type"] == "deepseek":
-                items = fetch_deepseek_balance(entry, key)
+                got = fetch_deepseek_balance(entry, entry_key)
             elif entry["type"] in ("mimo", "mimo_cookie"):
-                items = fetch_mimo_balance(entry, key)
+                got = _fetch_mimo_items(entry, entry_key)
             else:
                 raise BalanceError("暂不支持 %s" % entry["type"])
-            if not items:
+            if not got:
                 raise BalanceError("没有返回余额")
+            return got
+
+        items, message = None, None
+        try:
+            items = fetch_items(key)
+        except BalanceAuthError as exc:
+            # MiMo 的 Cookie 是短效会话，过期是常态：自动换新 Cookie 重试一次。
+            # 自动换新失败不影响面板——保留旧值，把原因记进 balance_state。
+            if (entry["type"] not in ("mimo", "mimo_cookie")
+                    or not entry.get("auto_cookie", True)):
+                message = str(exc)
+            else:
+                refresher = cookie_refresher or (
+                    lambda: refresh_mimo_cookie(
+                        secrets_path=secrets_path,
+                        secret_name=entry.get("secret") or MIMO_COOKIE_SECRET))
+                try:
+                    fresh = refresher()
+                except Exception as ref_exc:
+                    message = ("%s；自动换新 Cookie 失败（%s）。手动兜底："
+                               "python3 tokenlensbar.py cookie --from-clipboard"
+                               % (exc, ref_exc))
+                else:
+                    try:
+                        items = fetch_items(fresh)
+                    except Exception as exc2:
+                        message = "自动换新 Cookie 后仍失败：%s" % exc2
         except BalanceError as exc:
             message = str(exc)
+        except Exception:
+            message = "刷新异常"
+        if items is None:
             con.execute(
                 "insert or replace into balance_state"
                 " (provider, last_attempt, last_success, error) values (?,?,?,?)",
@@ -1769,17 +2391,6 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
             result["errors"].append((provider, message))
             if verbose:
                 print("  ! %s 余额：%s" % (entry["name"], message))
-            continue
-        except Exception:
-            message = "刷新异常"
-            con.execute(
-                "insert or replace into balance_state"
-                " (provider, last_attempt, last_success, error) values (?,?,?,?)",
-                (provider, now, last_success, message))
-            con.commit()
-            result["errors"].append((provider, message))
-            if verbose:
-                print("  ! %s 余额：刷新异常" % entry["name"])
             continue
 
         con.execute("delete from balances where provider=?", (provider,))
@@ -2106,6 +2717,157 @@ def today_spend(db_path, prices=None, items=None, now=None, config_path=None):
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
+def _cookie_check():
+    """只读体检：配置、Safari 可读性、找到的字段名、余额状态。不显示任何值。"""
+    status = 0
+    config = load_balances_config()
+    entries = [e for e in config["providers"]
+               if e.get("type") in ("mimo", "mimo_cookie")]
+    if not entries:
+        print("balances.json 里没有 MiMo 这条 provider。")
+        return 1
+    entry = entries[0]
+    print("余额配置：%s（enabled=%s，auto_cookie=%s，via_browser=%s）" % (
+        entry["name"], entry.get("enabled", True) is not False,
+        entry.get("auto_cookie", True) is not False,
+        entry.get("via_browser", True) is not False))
+    if entry.get("via_browser", True):
+        try:
+            probe = _run_safari_js(MIMO_SAFARI_PROBE, timeout=8)
+        except BalanceError as exc:
+            probe = "ERR:JS %s" % exc
+        if probe.startswith("ERR:NO_TAB"):
+            print("Safari 代查：没找到 MiMo 控制台标签页")
+            status = 1
+        elif probe.startswith("ERR:JS"):
+            print("Safari 代查：%s" % probe[6:].strip())
+            status = 1
+        else:
+            print("Safari 代查：正常（控制台标签页在、JS 授权在）")
+    try:
+        stored = json.loads(Path(SECRETS_PATH).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stored = {}
+    name = entry.get("secret") or entry["id"]
+    have_key = isinstance(stored, dict) and bool(stored.get(name))
+    print("secrets.json：%s（值不显示）" % ("已配置" if have_key else "未配置"))
+    if not have_key:
+        status = 1
+    candidates = _cookie_file_candidates()
+    if not candidates:
+        print("没发现任何 Cookie 文件。")
+        return 1
+    irrelevant, got_all = 0, False
+    for path in candidates:
+        try:
+            blob = path.read_bytes()
+        except PermissionError:
+            print("Cookie 库：%s —— 无权限读（需要完全磁盘访问权限）" % path)
+            status = 1
+            continue
+        except OSError as exc:
+            print("Cookie 库：%s —— 读不了（%s）" % (path, exc))
+            status = 1
+            continue
+        has_needle = (b"xiaomimimo" in blob
+                      or b"api-platform_serviceToken" in blob)
+        try:
+            records = _cookie_records(blob, path)
+        except (CookieError, sqlite3.Error) as exc:
+            if has_needle:
+                print("Cookie 库：%s —— %s（原始字节里有 MiMo 字样，格式待适配）" % (
+                    path, exc))
+                for line in _bc_describe(blob):
+                    print("  %s" % line)
+                status = 1
+            else:
+                irrelevant += 1
+            continue
+        fields = _mimo_picks(records)
+        found = "、".join(n for n in MIMO_COOKIE_NAMES if n in fields)
+        missing = "、".join(n for n in MIMO_COOKIE_NAMES if n not in fields)
+        if not found and not has_needle:
+            irrelevant += 1
+            continue
+        print("Cookie 库：%s —— %d 条记录，找到 %s%s" % (
+            path, len(records), found or "（没有 MiMo 字段）",
+            "，缺 %s" % missing if missing else ""))
+        for needle in (b"xiaomimimo", b"api-platform_serviceToken"):
+            print("  原始字节里含 %s：%s" % (
+                needle.decode(), "是" if needle in blob else "否"))
+        if missing:
+            status = 1
+            for line in _bc_domain_summary(records):
+                print(line)
+        else:
+            got_all = True
+    if irrelevant:
+        print("另有 %d 个 Cookie 文件与 MiMo 无关（已略过）" % irrelevant)
+    if not got_all:
+        status = 1
+        print("深度扫描（只报路径和命中的串名，不报内容）：")
+        hits, scanned = _scan_needles(
+            _cookie_roots(), (b"xiaomimimo", b"api-platform_serviceToken"))
+        print("  扫了 %d 个文件，命中 %d 处：" % (scanned, len(hits)))
+        for path, matched in hits[:30]:
+            print("  含 %s：%s" % ("、".join(matched), path))
+        if len(hits) > 30:
+            print("  …… 另有 %d 处未列出" % (len(hits) - 30))
+        shown_dirs = set()
+        for path, matched in hits:
+            parent = path.parent
+            if "websitedata" not in str(parent).lower() or parent in shown_dirs:
+                continue
+            if len(shown_dirs) >= 4:
+                break
+            shown_dirs.add(parent)
+            listing = []
+            try:
+                for child in sorted(parent.iterdir()):
+                    try:
+                        size = child.stat().st_size
+                        listing.append("%s(%d)" % (child.name, size)
+                                       if child.is_file() else "%s(目录)" % child.name)
+                    except OSError:
+                        listing.append("%s(不可读)" % child.name)
+            except OSError:
+                continue
+            print("  站点目录 %s 里有：%s" % (parent.name[:20] + "…",
+                                          "、".join(listing)))
+    try:
+        for provider in balance_payload(DEFAULT_DB)["providers"]:
+            if provider["id"] == entry["id"]:
+                stamp = (datetime.fromtimestamp(provider["fetched_at"])
+                         .strftime("%m-%d %H:%M") if provider["fetched_at"]
+                         else "从未成功")
+                print("余额状态：上次成功 %s%s" % (
+                    stamp, "；错误：%s" % provider["error"] if provider["error"] else ""))
+    except Exception:
+        pass
+    return status
+
+
+def cmd_cookie(args):
+    """MiMo 余额 Cookie：默认从 Safari 自动续期，--from-clipboard 剪贴板兜底。"""
+    if getattr(args, "check", False):
+        return _cookie_check()
+    try:
+        if getattr(args, "from_clipboard", False):
+            proc = subprocess.run(["pbpaste"], capture_output=True, check=False)
+            header = validate_mimo_cookie(proc.stdout.decode("utf-8", "replace"))
+            save_mimo_cookie(header,
+                             secret_name=mimo_cookie_secret_name())
+        else:
+            header = refresh_mimo_cookie(
+                secret_name=mimo_cookie_secret_name())
+    except (CookieError, BalanceError) as exc:
+        print("Cookie 更新失败：%s" % exc)
+        return 1
+    print("MiMo Cookie 已更新（内容不显示）。点「立即采集」或 "
+          "python3 tokenlensbar.py balance --refresh 生效。")
+    return 0
+
 
 def cmd_manual(args):
     """手动补记：金额、Token、Agent、Model 都可选，但金额和 Token 至少一个。"""
@@ -2513,6 +3275,13 @@ def main(argv=None):
     balance_parser.add_argument("--today", action="store_true", help="查看今日消费")
     balance_parser.add_argument("--json", action="store_true")
 
+    cookie_parser = sub.add_parser(
+        "cookie", help="更新 MiMo 余额 Cookie（自动读 Safari；--from-clipboard 兜底）")
+    cookie_parser.add_argument("--from-clipboard", action="store_true",
+                               help="从剪贴板读 Cookie 写入（自动读不到时的手动兜底）")
+    cookie_parser.add_argument("--check", action="store_true",
+                               help="只体检状态，不改任何东西")
+
     serve_parser = sub.add_parser("serve", help="启动本地看板")
     serve_parser.add_argument("--port", type=int, default=8787)
     serve_parser.add_argument("--no-browser", action="store_true")
@@ -2587,6 +3356,8 @@ def main(argv=None):
                             "" if item.get("available", True) else "  (不可用)"))
                 else:
                     print("%s  %s" % (provider["name"], provider["error"] or "读取中…"))
+    elif args.command == "cookie":
+        return cmd_cookie(args)
     elif args.command == "status":
         if args.json:
             print(json.dumps(status_json(DEFAULT_DB), ensure_ascii=False))
