@@ -10,6 +10,8 @@ let kRefreshInterval: TimeInterval = 60
 let kDashboardPort = 8787
 let kPanelWidth: CGFloat = 280
 let kPanelDefaultHeight: CGFloat = 300
+let kHoverWidth: CGFloat = 238
+let kHoverKey = "TokenLensBarHoverPreview"
 
 /// 面板最高不超过屏幕可见区；超出的内容在面板里滚动，不写死总高度。
 func panelMaxHeight() -> CGFloat {
@@ -339,6 +341,59 @@ func clockText(_ epoch: Double) -> String {
     return formatter.string(from: date)
 }
 
+/// 菜单栏 / 悬停 HUD / 右键摘要共用的一套「今日」口径。
+func todayFigures(_ snapshot: Snapshot) -> (tokens: Double, cost: Double, events: Int, symbol: String) {
+    let today = snapshot.windows?["today"]
+    let spend = snapshot.todaySpend
+    let symbol = snapshot.symbol ?? "¥"
+    let manualTokens = Double(spend?.manual?.tokens ?? 0)
+    let manualAmount = spend?.manual?.amount ?? 0
+    let primary = spend?.currencies?.first
+    let hasSample = primary?.providers?.contains { $0.spent != nil } == true
+    let showSpend = primary != nil && (hasSample || manualAmount != 0 || manualTokens > 0)
+    let cost = showSpend ? (primary?.total ?? 0) : (today?.cost ?? 0)
+    return (tokens: (today?.tokens ?? 0) + manualTokens,
+            cost: cost,
+            events: today?.events ?? 0,
+            symbol: symbol)
+}
+
+func topSlice(_ slices: [Snapshot.Slice]?) -> Snapshot.Slice? {
+    slices?.max { $0.tokens < $1.tokens }
+}
+
+func firstBalance(_ snapshot: Snapshot) -> (name: String, value: String)? {
+    guard let balances = snapshot.balances, balances.configured == true else { return nil }
+    for provider in balances.providers ?? [] {
+        let values = (provider.items ?? []).map {
+            balanceText($0.total ?? 0, currency: $0.currency ?? "CNY")
+        }
+        if !values.isEmpty {
+            return (provider.name ?? provider.id ?? "余额",
+                    values.joined(separator: " / "))
+        }
+    }
+    return nil
+}
+
+func cachePercent(_ snapshot: Snapshot) -> String {
+    guard let rate = snapshot.cacheRate, rate.isFinite else { return "—" }
+    return "\(Int((rate * 100).rounded()))%"
+}
+
+extension Notification.Name {
+    static let tokenLensBarCopied = Notification.Name("TokenLensBarCopied")
+}
+
+func copyToPasteboard(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    pasteboard.setString(trimmed, forType: .string)
+    NotificationCenter.default.post(name: .tokenLensBarCopied, object: nil)
+}
+
 // MARK: - 数据模型
 
 final class PanelModel: ObservableObject {
@@ -514,7 +569,7 @@ final class PanelModel: ObservableObject {
                   agent: agentField.stringValue, model: modelField.stringValue)
     }
 
-    private func flash(_ message: String, seconds: Double) {
+    func flash(_ message: String, seconds: Double) {
         status = message
         clearItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
@@ -557,6 +612,181 @@ private struct PanelContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+/// 面板里的行：悬停高亮，点击复制。
+private struct CopyableRow: ViewModifier {
+    let text: String
+    var helpText: String = "点击复制"
+    @State private var hovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.07 : 0))
+                    .padding(.horizontal, 6)
+            )
+            .onHover { hovering = $0 }
+            .onTapGesture { copyToPasteboard(text) }
+            .help(helpText)
+    }
+}
+
+extension View {
+    func copyable(_ text: String, help: String = "点击复制") -> some View {
+        modifier(CopyableRow(text: text, helpText: help))
+    }
+}
+
+// MARK: - 悬停预览
+
+struct MiniBars: View {
+    let values: [Double]
+
+    var body: some View {
+        GeometryReader { geo in
+            let maxValue = max(values.max() ?? 0, 1)
+            let count = max(values.count, 1)
+            let gap: CGFloat = 2
+            let width = max(2, (geo.size.width - gap * CGFloat(count - 1)) / CGFloat(count))
+            HStack(alignment: .bottom, spacing: gap) {
+                ForEach(Array(values.enumerated()), id: \.offset) { index, value in
+                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        .fill(index == values.count - 1
+                              ? Color.accentColor
+                              : Color.accentColor.opacity(0.35))
+                        .frame(width: width,
+                               height: max(2, geo.size.height * value / maxValue))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// 鼠标悬停菜单栏时的小卡片：只读缓存，不额外起 Python。
+struct HoverPreview: View {
+    let snapshot: Snapshot?
+    let lastLoaded: Date?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Text("今日")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                if let lastLoaded {
+                    Text(lastLoaded, style: .time)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+                }
+            }
+
+            if let snapshot, snapshot.ok {
+                let figures = todayFigures(snapshot)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(cn(figures.tokens))
+                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                    Text(moneyCompactSigned(figures.cost, figures.symbol))
+                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.accentColor)
+                }
+                Text("\(countText(figures.events)) 次请求 · 缓存 \(cachePercent(snapshot))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                if let daily = snapshot.daily, !daily.isEmpty {
+                    MiniBars(values: daily.suffix(7).map(\.tokens))
+                        .frame(height: 20)
+                }
+
+                if let top = topSlice(snapshot.modelsToday) {
+                    Divider()
+                    HStack(spacing: 6) {
+                        Text("最多")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(top.model ?? "?")
+                            .font(.caption)
+                            .lineLimit(1)
+                        Spacer(minLength: 6)
+                        Text(cn(top.tokens))
+                            .font(.caption)
+                            .monospacedDigit()
+                    }
+                }
+
+                if let balance = firstBalance(snapshot) {
+                    HStack(spacing: 6) {
+                        Text("余额")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(balance.name)
+                            .font(.caption)
+                            .lineLimit(1)
+                        Spacer(minLength: 6)
+                        Text(balance.value)
+                            .font(.caption)
+                            .monospacedDigit()
+                    }
+                }
+            } else {
+                Text("还没有数据")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text("点开面板看采集状态")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            Text("点菜单栏图标打开 · 右键更多")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(12)
+        .frame(width: kHoverWidth, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.1))
+                )
+        )
+    }
+}
+
+/// 右键菜单操作后的轻量反馈，不抢焦点。
+struct ToastView: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            Text(text)
+                .font(.callout)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .frame(width: 190, height: 34)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.1))
+                )
+        )
     }
 }
 
@@ -610,6 +840,9 @@ struct PanelView: View {
         }
         .background(Color.clear)
         .preferredColorScheme(model.colorScheme)
+        .onReceive(NotificationCenter.default.publisher(for: .tokenLensBarCopied)) { _ in
+            model.flash("已复制", seconds: 2)
+        }
     }
 
     private var header: some View {
@@ -871,9 +1104,9 @@ struct TodaySpendRow: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
             }
-            .help(help)
             .padding(.horizontal, 12)
             .padding(.vertical, 2)
+            .copyable("今日消费: \(value)（\(note)）", help: help + "\n\n点击复制")
             Divider()
                 .padding(.leading, 12)
         }
@@ -958,6 +1191,7 @@ struct ManualEntryRow: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 2)
+            .copyable("\(title): \(value)")
             Divider()
                 .padding(.leading, 12)
         }
@@ -1026,10 +1260,11 @@ struct SummaryRow: View {
                 Spacer()
                 Text(value)
                     .monospacedDigit()
-                    .help(help ?? "")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 2)
+            .copyable("\(label): \(value)",
+                      help: help.map { $0 + "\n\n点击复制" } ?? "点击复制")
             Divider()
                 .padding(.leading, 12)
         }
@@ -1076,9 +1311,17 @@ struct SliceRow: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 2)
+            .copyable(copyText)
             Divider()
                 .padding(.leading, 12)
         }
+    }
+
+    private var copyText: String {
+        let name = agent ? (slice.agent ?? "?") : (slice.model ?? "?")
+        let price = costText(slice.cost, tokens: slice.tokens, symbol,
+                             subscription: slice.subscription ?? false)
+        return "\(name) · \(cn(slice.tokens)) tokens · \(price)"
     }
 }
 
@@ -1096,25 +1339,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var themeObserver: NSObjectProtocol?
     private var wakeObservers: [NSObjectProtocol] = []
     private var lastWakeRefresh = Date.distantPast
+    private var hoverGlobalMonitor: Any?
+    private var hoverLocalMonitor: Any?
+    private var hoverWork: DispatchWorkItem?
+    private var hoverShown = false
+    private var hoverPanel: NSPanel?
+    private var toastPanel: NSPanel?
+    private var toastWork: DispatchWorkItem?
+    private var isShowingStatusMenu = false
+    private var hoverSuppressedUntil = Date.distantPast
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "…"
         statusItem.button?.toolTip = "TokenLensBar：本地 token 用量"
         statusItem.button?.target = self
-        statusItem.button?.action = #selector(togglePopover)
+        statusItem.button?.action = #selector(statusItemClicked(_:))
+        _ = statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         popover = NSPopover()
         popover.behavior = .transient
         popover.animates = true
+        installHoverMonitoring()
 
         // 系统浅色/深色切换时，面板若开着就立刻跟着变。
         themeObserver = DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
             object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self, self.popover.isShown else { return }
-            self.applyPanelAppearance()
+            guard let self else { return }
+            self.model.colorScheme = self.systemIsDark ? .dark : .light
+            if self.popover.isShown {
+                self.applyPanelAppearance()
+            }
+            if self.hoverShown {
+                self.hideHover()
+            }
         }
 
         // 开盖/唤醒时立刻补一次余额，让今天的起点尽量贴近开盖时刻。
@@ -1139,7 +1399,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
+        model.colorScheme = systemIsDark ? .dark : .light
+
         logLine("启动：statusItem=\(statusItem.button == nil ? "nil" : "ok")")
+        if ProcessInfo.processInfo.environment["TOKENLENSBAR_DEBUG_HOVER"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self, let button = self.statusItem.button,
+                      let window = button.window else { return }
+                let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+                logLine("调试：状态栏按钮 \(frame)")
+            }
+        }
+        if ProcessInfo.processInfo.environment["TOKENLENSBAR_DEMO_PANEL"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.togglePopover()
+            }
+        }
+        if ProcessInfo.processInfo.environment["TOKENLENSBAR_DEMO_MENU"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.showStatusMenu()
+            }
+        }
         model.reload()
 
         let timer = Timer.scheduledTimer(withTimeInterval: kRefreshInterval, repeats: true) { [weak self] _ in
@@ -1168,18 +1448,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.title = "—"
             return
         }
-        let symbol = snapshot.symbol ?? "¥"
+        let figures = todayFigures(snapshot)
+        let symbol = figures.symbol
         let spend = snapshot.todaySpend
         let primary = spend?.currencies?.first
-        let hasSample = primary?.providers?.contains { $0.spent != nil } == true
-        let hasManual = (spend?.manual?.amount ?? 0) != 0 || (spend?.manual?.tokens ?? 0) > 0
-        let showSpend = primary != nil && (hasSample || hasManual)
-        let cost = showSpend ? (primary?.total ?? 0) : today.cost
-        let totalTokens = today.tokens + Double(spend?.tokens ?? 0)
 
         statusItem.button?.attributedTitle = statusTitle(
-            today, tokens: totalTokens, cost: cost, symbol: symbol)
-        let plain = cn(totalTokens) + "  " + moneyCompactSigned(cost, symbol)
+            today, tokens: figures.tokens, cost: figures.cost, symbol: symbol)
+        let plain = cn(figures.tokens) + "  " + moneyCompactSigned(figures.cost, symbol)
         if !loggedFirstTitle {
             loggedFirstTitle = true
             logLine("首次刷新成功：菜单栏标题=\(plain)")
@@ -1202,8 +1478,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     + parts.joined(separator: " / ") + "）"
             }
         }
-        statusItem.button?.toolTip =
-            "今日 \(cn(totalTokens)) tokens · \(spendHelp) · \(countText(today.events)) 次请求"
+        let richToolTip =
+            "今日 \(cn(figures.tokens)) tokens · \(spendHelp) · \(countText(figures.events)) 次请求"
+        statusItem.button?.toolTip = hoverPreviewEnabled ? nil : richToolTip
     }
 
     private func ensurePanel() -> NSHostingController<PanelView> {
@@ -1247,7 +1524,297 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.colorScheme = isDark ? .dark : .light
     }
 
+    // MARK: 悬停 / 右键 / 复制
+
+    private var hoverPreviewEnabled: Bool {
+        UserDefaults.standard.object(forKey: kHoverKey) as? Bool ?? true
+    }
+
+    private func installHoverMonitoring() {
+        guard let button = statusItem.button else { return }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        button.addTrackingArea(area)
+
+        // 事件驱动：全局监听覆盖菜单栏，本地监听覆盖面板内部。
+        // 不用轮询，空闲时不产生唤醒，也不需要用 beginActivity 顶着 App Nap。
+        hoverGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) {
+            [weak self] _ in
+            self?.evaluateHover()
+        }
+        hoverLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) {
+            [weak self] event in
+            self?.evaluateHover()
+            return event
+        }
+    }
+
+    @objc private func mouseEntered(with event: NSEvent) {
+        guard hoverPreviewEnabled else { return }
+        scheduleHover()
+    }
+
+    @objc private func mouseExited(with event: NSEvent) {
+        cancelHover()
+        hideHover()
+    }
+
+    private func evaluateHover() {
+        guard hoverPreviewEnabled,
+              let button = statusItem.button,
+              let window = button.window else { return }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        if frame.contains(NSEvent.mouseLocation) {
+            scheduleHover()
+        } else {
+            cancelHover()
+            hideHover()
+        }
+    }
+
+    private func scheduleHover() {
+        guard hoverPreviewEnabled, !hoverShown, hoverWork == nil,
+              !popover.isShown, statusItem.menu == nil,
+              Date() >= hoverSuppressedUntil,
+              toastPanel?.isVisible != true else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.hoverWork = nil
+            self.showHover()
+        }
+        hoverWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: work)
+    }
+
+    private func cancelHover() {
+        hoverWork?.cancel()
+        hoverWork = nil
+    }
+
+    private func debugHover(_ message: String) {
+        guard ProcessInfo.processInfo.environment["TOKENLENSBAR_DEBUG_HOVER"] == "1" else { return }
+        logLine("悬停：\(message)")
+    }
+
+    private func showHover() {
+        guard hoverPreviewEnabled,
+              let button = statusItem.button,
+              let window = button.window else { return }
+        let buttonFrame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        guard buttonFrame.contains(NSEvent.mouseLocation),
+              !popover.isShown, statusItem.menu == nil else { return }
+
+        let dark = systemIsDark
+        let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        let root = HoverPreview(snapshot: model.snapshot, lastLoaded: model.lastLoaded)
+            .environment(\.colorScheme, dark ? .dark : .light)
+        let host = NSHostingView(rootView: root)
+        host.appearance = appearance
+        host.frame = NSRect(x: 0, y: 0, width: kHoverWidth, height: 10)
+        host.layoutSubtreeIfNeeded()
+        let size = NSSize(width: kHoverWidth, height: max(host.fittingSize.height, 60))
+        host.frame = NSRect(origin: .zero, size: size)
+        host.layoutSubtreeIfNeeded()
+
+        if hoverPanel == nil {
+            hoverPanel = makeFloatingPanel()
+        }
+        guard let panel = hoverPanel else { return }
+        panel.appearance = appearance
+        panel.contentView = host
+        panel.setContentSize(size)
+        place(panel: panel, size: size, under: buttonFrame, screen: window.screen)
+        panel.orderFrontRegardless()
+        hoverShown = true
+        debugHover("显示 \(size.width)x\(size.height) at \(panel.frame)")
+    }
+
+    private func hideHover() {
+        guard hoverShown else { return }
+        hoverShown = false
+        hoverPanel?.orderOut(nil)
+        debugHover("隐藏")
+    }
+
+    private func makeFloatingPanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: kHoverWidth, height: 120),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .statusBar
+        panel.collectionBehavior = [
+            .canJoinAllSpaces, .transient, .ignoresCycle, .fullScreenAuxiliary
+        ]
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.animationBehavior = .utilityWindow
+        return panel
+    }
+
+    private func place(panel: NSPanel, size: NSSize, under buttonFrame: NSRect, screen: NSScreen?) {
+        let visible = (screen ?? NSScreen.main)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        var x = buttonFrame.midX - size.width / 2
+        x = min(max(x, visible.minX + 8), visible.maxX - size.width - 8)
+        var y = buttonFrame.minY - size.height - 6
+        y = max(y, visible.minY + 8)
+        panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height),
+                       display: true)
+    }
+
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        guard !isShowingStatusMenu else { return }
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showStatusMenu()
+        } else {
+            togglePopover()
+        }
+    }
+
+    private func showStatusMenu() {
+        hoverSuppressedUntil = Date().addingTimeInterval(1.0)
+        cancelHover()
+        hideHover()
+        isShowingStatusMenu = true
+        let menu = buildStatusMenu()
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+        isShowingStatusMenu = false
+    }
+
+    private func buildStatusMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        addStatusItem(menu, "打开面板", #selector(menuOpenPanel))
+        addStatusItem(menu, "打开看板", #selector(menuOpenDashboard))
+        addStatusItem(menu, "立即采集", #selector(menuScan))
+        menu.addItem(.separator())
+        addStatusItem(menu, "复制今日摘要", #selector(menuCopySummary))
+        menu.addItem(.separator())
+        let hover = NSMenuItem(title: "悬停预览",
+                               action: #selector(menuToggleHover),
+                               keyEquivalent: "")
+        hover.target = self
+        hover.state = hoverPreviewEnabled ? .on : .off
+        menu.addItem(hover)
+        menu.addItem(.separator())
+        addStatusItem(menu, "退出", #selector(menuQuit))
+        return menu
+    }
+
+    private func addStatusItem(_ menu: NSMenu, _ title: String, _ action: Selector) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+    }
+
+    @objc private func menuOpenPanel() {
+        if !popover.isShown {
+            togglePopover()
+        }
+    }
+
+    @objc private func menuOpenDashboard() {
+        model.openDashboard()
+    }
+
+    @objc private func menuScan() {
+        model.scan()
+        showToast("开始采集…")
+    }
+
+    @objc private func menuCopySummary() {
+        guard let snapshot = model.snapshot, snapshot.ok else {
+            showToast("还没有数据")
+            return
+        }
+        copyToPasteboard(summaryText(snapshot))
+        showToast("已复制今日摘要")
+    }
+
+    @objc private func menuToggleHover() {
+        let enabled = !hoverPreviewEnabled
+        UserDefaults.standard.set(enabled, forKey: kHoverKey)
+        if !enabled {
+            cancelHover()
+            hideHover()
+        }
+        if let snapshot = model.snapshot {
+            updateStatusItem(snapshot)
+        }
+        showToast(enabled ? "悬停预览已开启" : "悬停预览已关闭")
+    }
+
+    @objc private func menuQuit() {
+        NSApp.terminate(nil)
+    }
+
+    private func summaryText(_ snapshot: Snapshot) -> String {
+        let figures = todayFigures(snapshot)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        var lines = [
+            "TokenLensBar · \(formatter.string(from: Date()))",
+            "今日  \(cn(figures.tokens)) tokens · "
+                + "\(moneyCompactSigned(figures.cost, figures.symbol)) · "
+                + "\(countText(figures.events)) 次请求",
+            "缓存  \(cachePercent(snapshot))",
+        ]
+        if let top = topSlice(snapshot.modelsToday) {
+            lines.append("最多  \(top.model ?? "?")  \(cn(top.tokens)) tokens")
+        }
+        if let balance = firstBalance(snapshot) {
+            lines.append("余额  \(balance.name)  \(balance.value)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func showToast(_ text: String) {
+        guard let button = statusItem.button, let window = button.window else { return }
+        cancelHover()
+        hideHover()
+        if toastPanel == nil {
+            toastPanel = makeFloatingPanel()
+        }
+        guard let panel = toastPanel else { return }
+        let dark = systemIsDark
+        let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        let root = ToastView(text: text)
+            .environment(\.colorScheme, dark ? .dark : .light)
+        let host = NSHostingView(rootView: root)
+        host.appearance = appearance
+        host.frame = NSRect(x: 0, y: 0, width: 190, height: 34)
+        panel.appearance = appearance
+        panel.contentView = host
+        panel.setContentSize(NSSize(width: 190, height: 34))
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        place(panel: panel, size: NSSize(width: 190, height: 34),
+              under: frame, screen: window.screen)
+        panel.orderFrontRegardless()
+        toastWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.toastPanel?.orderOut(nil)
+        }
+        toastWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4, execute: work)
+    }
+
     @objc private func togglePopover() {
+        hoverSuppressedUntil = Date().addingTimeInterval(0.8)
+        cancelHover()
+        hideHover()
         guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
@@ -1264,6 +1831,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ? min(preferred.height, panelMaxHeight()) : kPanelDefaultHeight
         popover.contentSize = NSSize(width: kPanelWidth, height: height)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
         popover.contentViewController?.view.window?.makeKey()
         DispatchQueue.main.async { [weak self] in
             self?.applyPanelAppearance()
@@ -1280,6 +1848,11 @@ struct TokenLensBarMain {
             renderPanel(path: path)
             return
         }
+        if let index = args.firstIndex(of: "--render-hover") {
+            let path = index + 1 < args.count ? args[index + 1] : "/tmp/tokenlensbar-hover.png"
+            renderHover(path: path)
+            return
+        }
         if args.contains("--dump") {
             dump()
             return
@@ -1289,6 +1862,49 @@ struct TokenLensBarMain {
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
         app.run()
+    }
+
+    private static func renderHover(path: String) {
+        let model = PanelModel()
+        model.snapshot = PyBridge().load()
+        model.lastLoaded = Date()
+        let scheme: ColorScheme = ProcessInfo.processInfo.environment["TOKENLENSBAR_APPEARANCE"] == "light"
+            ? .light : .dark
+        let root = HoverPreview(snapshot: model.snapshot, lastLoaded: model.lastLoaded)
+            .environment(\.colorScheme, scheme)
+        let host = NSHostingView(rootView: root)
+        host.frame = NSRect(x: 0, y: 0, width: kHoverWidth, height: 10)
+        host.layoutSubtreeIfNeeded()
+        let size = NSSize(width: kHoverWidth, height: max(host.fittingSize.height, 60))
+        host.frame = NSRect(origin: .zero, size: size)
+        host.layoutSubtreeIfNeeded()
+
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
+        window.contentView = host
+        window.orderFrontRegardless()
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
+
+        let captureSize = host.bounds.size
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(captureSize.width * scale),
+            pixelsHigh: Int(captureSize.height * scale),
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ) else { return }
+        rep.size = captureSize
+        host.cacheDisplay(in: host.bounds, to: rep)
+        if let data = rep.representation(using: .png, properties: [:]) {
+            try? data.write(to: URL(fileURLWithPath: path))
+            print("已输出：\(path)（\(Int(captureSize.width))x\(Int(captureSize.height))）")
+        }
+        window.orderOut(nil)
     }
 
     private static func renderPanel(path: String) {
