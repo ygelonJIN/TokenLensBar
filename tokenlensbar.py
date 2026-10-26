@@ -247,21 +247,26 @@ def is_off_peak(ts, prices):
     return False
 
 
-def event_cost(event, prices):
-    """按'缓存命中 / 未命中 + 峰谷'算一次请求的钱。返回 (金额, 命中的型号名)。"""
+def event_cost(event, prices, with_band=False):
+    """按'缓存命中 / 未命中 + 峰谷'算一次请求的钱。返回 (金额, 命中的型号名)。
+
+    with_band=True 时多返回一个 "peak" / "off_peak"，用于面板拆峰谷金额。
+    """
     if not prices:
-        return 0.0, None
+        return (0.0, None, "peak") if with_band else (0.0, None)
     ts = float(event.get("ts") or 0)
     name, version = resolve_rate(event.get("model") or "", ts, prices)
     if version is None:
-        return 0.0, None
+        return (0.0, None, "peak") if with_band else (0.0, None)
 
     rates = version["peak"]
+    band = "peak"
     agent = (event.get("agent") or "").lower()
     peak_only = any(agent == name or agent.startswith(name)
                     for name in (prices.get("peak_only_agents") or []))
     if version["off_peak"] and not peak_only and is_off_peak(ts, prices):
         rates = version["off_peak"]
+        band = "off_peak"
 
     cache_hit = float(event.get("cache_read") or 0)
     raw_input = float(event.get("input") or 0)
@@ -276,6 +281,8 @@ def event_cost(event, prices):
         + float(event.get("output") or 0) * rates.get("output", 0.0)
         + float(event.get("cache_write") or 0) * rates.get("cache_write", 0.0)
     )
+    if with_band:
+        return amount / MTOK, name, band
     return amount / MTOK, name
 
 
@@ -1010,13 +1017,19 @@ def row_event(row):
     }
 
 
-def row_cost(row, prices):
-    """返回 (金额, 命中的型号名, 是否来自来源自带成本)。"""
+def row_cost(row, prices, with_band=False):
+    """返回 (金额, 命中的型号名, 是否来自来源自带成本)。
+
+    with_band=True 时再返回 "peak" / "off_peak"，供面板拆分峰谷金额。
+    """
     # Hermes 自带的 estimated_cost_usd 是美元，和人民币单价表混用会算错，
     # 所以默认一律用本地单价表重算；需要时在 prices.json 里打开 use_source_cost。
     stored = row[10] or 0.0
     if stored > 0 and prices.get("use_source_cost"):
-        return stored, "(来源自带)", True
+        return (stored, "(来源自带)", True, "peak") if with_band else (stored, "(来源自带)", True)
+    if with_band:
+        amount, name, band = event_cost(row_event(row), prices, with_band=True)
+        return amount, name, False, band
     amount, name = event_cost(row_event(row), prices)
     return amount, name, False
 
@@ -1092,16 +1105,64 @@ def breakdown(rows, prices, since):
     return out
 
 
-def daily_series(rows, since):
+def start_of_day(ts):
+    return datetime.fromtimestamp(ts).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def daily_series(rows, since, prices=None, now=None):
+    """按天汇总：token、次数、金额；记录之间的空档补 0，时间轴不会被压缩。"""
+    prices = prices if prices is not None else load_prices()
+    now = time.time() if now is None else now
     series = {}
     for row in rows:
         if row[0] < since:
             continue
         day = datetime.fromtimestamp(row[0]).strftime("%Y-%m-%d")
-        bucket = series.setdefault(day, {"tokens": 0, "count": 0})
-        bucket["tokens"] += row[9]
-        bucket["count"] += 1
-    return [dict(date=day, **value) for day, value in sorted(series.items())]
+        bucket = series.setdefault(day, zero_bucket())
+        cost, _, _ = row_cost(row, prices)
+        add(bucket, row, cost)
+    if not series:
+        return []
+
+    first = datetime.strptime(min(series), "%Y-%m-%d").date()
+    last = max(datetime.fromtimestamp(now).date(),
+               datetime.strptime(max(series), "%Y-%m-%d").date())
+    out = []
+    day = first
+    while day <= last:
+        key = day.strftime("%Y-%m-%d")
+        bucket = series.get(key)
+        out.append({
+            "date": key,
+            "tokens": bucket["total"] if bucket else 0,
+            "count": bucket["count"] if bucket else 0,
+            "cost": round(bucket["cost"], 6) if bucket else 0.0,
+        })
+        day += timedelta(days=1)
+    return out
+
+
+def heatmap_series(rows, since, prices=None):
+    """7×24 热力图：按计价时区把事件落到「周几 / 几点」，其余返回给前端补格。"""
+    prices = prices if prices is not None else load_prices()
+    try:
+        zone = ZoneInfo((prices.get("off_peak") or {}).get("timezone") or "Asia/Shanghai")
+    except Exception:
+        zone = None
+    cells = {}
+    for row in rows:
+        if row[0] < since:
+            continue
+        local = datetime.fromtimestamp(row[0], zone) if zone else datetime.fromtimestamp(row[0])
+        key = (local.isoweekday() - 1, local.hour)
+        bucket = cells.setdefault(key, zero_bucket())
+        cost, _, _ = row_cost(row, prices)
+        add(bucket, row, cost)
+    return [
+        {"day": day, "hour": hour, "tokens": bucket["total"],
+         "cost": round(bucket["cost"], 6), "count": bucket["count"]}
+        for (day, hour), bucket in sorted(cells.items())
+    ]
 
 
 def outside_cells(db_path, window_cells, prices):
@@ -2291,11 +2352,20 @@ def api_payload(db_path, days, now=None, prices=None):
     prices = prices if prices is not None else load_prices()
     symbol = prices.get("symbol") or "$"
     now = time.time() if now is None else now
-    since = now - days * 86400
+    since = start_of_day(now - (days - 1) * 86400)
     rows, sources = fetch_rows(db_path, since) if db_path.exists() else ([], [])
     agg = aggregate(rows, prices, since)
     totals = agg["totals"]
     seen = models_seen(rows, prices)
+    peak_cost = off_peak_cost = 0.0
+    for row in rows:
+        if row[0] < since:
+            continue
+        cost, _, _, band = row_cost(row, prices, with_band=True)
+        if band == "off_peak":
+            off_peak_cost += cost
+        else:
+            peak_cost += cost
 
     models = []
     for model, bucket in sorted(agg["by_model"].items(), key=lambda kv: -kv[1]["total"]):
@@ -2331,7 +2401,9 @@ def api_payload(db_path, days, now=None, prices=None):
         ],
         "matrix": breakdown(rows, prices, since),
         "outside": outside_cells(db_path, breakdown(rows, prices, since), prices),
-        "daily": daily_series(rows, since),
+        "daily": daily_series(rows, since, prices, now),
+        "heatmap": heatmap_series(rows, since, prices),
+        "bands": {"peak": round(peak_cost, 6), "off_peak": round(off_peak_cost, 6)},
         "unpriced": agg["unpriced"],
         "sources": [{"agent": name, "files": count} for name, count in sources],
     }

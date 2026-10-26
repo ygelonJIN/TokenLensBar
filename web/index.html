@@ -54,6 +54,16 @@
   .tabs button:hover { color: var(--text); background: var(--hover); }
   .tabs button.on { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
 
+  .sec-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+  .sec-head h2 { margin: 0; }
+  .seg { display: inline-flex; background: var(--panel-2); border-radius: 7px; padding: 2px; gap: 2px; flex: none; }
+  .seg button {
+    border: 0; background: transparent; color: var(--muted); font-size: 11.5px;
+    padding: 3px 10px; border-radius: 5px; cursor: pointer; font-family: inherit;
+  }
+  .seg button:hover { color: var(--text); }
+  .seg button.on { background: var(--panel); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(0, 0, 0, .14); }
+
   .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 26px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 15px 17px; }
   .card .k { color: var(--muted); font-size: 12px; margin-bottom: 7px; letter-spacing: .3px; }
@@ -67,15 +77,40 @@
 
   .chart { display: flex; align-items: flex-end; gap: 3px; height: 150px; padding-top: 8px; }
   .chart .bar { flex: 1; min-width: 2px; position: relative; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
-  .chart .bar i { display: block; background: var(--accent); border-radius: 3px 3px 0 0; min-height: 2px; transition: opacity .12s; }
-  .chart .bar:hover i { opacity: .62; }
-  .chart .bar:hover::after {
-    content: attr(data-tip); position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
-    background: var(--panel); border: 1px solid var(--line); color: var(--text);
-    padding: 4px 9px; border-radius: 6px; font-size: 11px; white-space: nowrap; z-index: 5;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, .12);
-  }
+  .chart .bar i { display: block; background: var(--accent); border-radius: 3px 3px 0 0; min-height: 2px; transition: opacity .12s, background .15s; }
+  .chart.cost .bar i { background: var(--accent-2); }
+  .chart .bar i.zero { background: var(--line); }
+  .chart .bar:hover i, .chart .bar:focus-visible i { opacity: .62; }
+  .chart .bar:focus-visible { outline: none; }
+  .chart .bar:focus-visible i { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; padding-top: 6px; font-variant-numeric: tabular-nums; }
 
+  .heat-wrap { overflow-x: auto; padding: 2px 0 4px; }
+  .heat {
+    display: grid; grid-template-columns: 40px repeat(24, minmax(16px, 1fr));
+    gap: 3px; align-items: center; min-width: 660px;
+  }
+  .heat .hh { color: var(--muted); font-size: 10px; text-align: center; font-variant-numeric: tabular-nums; }
+  .heat .hl { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .heat .cell { height: 25px; border-radius: 4px; background: var(--panel-2); transition: background .15s; }
+  .heat .cell:hover { outline: 1.5px solid var(--text); outline-offset: -1px; }
+  .heat .cell:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+
+  .tip {
+    position: fixed; left: 0; top: 0; z-index: 50; pointer-events: none;
+    background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    padding: 8px 12px; border-radius: 9px; font-size: 12px; line-height: 1.55;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+    opacity: 0; transform: translateY(3px); transition: opacity .1s ease, transform .1s ease;
+    white-space: nowrap;
+  }
+  .tip.on { opacity: 1; transform: translateY(0); }
+  .tip .d { color: var(--muted); font-size: 11px; }
+  .tip .c { color: var(--accent); font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tip .m { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+
+  .table-wrap { overflow-x: auto; }
+  .table-wrap table { min-width: 700px; }
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
   th { text-align: right; font-weight: 500; color: var(--muted); font-size: 12px; padding: 0 10px 9px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; }
@@ -89,6 +124,9 @@
   .share .track { width: 62px; height: 5px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
   .share .fill { height: 100%; background: var(--accent-2); border-radius: 3px; }
   .cost { color: var(--accent); }
+  .cost .pct { color: var(--muted); font-size: 11px; margin-left: 6px; font-weight: 400; }
+  .unit { color: var(--muted); }
+  .matrix-agent { display: none; }
 
   .warn { background: color-mix(in srgb, var(--warn) 9%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); color: var(--warn);
           border-radius: 10px; padding: 12px 16px; font-size: 13px; margin-bottom: 18px; }
@@ -98,9 +136,22 @@
   .empty { text-align: center; color: var(--muted); padding: 60px 0; }
   tbody tr.dim td { color: var(--muted); }
   tbody tr.dim td .cost { color: var(--muted); }
+  .only-narrow { display: none; }
   @media (max-width: 860px) {
     .cards { grid-template-columns: repeat(2, 1fr); }
     body { padding: 20px 14px 40px; }
+  }
+  @media (max-width: 720px) {
+    .col-in, .col-out, .col-cache, .col-unit, .col-share, .col-last { display: none; }
+    .table-wrap table { min-width: 0; }
+    .only-narrow { display: inline; }
+    .heat { min-width: 620px; }
+    .table-wrap th:first-child, .table-wrap td:first-child,
+    .table-wrap th.wrap-cell, .table-wrap td.wrap-cell { white-space: normal; }
+    .table-wrap .agents { display: block; margin-left: 0; }
+    .col-agent, .col-count, .col-count-m { display: none; }
+    .matrix-agent { display: block; margin-left: 0; }
+    .table-wrap th, .table-wrap td { padding-left: 6px; padding-right: 6px; }
   }
 </style>
 </head>
@@ -126,6 +177,12 @@
   </footer>
 </div>
 
+<div class="tip" id="tip" role="tooltip" aria-hidden="true">
+  <div class="d"></div>
+  <div class="c"></div>
+  <div class="m"></div>
+</div>
+
 <script>
 const fmt = (n) => {
   if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿';
@@ -133,18 +190,28 @@ const fmt = (n) => {
   return String(Math.round(n));
 };
 const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cash = (n, s) => {
+  if (!(n > 0)) return s + '0.00';
+  if (n < 0.01) return s + n.toFixed(4);
+  return s + n.toFixed(2);
+};
 
+let symbol = '$';
 let current = 30;
+let metric = 'tokens';
+let lastPayload = null;
 
 async function load(days) {
   current = days;
   const res = await fetch('/api/summary?days=' + days);
   const d = await res.json();
+  lastPayload = d;
   render(d);
 }
 
 
 function render(d) {
+  hideTip();
   const box = document.getElementById('content');
   if (!d.ok) {
     box.innerHTML = '<div class="empty">还没有数据。先运行 <code>python3 tokenlensbar.py scan</code></div>';
@@ -153,7 +220,17 @@ function render(d) {
 
   const t = d.totals;
   const hitRate = t.input ? (t.cache_read / t.input * 100) : 0;
-  const sym = d.symbol;
+  symbol = d.symbol || '$';
+  const bands = d.bands || { peak: 0, off_peak: 0 };
+  const totalCost = t.cost || 0;
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const costPct = (cost) => totalCost ? (cost / totalCost * 100) : 0;
+  const unitPrice = (cost, tokens) => tokens ? cash(cost / tokens * 1e6, symbol) : '—';
+  const seg = `
+    <div class="seg" data-seg>
+      <button data-metric="tokens" class="${metric === 'tokens' ? 'on' : ''}">Token</button>
+      <button data-metric="cost" class="${metric === 'cost' ? 'on' : ''}">金额</button>
+    </div>`;
 
   const cars = `
     <div class="cards">
@@ -164,8 +241,9 @@ function render(d) {
       </div>
       <div class="card">
         <div class="k">成本（Token 估算）</div>
-        <div class="v">${sym}${t.cost.toFixed(2)}</div>
+        <div class="v">${cash(t.cost, symbol)}</div>
         <div class="sub">${d.priced ? '按本地单价表，不含余额差异' : '未配置单价表'}</div>
+        <div class="sub">峰 ${cash(bands.peak, symbol)} · 谷 ${cash(bands.off_peak, symbol)}</div>
       </div>
       <div class="card">
         <div class="k">缓存命中率</div>
@@ -186,16 +264,64 @@ function render(d) {
     </div>` : '';
 
   const daily = d.daily || [];
-  const maxDay = Math.max(1, ...daily.map(x => x.tokens));
+  const activeDays = daily.filter(x => x.tokens > 0).length;
+  const maxDay = Math.max(1e-9, ...daily.map(x => metric === 'tokens' ? x.tokens : x.cost));
+  const bars = daily.map(x => {
+    const cost = Number(x.cost) || 0;
+    const value = metric === 'tokens' ? x.tokens : cost;
+    const zero = value <= 0;
+    const height = zero ? 2 : Math.max(2, value / maxDay * 100);
+    const label = `${x.date}：${cash(cost, symbol)}，${fmt(x.tokens)} tokens，${x.count} 次`;
+    return `<div class="bar tip-target" tabindex="0" role="img" aria-label="${esc(label)}"
+                 data-title="${x.date}" data-tokens="${x.tokens}" data-count="${x.count}" data-cost="${cost}">
+              <i class="${zero ? 'zero' : ''}" style="height:${height}%"></i>
+            </div>`;
+  }).join('');
+  const peakText = metric === 'tokens' ? `${fmt(maxDay)} tokens` : cash(maxDay, symbol);
+  const midDay = daily[Math.floor((daily.length - 1) / 2)];
+  const axis = daily.length === 0 ? '' : `
+    <div class="axis">
+      <span>${daily[0].date.slice(5)}</span>
+      ${daily.length > 2 ? `<span>${midDay.date.slice(5)}</span>` : ''}
+      <span>${daily[daily.length - 1].date.slice(5)}</span>
+    </div>`;
   const chart = `
     <section>
-      <h2>每日用量</h2>
-      <div class="hint">共 ${daily.length} 天有记录，峰值 ${fmt(maxDay)} tokens/天</div>
-      <div class="chart">
-        ${daily.map(x => `<div class="bar" data-tip="${x.date} · ${fmt(x.tokens)} · ${x.count} 次">
-             <i style="height:${Math.max(2, x.tokens / maxDay * 100)}%"></i>
-           </div>`).join('')}
-      </div>
+      <div class="sec-head"><h2>每日用量</h2>${seg}</div>
+      <div class="hint">共 ${activeDays} 天有记录 · 峰值 ${peakText}/天 · 悬停或聚焦看当日金额</div>
+      <div class="chart${metric === 'cost' ? ' cost' : ''}"${daily.length > 60 ? ' style="gap:1px"' : ''}>${bars}</div>
+      ${axis}
+    </section>`;
+
+  const heat = d.heatmap || [];
+  const heatBy = {};
+  heat.forEach(c => { heatBy[`${c.day}-${c.hour}`] = c; });
+  const maxHeat = Math.max(1e-9, ...heat.map(c => metric === 'tokens' ? c.tokens : c.cost));
+  const dayNames = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  const heatHead = '<div class="hl"></div>' + Array.from({ length: 24 }, (_, h) =>
+    `<div class="hh">${h % 3 === 0 ? pad2(h) : ''}</div>`).join('');
+  const heatRows = dayNames.map((name, di) => {
+    const label = `<div class="hl">${name}</div>`;
+    const cells = Array.from({ length: 24 }, (_, h) => {
+      const c = heatBy[`${di}-${h}`] || { tokens: 0, cost: 0, count: 0 };
+      const value = metric === 'tokens' ? c.tokens : c.cost;
+      const has = value > 0;
+      const pct = has ? Math.max(12, Math.round(Math.sqrt(value / maxHeat) * 100)) : 0;
+      const color = metric === 'cost' ? 'var(--accent-2)' : 'var(--accent)';
+      const bg = has ? ` style="background:color-mix(in srgb, ${color} ${pct}%, var(--panel-2))"` : '';
+      const title = `${name} ${pad2(h)}:00`;
+      const meta = `${fmt(c.tokens)} tokens · ${c.count} 次`;
+      const aria = `${title}：${cash(c.cost, symbol)}，${fmt(c.tokens)} tokens，${c.count} 次`;
+      return `<div class="cell${has ? ' tip-target' : ''}" tabindex="${has ? 0 : -1}" role="img" aria-label="${esc(aria)}"
+                   data-title="${title}" data-cost="${c.cost}" data-tokens="${c.tokens}" data-count="${c.count}" data-meta="${meta}"${bg}></div>`;
+    }).join('');
+    return label + cells;
+  }).join('');
+  const heatBlock = `
+    <section>
+      <div class="sec-head"><h2>时段分布</h2>${seg}</div>
+      <div class="hint">7×24 小时<span class="only-narrow">（可左右滑动）</span> · 颜色按${metric === 'tokens' ? ' Token ' : '金额'} · 悬停看该时段花费 · 高峰：工作日 09–12、14–18</div>
+      <div class="heat-wrap"><div class="heat">${heatHead}${heatRows}</div></div>
     </section>`;
 
   const grand = t.tokens || 1;
@@ -203,63 +329,72 @@ function render(d) {
     <tr>
       <td><span class="name">${esc(m.model)}</span><span class="agents">${m.agents.map(esc).join(' · ')}</span></td>
       <td>${fmt(m.tokens)}</td>
-      <td>${fmt(m.input)}</td>
-      <td>${fmt(m.output)}</td>
-      <td>${fmt(m.cache_read)}</td>
-      <td>${m.events.toLocaleString()}</td>
-      <td class="cost">${sym}${m.cost.toFixed(2)}</td>
-      <td><div class="share"><div class="track"><div class="fill" style="width:${(m.tokens / grand * 100).toFixed(1)}%"></div></div><span>${(m.tokens / grand * 100).toFixed(1)}%</span></div></td>
+      <td class="col-in">${fmt(m.input)}</td>
+      <td class="col-out">${fmt(m.output)}</td>
+      <td class="col-cache">${fmt(m.cache_read)}</td>
+      <td class="col-count">${m.events.toLocaleString()}</td>
+      <td class="cost">${cash(m.cost, symbol)}<span class="pct">${costPct(m.cost).toFixed(1)}%</span></td>
+      <td class="unit col-unit">${unitPrice(m.cost, m.tokens)}</td>
+      <td class="col-share"><div class="share"><div class="track"><div class="fill" style="width:${(m.tokens / grand * 100).toFixed(1)}%"></div></div><span>${(m.tokens / grand * 100).toFixed(1)}%</span></div></td>
     </tr>`).join('');
 
   const models = `
     <section>
       <h2>按模型</h2>
-      <div class="hint">模型名来自各 Agent 自己的日志，代号变了会自动出现新行</div>
-      <table>
-        <thead><tr><th>模型 / 出现在</th><th>总量</th><th>输入</th><th>输出</th><th>缓存命中</th><th>次数</th><th>成本</th><th>占比</th></tr></thead>
-        <tbody>${modelRows}</tbody>
-      </table>
+      <div class="hint">模型名来自各 Agent 自己的日志 · 成本占比按当前窗口总额 · 单价 = 每百万 token 的成本</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>模型 / 出现在</th><th>总量</th><th class="col-in">输入</th><th class="col-out">输出</th><th class="col-cache">缓存命中</th><th class="col-count">次数</th><th>成本 / 占比</th><th class="col-unit">单价</th><th class="col-share">Token 占比</th></tr></thead>
+          <tbody>${modelRows}</tbody>
+        </table>
+      </div>
     </section>`;
 
   const agentRows = d.agents.map(a => `
     <tr>
       <td><span class="name">${esc(a.agent)}</span></td>
       <td>${fmt(a.total)}</td>
-      <td>${fmt(a.input)}</td>
-      <td>${fmt(a.output)}</td>
+      <td class="col-in">${fmt(a.input)}</td>
+      <td class="col-out">${fmt(a.output)}</td>
       <td>${a.count.toLocaleString()}</td>
-      <td class="cost">${sym}${a.cost.toFixed(2)}</td>
+      <td class="cost">${cash(a.cost, symbol)}<span class="pct">${costPct(a.cost).toFixed(1)}%</span></td>
+      <td class="unit col-unit">${unitPrice(a.cost, a.total)}</td>
     </tr>`).join('');
 
   const agents = `
     <section>
       <h2>按 Agent</h2>
-      <div class="hint">同一个 Agent 会切不同厂商和模型，所以这里只回答"哪个工具用的多"</div>
-      <table>
-        <thead><tr><th>Agent</th><th>总量</th><th>输入</th><th>输出</th><th>次数</th><th>成本</th></tr></thead>
-        <tbody>${agentRows}</tbody>
-      </table>
+      <div class="hint">同一个 Agent 会切不同厂商和模型，所以这里只回答"哪个工具用的多、花得多"</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Agent</th><th>总量</th><th class="col-in">输入</th><th class="col-out">输出</th><th>次数</th><th>成本 / 占比</th><th class="col-unit">单价</th></tr></thead>
+          <tbody>${agentRows}</tbody>
+        </table>
+      </div>
     </section>`;
 
   const matrixRows = (d.matrix || []).map(m => `
     <tr>
-      <td><span class="name">${esc(m.agent)}</span></td>
-      <td style="text-align:left"><span class="name">${esc(m.model)}</span></td>
+      <td class="col-agent"><span class="name">${esc(m.agent)}</span></td>
+      <td class="wrap-cell" style="text-align:left"><span class="name">${esc(m.model)}</span><span class="agents matrix-agent">${esc(m.agent)}</span></td>
       <td>${fmt(m.total)}</td>
-      <td>${fmt(m.input)}</td>
-      <td>${fmt(m.output)}</td>
-      <td>${m.count.toLocaleString()}</td>
-      <td class="cost">${sym}${m.cost.toFixed(2)}</td>
+      <td class="col-in">${fmt(m.input)}</td>
+      <td class="col-out">${fmt(m.output)}</td>
+      <td class="col-count-m">${m.count.toLocaleString()}</td>
+      <td class="cost">${cash(m.cost, symbol)}<span class="pct">${costPct(m.cost).toFixed(1)}%</span></td>
+      <td class="unit col-unit">${unitPrice(m.cost, m.total)}</td>
     </tr>`).join('');
 
   const matrix = `
     <section>
       <h2>Agent × 模型</h2>
-      <div class="hint">同时回答"哪个 Agent 用了哪个模型、各用了多少"</div>
-      <table>
-        <thead><tr><th>Agent</th><th style="text-align:left">模型</th><th>总量</th><th>输入</th><th>输出</th><th>次数</th><th>成本</th></tr></thead>
-        <tbody>${matrixRows}</tbody>
-      </table>
+      <div class="hint">同时回答"哪个 Agent 用了哪个模型、各用了多少、哪条最贵"</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th class="col-agent">Agent</th><th class="wrap-cell" style="text-align:left">模型</th><th>总量</th><th class="col-in">输入</th><th class="col-out">输出</th><th class="col-count-m">次数</th><th>成本 / 占比</th><th class="col-unit">单价</th></tr></thead>
+          <tbody>${matrixRows}</tbody>
+        </table>
+      </div>
     </section>`;
 
   const outside = d.outside || [];
@@ -267,28 +402,85 @@ function render(d) {
     <section>
       <h2>窗口外还有</h2>
       <div class="hint">这些 Agent × 模型 在最近 ${d.days} 天没有新记录，但历史数据仍在库里 —— 切到「全部」看完整报表</div>
-      <table>
-        <thead><tr><th>Agent</th><th style="text-align:left">模型</th><th>历史总量</th><th>成本</th><th>最后使用</th></tr></thead>
-        <tbody>
-          ${outside.map(o => `
-            <tr class="dim">
-              <td>${esc(o.agent)}</td>
-              <td style="text-align:left">${esc(o.model)}</td>
-              <td>${fmt(o.tokens)}</td>
-              <td class="cost">${sym}${o.cost.toFixed(2)}</td>
-              <td>${new Date(o.last * 1000).toLocaleDateString('zh-CN')}</td>
-            </tr>`).join('')}
-        </tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Agent</th><th class="wrap-cell" style="text-align:left">模型</th><th>历史总量</th><th>成本</th><th class="col-last">最后使用</th></tr></thead>
+          <tbody>
+            ${outside.map(o => `
+              <tr class="dim">
+                <td>${esc(o.agent)}</td>
+                <td class="wrap-cell" style="text-align:left">${esc(o.model)}</td>
+                <td>${fmt(o.tokens)}</td>
+                <td class="cost">${cash(o.cost, symbol)}</td>
+                <td class="col-last">${new Date(o.last * 1000).toLocaleDateString('zh-CN')}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
     </section>` : '';
 
-  box.innerHTML = cars + warn + chart + models + agents + matrix + outsideBlock;
+  box.innerHTML = cars + warn + chart + heatBlock + models + agents + matrix + outsideBlock;
 
   document.getElementById('src').textContent =
     '数据源：' + d.sources.map(s => `${s.agent}(${s.files})`).join('  ') + ' · 本机 SQLite';
   document.getElementById('stamp').textContent =
     '窗口 ' + d.days + ' 天 · ' + new Date().toLocaleString('zh-CN');
 }
+
+const tipEl = document.getElementById('tip');
+const tipDate = tipEl.querySelector('.d');
+const tipCost = tipEl.querySelector('.c');
+const tipMeta = tipEl.querySelector('.m');
+
+function showTip(el) {
+  const tokens = Number(el.dataset.tokens) || 0;
+  const count = Number(el.dataset.count) || 0;
+  const cost = Number(el.dataset.cost) || 0;
+  tipDate.textContent = el.dataset.title || el.dataset.date || '';
+  tipCost.textContent = cash(cost, symbol);
+  tipMeta.textContent = el.dataset.meta || `${fmt(tokens)} tokens · ${count} 次`;
+  tipEl.classList.remove('on');
+
+  const r = el.getBoundingClientRect();
+  const w = tipEl.offsetWidth;
+  const h = tipEl.offsetHeight;
+  const left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), window.innerWidth - w - 8);
+  let top = r.top - h - 8;
+  if (top < 8) top = r.bottom + 8;
+  tipEl.style.left = Math.round(left) + 'px';
+  tipEl.style.top = Math.round(top) + 'px';
+  tipEl.classList.add('on');
+  tipEl.setAttribute('aria-hidden', 'false');
+}
+
+function hideTip() {
+  tipEl.classList.remove('on');
+  tipEl.setAttribute('aria-hidden', 'true');
+}
+
+const barFrom = (e) => (e.target.closest ? e.target.closest('.tip-target') : null);
+document.addEventListener('mouseover', (e) => { const bar = barFrom(e); if (bar) showTip(bar); });
+document.addEventListener('mouseout', (e) => {
+  const bar = barFrom(e);
+  if (bar && !bar.contains(e.relatedTarget)) hideTip();
+});
+document.addEventListener('focusin', (e) => { const bar = barFrom(e); if (bar) showTip(bar); });
+document.addEventListener('focusout', (e) => { const bar = barFrom(e); if (bar) hideTip(); });
+window.addEventListener('scroll', hideTip, true);
+window.addEventListener('resize', hideTip);
+if (window.matchMedia('(hover: none)').matches) {
+  document.addEventListener('click', (e) => {
+    const bar = barFrom(e);
+    if (bar) showTip(bar); else hideTip();
+  });
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest ? e.target.closest('[data-seg] button') : null;
+  if (!btn) return;
+  metric = btn.dataset.metric;
+  if (lastPayload) render(lastPayload);
+});
 
 document.getElementById('tabs').addEventListener('click', (e) => {
   const btn = e.target.closest('button');
