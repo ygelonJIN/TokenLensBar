@@ -156,16 +156,25 @@ def load_prices(path=None):
 
 
 def _match_score(model, spec):
+    """型号匹配打分：完全相等 > 前缀 > 包含。
+
+    同档位内**别名越长越优先**，否则 `mimo-v2.6-pro` 和
+    `mimo-v2.6-pro-ultraspeed` 在 `mimo-v2.6-pro-ultraspeed-20261001`
+    这种带后缀的名字上会打成平手，谁先进字典谁赢，价格就串了。
+    """
     needle = (model or "").lower().replace("_", "-")
     if not needle:
         return 0
     for index, alias in enumerate(spec["match"]):
+        # 档位（1000/500/100）主导排序，末尾两位用别名长度破平手。
+        rank = min(index, 99)
+        bonus = min(len(alias), 99)
         if needle == alias:
-            return 1000 - index
+            return (1000 - rank) * 100 + bonus
         if needle.startswith(alias) or alias.startswith(needle):
-            return 500 - index
+            return (500 - rank) * 100 + bonus
         if alias in needle:
-            return 100 - index
+            return (100 - rank) * 100 + bonus
     return 0
 
 

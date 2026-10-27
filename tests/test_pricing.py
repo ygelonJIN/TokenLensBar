@@ -111,6 +111,35 @@ def main():
                     tl.resolve_rate("unknown-model", epoch("2026-10-24 12:00"), prices)[0] is None,
                     True)
 
+    # 4c. 同一前缀的两个型号（pro / pro-ultraspeed）不能串价
+    prices = tl.load_prices(write_prices({
+        "currency": "CNY", "symbol": "¥",
+        "models": {
+            "mimo-v2.6-pro": {"match": ["mimo-v2.6-pro"],
+                              "input_cache_hit": 0.025, "input_cache_miss": 3.0, "output": 6.0},
+            "mimo-v2.6-pro-ultraspeed": {"match": ["mimo-v2.6-pro-ultraspeed"],
+                                         "input_cache_hit": 0.25, "input_cache_miss": 30.0,
+                                         "output": 60.0},
+            "mimo-v2.6-flash": {"match": ["mimo-v2.6-flash"],
+                                "input_cache_hit": 0.02, "input_cache_miss": 1.0, "output": 2.0},
+        },
+    }))
+    now = epoch("2026-10-24 12:00")
+    passed &= check_text("pro 认成 pro",
+                         tl.model_label("MiMo-V2.6-Pro", now, prices), "mimo-v2.6-pro")
+    passed &= check_text("ultraspeed 不会被 pro 抢走",
+                         tl.model_label("mimo-v2.6-pro-ultraspeed", now, prices),
+                         "mimo-v2.6-pro-ultraspeed")
+    passed &= check_text("带日期的 ultraspeed 也归 ultraspeed",
+                         tl.model_label("mimo-v2.6-pro-ultraspeed-20261001", now, prices),
+                         "mimo-v2.6-pro-ultraspeed")
+    passed &= check_text("带日期的 pro 仍归 pro",
+                         tl.model_label("mimo-v2.6-pro-20261001", now, prices), "mimo-v2.6-pro")
+    passed &= check_text("flash 是独立型号",
+                         tl.model_label("mimo-v2.6-flash", now, prices), "mimo-v2.6-flash")
+    passed &= check("flash 单价对得上",
+                    tl.event_cost(event("mimo-v2.6-flash", now, 1_000_000, 0, 0), prices)[0], 1.0)
+
     # 4b. 展示用正式名：日志里的别名归到价格表里的型号名
     prices = tl.load_prices(write_prices({
         "currency": "CNY", "symbol": "¥",

@@ -471,6 +471,8 @@ Hermes (pi)       mimo-v2.5-pro    156.1万   ¥1.47
 ```
 
 - `match` 是别名列表，不区分大小写，支持前缀/包含匹配，所以 `-1017`、`-0813` 这类日期后缀不用单个写。
+  同档位下**别名越长越优先**：`mimo-v2.6-pro` 和 `mimo-v2.6-pro-ultraspeed` 同时存在时，
+  `mimo-v2.6-pro-ultraspeed-1017` 归 ultraspeed，`mimo-v2.6-pro-1017` 归 pro。
 - **显示名**：面板 / 报表 / 看板优先显示这里配置的型号名；日志里的别名（如 `deepseek-flash`）
   会归并到正式名（`deepseek-v4.1-flash`）下。
 - 没有 `peak`/`off_peak` 就是全天一口价。
