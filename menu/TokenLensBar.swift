@@ -1327,7 +1327,7 @@ struct SliceRow: View {
 
 // MARK: - 菜单栏两行标题
 
-/// 菜单栏厚度只有 22pt，一行放两段信息太宽：token 量在上、金额徽标在下。
+/// 菜单栏厚度只有 22pt，一行放两段信息太宽：金额在上、token 徽标在下。
 /// 不用 NSButtonCell 的两行标题（它按单行高度摆，整块偏上），
 /// 直接当按钮的子视图自己画；hitTest 放行，点击/右键/悬停仍走按钮。
 final class TwoLineStatusView: NSView {
@@ -1337,20 +1337,20 @@ final class TwoLineStatusView: NSView {
     var costText = "" { didSet { needsDisplay = true } }
     var fallback = false { didSet { needsDisplay = true } }
 
-    private static let tokenFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+    private static let tokenFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
     private static let costFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
     /// 两行的墨迹中心（view 坐标，从下往上），和旁边图标中线对齐。
-    private static let tokenInkCenter: CGFloat = 17.0
-    private static let costInkCenter: CGFloat = 6.25
+    private static let topInkCenter: CGFloat = 17.0
+    private static let badgeInkCenter: CGFloat = 6.25
     private static let badgeHeight: CGFloat = 10.5
     private static let badgePadding: CGFloat = 3
 
-    /// 状态项宽度：取两行较宽者，加徽标内边距和左右留白。
+    /// 状态项宽度：取两行较宽者，徽标那行加上内边距，再留左右白边。
     static func measure(_ view: TwoLineStatusView) -> CGFloat {
         guard !view.fallback else { return fallbackWidth }
         let tokens = NSAttributedString(string: view.tokensText, attributes: [.font: tokenFont])
         let cost = NSAttributedString(string: view.costText, attributes: [.font: costFont])
-        let widest = max(tokens.size().width, cost.size().width + badgePadding * 2)
+        let widest = max(cost.size().width, tokens.size().width + badgePadding * 2)
         return ceil(widest) + 6
     }
 
@@ -1359,34 +1359,34 @@ final class TwoLineStatusView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let width = bounds.width
         if fallback {
-            let dash = NSAttributedString(string: "—", attributes: [.font: Self.tokenFont])
+            let dash = NSAttributedString(string: "—", attributes: [.font: Self.costFont])
             let size = dash.size()
             dash.draw(at: NSPoint(x: (width - size.width) / 2,
-                                  y: Self.tokenInkCenter - size.height / 2))
+                                  y: Self.topInkCenter - size.height / 2))
             return
         }
-        // 上行：token 量
-        let tokens = NSAttributedString(
-            string: tokensText,
-            attributes: [.font: Self.tokenFont, .foregroundColor: NSColor.labelColor])
-        let tokenSize = tokens.size()
-        tokens.draw(at: NSPoint(x: (width - tokenSize.width) / 2,
-                                y: Self.tokenInkCenter - tokenSize.height / 2))
-        // 下行：金额徽标，底色和文字反色；语义色随菜单栏浅/深色自动翻转
+        // 上行：金额
         let cost = NSAttributedString(
             string: costText,
-            attributes: [.font: Self.costFont, .foregroundColor: NSColor.textBackgroundColor])
+            attributes: [.font: Self.costFont, .foregroundColor: NSColor.labelColor])
         let costSize = cost.size()
-        let pillWidth = costSize.width + Self.badgePadding * 2
+        cost.draw(at: NSPoint(x: (width - costSize.width) / 2,
+                              y: Self.topInkCenter - costSize.height / 2))
+        // 下行：token 量徽标，底色和文字反色；语义色随菜单栏浅/深色自动翻转
+        let tokens = NSAttributedString(
+            string: tokensText,
+            attributes: [.font: Self.tokenFont, .foregroundColor: NSColor.textBackgroundColor])
+        let tokenSize = tokens.size()
+        let pillWidth = tokenSize.width + Self.badgePadding * 2
         let pill = NSBezierPath(
             roundedRect: NSRect(x: (width - pillWidth) / 2,
-                                y: Self.costInkCenter - Self.badgeHeight / 2,
+                                y: Self.badgeInkCenter - Self.badgeHeight / 2,
                                 width: pillWidth, height: Self.badgeHeight),
             xRadius: 2.5, yRadius: 2.5)
         NSColor.labelColor.setFill()
         pill.fill()
-        cost.draw(at: NSPoint(x: (width - costSize.width) / 2,
-                              y: Self.costInkCenter - costSize.height / 2))
+        tokens.draw(at: NSPoint(x: (width - tokenSize.width) / 2,
+                                y: Self.badgeInkCenter - tokenSize.height / 2))
     }
 }
 
