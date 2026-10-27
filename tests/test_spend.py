@@ -194,19 +194,26 @@ def main():
                         payload["balances"]["providers"][0]["items"][0]["total"], 94.0)
 
         # 9. 命令行补记
+        #    必须显式 --date：tl.main 拿不到测试里的假 now，
+        #    不传就按真实的今天记账，钉错那天会误判成上一条（Baz）。
         saved = tl.DEFAULT_DB
         tl.DEFAULT_DB = db
         try:
             import contextlib
             import io
-            code = tl.main(["manual", "add", "--amount", "1", "--agent", "CLI",
-                            "--model", "m"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = tl.main(["manual", "add", "--amount", "1", "--agent", "CLI",
+                                "--model", "m", "--date", "2026-10-25"])
             passed &= check("manual CLI 退出码", code, 0)
             entries = tl.manual_entries_for(db, now=now)
             passed &= check("manual CLI 写入", entries[-1]["agent"], "CLI")
+            cli_id = entries[-1]["id"]
             with contextlib.redirect_stdout(io.StringIO()):
-                code = tl.main(["manual", "delete", str(entries[-1]["id"])])
+                code = tl.main(["manual", "delete", str(cli_id)])
             passed &= check("manual CLI 删除", code, 0)
+            rest = [entry["id"] for entry in tl.manual_entries_for(db, now=now)]
+            passed &= check("删掉的是刚补那一条", cli_id in rest, False)
+            passed &= check("其余补记没被误删", len(rest), len(entries) - 1)
         finally:
             tl.DEFAULT_DB = saved
 
