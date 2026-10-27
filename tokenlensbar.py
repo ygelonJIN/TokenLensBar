@@ -19,11 +19,13 @@ TokenLensBar — 本地 token 用量采集器
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -32,6 +34,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -63,7 +66,13 @@ DEFAULT_OFF_PEAK = {"timezone": "Asia/Shanghai",
 RATE_KEYS = ("input_cache_hit", "input_cache_miss", "output", "cache_write")
 
 
+@lru_cache(maxsize=512)
 def _hhmm(text):
+    """把 "HH:MM" 换成当天分钟数。
+
+    峰谷判定每条事件都要跑一遍窗口，而窗口字符串只有几个，
+    缓存掉省下的是每条事件两次字符串切分。
+    """
     hour, minute = str(text).split(":")
     return int(hour) * 60 + int(minute)
 
@@ -178,21 +187,46 @@ def _match_score(model, spec):
     return 0
 
 
+def _best_model(model, prices):
+    """型号名匹配的结果只取决于 model 字符串，与时间无关，按价格表缓存。
+
+    一次查询要过上万条事件，型号却只有十几个：不缓存的话 `_match_score`
+    会被调用几十万次，实测占掉整个状态查询一半以上的时间。
+    缓存挂在 prices 上，换了价格表就是新对象，不会串价。
+    """
+    key = model or ""
+    cache = prices.get("_match_cache")
+    if cache is None:
+        cache = prices["_match_cache"] = {}
+    if key in cache:
+        return cache[key]
+    resolved = None
+    if key:
+        best_score = 0
+        for name, spec in prices["models"].items():
+            # 没有版本区间 = 这份价格不完整，不能用来算钱
+            if not spec["versions"]:
+                continue
+            score = _match_score(key, spec)
+            if score > best_score:
+                best_score, resolved = score, name
+    cache[key] = resolved
+    return resolved
+
+
 def resolve_rate(model, ts, prices):
     """返回 (配置里的型号名, 该时间点生效的费率) 或 (None, None)。"""
-    best_score, best_name, best_version = 0, None, None
-    for name, spec in prices["models"].items():
-        score = _match_score(model, spec)
-        if score <= best_score:
-            continue
-        version = spec["versions"][0] if spec["versions"] else None
-        for candidate in spec["versions"]:
-            if candidate["from"] <= ts:
-                version = candidate
-        if version is None:
-            continue
-        best_score, best_name, best_version = score, name, version
-    return best_name, best_version
+    name = _best_model(model, prices)
+    if name is None:
+        return None, None
+    versions = prices["models"][name]["versions"]
+    version = versions[0]
+    for candidate in versions:            # 已按 from 升序，取最后一段已生效的
+        if candidate["from"] <= ts:
+            version = candidate
+        else:
+            break
+    return name, version
 
 
 def model_label(model, ts, prices):
@@ -204,6 +238,36 @@ def model_label(model, ts, prices):
     return name or raw
 
 
+def _peak_zone(prices, config):
+    """时区对象按价格表缓存；构造失败记 False，避免每条事件都重试一次。"""
+    zone = prices.get("_peak_zone")
+    if zone is None:
+        try:
+            zone = ZoneInfo(config.get("timezone") or "Asia/Shanghai")
+        except Exception:
+            zone = False
+        prices["_peak_zone"] = zone
+    return zone or None
+
+
+def _window_minutes(prices, key, windows):
+    """把 ["09:00","12:00"] 预解析成分钟数，按价格表缓存。
+
+    窗口只有两三个，事件有上万条；每条都重解析一遍字符串是纯浪费。
+    不合法的窗口照旧跳过，不抛异常。
+    """
+    parsed = prices.get(key)
+    if parsed is None:
+        parsed = []
+        for window in windows:
+            try:
+                parsed.append((_hhmm(window[0]), _hhmm(window[1])))
+            except (ValueError, IndexError, TypeError):
+                continue
+        prices[key] = parsed
+    return parsed
+
+
 def is_off_peak(ts, prices):
     """这条请求发生时是不是空闲时段。
 
@@ -213,42 +277,44 @@ def is_off_peak(ts, prices):
       windows       老写法：直接给出「空闲」区间。
 
     判定按事件自己的时间戳，所以历史账单不会因为"现在几点"而变。
+
+    结果只取决于「这一天是否全天休假」和「当前分钟数」，两者分开缓存，
+    所以上万条事件也只是每天算一次、每分钟算一次。
     """
     config = (prices or {}).get("off_peak") or {}
     peak_windows = config.get("peak_windows")
     windows = config.get("windows") or []
     if peak_windows is None and not windows:
         return False
-    try:
-        zone = ZoneInfo(config.get("timezone") or "Asia/Shanghai")
-    except Exception:
+    zone = _peak_zone(prices, config)
+    if zone is None:
         return False
     local = datetime.fromtimestamp(ts, zone)
     minutes = local.hour * 60 + local.minute
 
     if peak_windows is not None:
-        weekdays = config.get("weekdays") or [1, 2, 3, 4, 5]
-        holidays = set(config.get("holidays") or [])
-        if local.isoweekday() not in weekdays:
-            return True                                    # 周末
-        if local.strftime("%Y-%m-%d") in holidays:
-            return True                                    # 法定节假日
-        for window in peak_windows:
-            try:
-                start, end = _hhmm(window[0]), _hhmm(window[1])
-            except (ValueError, IndexError, TypeError):
-                continue
+        # 周末 / 法定节假日全天算空闲，按天缓存
+        day_cache = prices.get("_day_cache")
+        if day_cache is None:
+            day_cache = prices["_day_cache"] = {}
+        day = local.date().toordinal()
+        allday = day_cache.get(day)
+        if allday is None:
+            weekdays = config.get("weekdays") or [1, 2, 3, 4, 5]
+            holidays = frozenset(config.get("holidays") or [])
+            allday = (local.isoweekday() not in weekdays
+                      or local.strftime("%Y-%m-%d") in holidays)
+            day_cache[day] = allday
+        if allday:
+            return True
+        for start, end in _window_minutes(prices, "_peak_minutes", peak_windows):
             if start <= end and start <= minutes < end:
                 return False
             if start > end and (minutes >= start or minutes < end):  # 跨午夜
                 return False
         return True                                        # 工作日但不在高峰时段
 
-    for window in windows:
-        try:
-            start, end = _hhmm(window[0]), _hhmm(window[1])
-        except (ValueError, IndexError, TypeError):
-            continue
+    for start, end in _window_minutes(prices, "_idle_minutes", windows):
         if start <= end:
             if start <= minutes < end:
                 return True
@@ -344,6 +410,8 @@ def zstd_decompress(path):
     文件正在被追加写入时，zstd 会因为末尾帧不完整而返回非 0，但前面已经解出来的
     部分是有效数据。所以只要 stdout 有内容就照常返回，让调用方自己跳过被截断的
     最后一行（json 解析失败会自动跳过）。返回 None 才是真的没法读。
+
+    注意：这条路径会把整个解压结果读进内存。逐行处理请用 `iter_zstd_lines`。
     """
     binary = find_zstd()
     if binary is None:
@@ -363,6 +431,38 @@ def zstd_decompress(path):
     return text
 
 
+def iter_zstd_lines(path):
+    """流式解压，逐行产出（不含换行符）。
+
+    一个会话解压出来十几 MB，`zstd_decompress` + `splitlines` 会同时持有
+    两份完整拷贝——扫描七十个会话时峰值能到三百多 MB，而其中真正用到的
+    只有当前这一行。这里直接读管道，内存里只留一行。
+
+    截断语义和 `zstd_decompress` 一致：文件正在被写时末尾帧不完整，
+    已经解出来的行照常产出，调用方跳过解析失败的最后一行即可。
+    """
+    binary = find_zstd()
+    if binary is None:
+        return
+    try:
+        proc = subprocess.Popen(
+            [binary, "-dc", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=1024 * 1024,
+        )
+    except OSError:
+        return
+    try:
+        for raw in proc.stdout:
+            yield raw.decode("utf-8", "replace").rstrip("\r\n")
+    finally:
+        try:
+            proc.stdout.close()
+        finally:
+            proc.wait()
+
+
 def iter_jsonl(text):
     for line in text.splitlines():
         line = line.strip()
@@ -372,6 +472,21 @@ def iter_jsonl(text):
             yield json.loads(line)
         except ValueError:
             continue
+
+
+def snapshot_id(prefix, *fields):
+    """累计快照源的事件 id：把**全部主键列**拼起来取摘要。
+
+    这些源一行代表「某会话 × 某模型 × 某计费组合的累计值」，而源表的主键
+    往往不止四列（hermes 是六列，还含服务地址和计费方式）。少用一列就有
+    撞号风险：撞上时数据库按 id 覆盖，后写的覆盖先写的，静默丢一行用量。
+    服务地址实际出现过 `/v1` 和 `/v1/` 两种写法，这不是假想。
+
+    字段里可能含冒号，所以用 \\x1f 分隔再取 sha1 前 20 位；
+    id 只用于去重，不需要人能读。
+    """
+    raw = "\x1f".join("" if field is None else str(field) for field in fields)
+    return "%s:%s" % (prefix, hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20])
 
 
 def make_event(event_id, ts, agent, model, usage, provider=None, cost=0.0,
@@ -428,6 +543,10 @@ class Adapter:
     # 整文件重写的源（zstd 会话、sqlite 快照）必须用它：
     # 写入落在 -wal 或扫描正好撞上写入时，size/mtime 会停在半截。
     always_scan = False
+    # 能不能用「文件凉了 N 秒」来判定它不会再有新数据。
+    # 写入不落在文件自身 mtime 上的源（比如 sqlite 的 -wal）必须保持 False，
+    # 否则它的 mtime 可能几小时不动，快路径会一直拿旧快照、永远漏采。
+    can_settle = False
 
     def discover(self):
         """返回本机上存在的候选文件路径。"""
@@ -437,6 +556,14 @@ class Adapter:
         """解析一个文件，产出事件 dict 的生成器。"""
         return []
         yield
+
+    def fingerprint(self, path):
+        """源自己判断「这轮和上轮比有没有新数据」。
+
+        返回 None 表示判断不了，调用方照常解析。
+        对「累计快照 + 每轮整表覆盖写回」的源来说，没变化时这次写入纯属浪费。
+        """
+        return None
 
 
 class CodexAdapter(Adapter):
@@ -498,7 +625,9 @@ class DshAdapter(Adapter):
     name = "dsh"
     # DSH 每步都会整文件重写 zstd 会话。扫描正好撞上写入时，解出来的是半截流，
     # 而 (size, mtime) 会被记成"已处理"，之后再也不重读——所以这个源永远重扫。
+    # 但它是整文件重写、mtime 跟着内容走，凉下来之后可以放心走快路径。
     always_scan = True
+    can_settle = True
 
     def discover(self):
         root = home(".dsh", "sessions")
@@ -507,14 +636,20 @@ class DshAdapter(Adapter):
                 yield path
 
     def parse(self, path):
-        text = zstd_decompress(path)
-        if text is None:
-            raise SourceBusy(path)
         session_id = ""
         provider = ""
         model = ""
         step_started = {}
-        for obj in iter_jsonl(text):
+        seen = False
+        for line in iter_zstd_lines(path):
+            line = line.strip()
+            if not line:
+                continue
+            seen = True
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
             kind = obj.get("type")
             if kind == "session":
                 session_id = obj.get("id") or ""
@@ -562,6 +697,10 @@ class DshAdapter(Adapter):
                     usage=normalized,
                     cached_in_input=True,
                 )
+        if not seen:
+            # 整个文件一行都没解出来（没装 zstd / 读到空流）：这一轮当没读到，
+            # 不能记成"已处理"，否则这个会话会永久漏采。
+            raise SourceBusy(path)
 
 
 class HermesAdapter(Adapter):
@@ -579,6 +718,38 @@ class HermesAdapter(Adapter):
             if path.exists():
                 yield path
 
+    def fingerprint(self, path):
+        """用量数据变了没有：行数 + token 总和 + 最后活动时间。
+
+        snapshot 源每轮都要整表删掉再写回。数据没变时这一步就是把同样的
+        280 行原样重写一遍——一轮三百多 KB，一天两百多轮，比所有日志
+        加起来还多两个数量级，换来零比特的新数据。
+
+        三个量取的是「几乎任何数据变化都会让它变」的组合：
+        新增/删除行改行数，追加 token 改总和，时间戳变动改时间总和。
+        全部转成整数再求和：浮点求和会随行顺序出现极小差异，
+        指纹就会每轮都"变了"，退化成永远重扫。
+        """
+        if path.name.endswith("-wal"):
+            return None
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=1.0)
+        except sqlite3.Error:
+            return None
+        try:
+            row = con.execute(
+                "select count(*),"
+                " coalesce(sum(cast(input_tokens + output_tokens"
+                "  + cache_read_tokens + cache_write_tokens as integer)), 0),"
+                " coalesce(sum(cast(coalesce(last_seen, first_seen, 0)"
+                "  as integer)), 0)"
+                " from session_model_usage").fetchone()
+        except sqlite3.Error:
+            con.close()
+            return None
+        con.close()
+        return "%s:%s:%s" % row
+
     def parse(self, path):
         if path.name.endswith("-wal"):
             return
@@ -588,7 +759,8 @@ class HermesAdapter(Adapter):
             return
         try:
             rows = con.execute(
-                "select session_id, model, billing_provider, task, input_tokens, output_tokens,"
+                "select session_id, model, billing_provider, billing_base_url,"
+                " billing_mode, task, input_tokens, output_tokens,"
                 " cache_read_tokens, cache_write_tokens, reasoning_tokens,"
                 " estimated_cost_usd, coalesce(last_seen, first_seen, 0)"
                 " from session_model_usage"
@@ -597,9 +769,12 @@ class HermesAdapter(Adapter):
             con.close()
             return
         for row in rows:
-            (session_id, model, provider, task, inp, out, cr, cw, rsn, cost, last_seen) = row
+            (session_id, model, provider, base_url, mode, task,
+             inp, out, cr, cw, rsn, cost, last_seen) = row
             yield make_event(
-                event_id="hermes:%s:%s:%s:%s" % (session_id, model, provider or "", task or ""),
+                # 六列全用上：源表主键就是这六列，少一列就可能两行撞一个 id
+                event_id=snapshot_id("hermes", session_id, model, provider,
+                                     base_url, mode, task),
                 ts=float(last_seen or 0),
                 agent=self.name,
                 provider=provider,
@@ -633,10 +808,12 @@ try:
         "select name from sqlite_master where type='table'")}
 
     if "session_model_usage" in tables:
-        # 新版 Hermes：按会话+模型累计
+        # 新版 Hermes：按会话+模型累计。主键六列全部带上，否则同会话不同
+        # 服务地址（/v1 与 /v1/）会撞同一个事件 id。
         out["mode"] = "model_usage"
         out["rows"] = con.execute(
-            "select session_id, model, billing_provider, task, input_tokens,"
+            "select session_id, model, billing_provider, billing_base_url,"
+            " billing_mode, task, input_tokens,"
             " output_tokens, cache_read_tokens, cache_write_tokens,"
             " reasoning_tokens, estimated_cost_usd,"
             " coalesce(last_seen, first_seen, 0)"
@@ -652,9 +829,10 @@ try:
         else:
             stamp = "coalesce(%s, started_at)" % last_msg
         provider = "billing_provider" if "billing_provider" in cols else "''"
+        # 老版没有服务地址 / 计费方式这两列，补空串占位，保持 13 列对齐
         out["mode"] = "sessions"
         out["rows"] = con.execute(
-            "select id, model, %s, '', input_tokens, output_tokens,"
+            "select id, model, %s, '', '', '', input_tokens, output_tokens,"
             " cache_read_tokens, cache_write_tokens, reasoning_tokens,"
             " estimated_cost_usd, %s from sessions"
             " where input_tokens > 0 or output_tokens > 0 or cache_read_tokens > 0"
@@ -695,7 +873,8 @@ class HermesRemoteAdapter(Adapter):
         command = [
             "ssh",
             "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=5",
+            # 连接超时压到 3 秒：连不上时白等的就是这几秒，而局域网正常响应远低于此
+            "-o", "ConnectTimeout=3",
             "-o", "StrictHostKeyChecking=accept-new",
             self.ssh_target,
             "python3", "-", self.db_path,
@@ -720,11 +899,11 @@ class HermesRemoteAdapter(Adapter):
 
         events = []
         for row in payload.get("rows") or []:
-            (session_id, model, provider, task, inp, out, cr, cw, rsn,
+            (session_id, model, provider, base_url, mode, task, inp, out, cr, cw, rsn,
              cost, last_seen) = row
             events.append(make_event(
-                event_id="%s:%s:%s:%s:%s" % (self.name, session_id, model,
-                                             provider or "", task or ""),
+                event_id=snapshot_id(self.name, session_id, model, provider,
+                                     base_url, mode, task),
                 ts=float(last_seen or 0),
                 agent=self.name,
                 provider=provider,
@@ -828,6 +1007,16 @@ CREATE TABLE IF NOT EXISTS balance_state (
     last_success REAL,
     error        TEXT
 );
+CREATE TABLE IF NOT EXISTS remote_state (
+    origin     TEXT PRIMARY KEY,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    next_try   REAL NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS scan_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE TABLE IF NOT EXISTS balance_samples (
     provider   TEXT NOT NULL,
     currency   TEXT NOT NULL,
@@ -893,24 +1082,265 @@ def insert_event(con, event, origin):
     ))
 
 
+SNAPSHOT_UPSERT_SQL = (
+    "insert into events"
+    " (id, ts, agent, provider, model, input, output, cache_read, cache_write,"
+    "  reasoning, total, cost_usd, cached_in_input, origin)"
+    " values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    # 累计快照要整行覆盖（追加会重复计数），但只在真的变了才落盘。
+    # 用 `is not` 而不是 `<>`：两边都是 NULL 时 `<>` 返回 NULL，那一行就不会更新。
+    " on conflict(id) do update set"
+    "  ts=excluded.ts, agent=excluded.agent, provider=excluded.provider,"
+    "  model=excluded.model, input=excluded.input, output=excluded.output,"
+    "  cache_read=excluded.cache_read, cache_write=excluded.cache_write,"
+    "  reasoning=excluded.reasoning, total=excluded.total,"
+    "  cost_usd=excluded.cost_usd, cached_in_input=excluded.cached_in_input"
+    " where excluded.ts is not events.ts"
+    "  or excluded.agent is not events.agent"
+    "  or excluded.provider is not events.provider"
+    "  or excluded.model is not events.model"
+    "  or excluded.input is not events.input"
+    "  or excluded.output is not events.output"
+    "  or excluded.cache_read is not events.cache_read"
+    "  or excluded.cache_write is not events.cache_write"
+    "  or excluded.reasoning is not events.reasoning"
+    "  or excluded.total is not events.total"
+    "  or excluded.cost_usd is not events.cost_usd"
+)
+
+
+def apply_snapshot(con, events, origin):
+    """把一批「累计快照」事件写进库，返回快照里的行数。
+
+    原来是整表删掉再插回去。SQLite 按页写，280 行摊在三十多个页上，
+    删一遍再加插一遍，配上 rollback journal 的事前备份，一轮三百多 KB——
+    而实际变化的常常只有一两行。这里改成逐行覆盖、只写真正变了的，
+    最后再清掉快照里已经消失的行。
+    """
+    seen = []
+    for event in events:
+        seen.append(event["id"])
+        con.execute(SNAPSHOT_UPSERT_SQL, (
+            event["id"], event["ts"], event["agent"], event["provider"], event["model"],
+            event["input"], event["output"], event["cache_read"], event["cache_write"],
+            event["reasoning"], event["total"], event["cost_usd"],
+            event["cached_in_input"], origin,
+        ))
+    keep = set(seen)
+    # 快照里没有了的行说明源已经删掉，不清就会一直留在统计里
+    stale = [row[0] for row in con.execute(
+        "select id from events where origin=?", (origin,)) if row[0] not in keep]
+    for start in range(0, len(stale), 400):
+        chunk = stale[start:start + 400]
+        con.execute("delete from events where id in (%s)"
+                    % ",".join("?" * len(chunk)), chunk)
+    return len(seen)
+
+
+REMOTE_BACKOFF_BASE = 300          # 远程源第一次失败后，等 5 分钟再试
+REMOTE_BACKOFF_MAX = 3600          # 最长退到 1 小时一次
+
+# 文件最后一次写入距今超过这么多秒，才相信它的 (size, mtime) 可以代表最终内容。
+# 设 0 等于退回旧行为：always_scan 的源每轮全量重扫（慢，但绝对不依赖时间）。
+SETTLE_SECONDS = float(os.environ.get("TOKENLENSBAR_SETTLE_SECONDS", "90"))
+
+
+def _remote_should_try(con, origin, now):
+    """这个远程源现在该不该连。
+
+    树莓派这类机器经常关着：每次采集都硬等一遍 SSH 超时（实测 5 秒），
+    一天就是二十多分钟的白等，而本地采集只要 2 秒。
+    连续失败就指数退避，连上过一次立刻恢复原频率。
+    """
+    row = con.execute("select next_try from remote_state where origin=?",
+                      (origin,)).fetchone()
+    return (not row) or not row[0] or now >= row[0]
+
+
+def _remote_after_attempt(con, origin, ok, now, error=None):
+    """记录一次远程拉取的结果，返回下次允许重试的秒数（供 verbose 输出）。"""
+    row = con.execute("select attempts from remote_state where origin=?",
+                      (origin,)).fetchone()
+    attempts = ((row[0] if row else 0) or 0)
+    if ok:
+        con.execute("insert or replace into remote_state"
+                    " (origin, attempts, next_try, last_error) values (?,?,?,?)",
+                    (origin, 0, 0, None))
+        return 0
+    attempts += 1
+    delay = min(REMOTE_BACKOFF_BASE * (2 ** (attempts - 1)), REMOTE_BACKOFF_MAX)
+    con.execute("insert or replace into remote_state"
+                " (origin, attempts, next_try, last_error) values (?,?,?,?)",
+                (origin, attempts, now + delay, error))
+    return delay
+
+
+def _unpriced_models(db_path, since, prices=None):
+    """最近这段时间出现过、但价格表认不出的型号。
+
+    只查 distinct 型号再逐个比对价格表：型号只有几十个，
+    比把上万条事件全捞出来过一遍 aggregate 便宜得多。
+    """
+    prices = prices if prices is not None else load_prices()
+    if not prices:
+        return []
+    try:
+        con = sqlite3.connect(str(db_path))
+        try:
+            names = [row[0] for row in con.execute(
+                "select distinct model from events where ts >= ?"
+                " and (input > 0 or output > 0)", (since,))]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+    now = time.time()
+    return sorted(name for name in names
+                  if name and resolve_rate(name, now, prices)[0] is None)
+
+
+def _warn_unpriced_once(db_path, models):
+    """未定价模型只在「集合变了」的时候提醒一次。
+
+    采集是每几分钟一轮，条件不变时每轮都写一遍同样的警告，
+    一天下来日志里一半是重复行，真正要看的东西反而被冲掉。
+    """
+    if not models:
+        return False
+    stamp = ",".join(sorted(models))
+    try:
+        con = sqlite3.connect(str(db_path))
+        try:
+            row = con.execute(
+                "select value from scan_state where key='unpriced'").fetchone()
+            if row and row[0] == stamp:
+                return False
+            con.execute("insert or replace into scan_state (key, value)"
+                        " values ('unpriced', ?)", (stamp,))
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        return True          # 记不住状态就照旧每次都提醒，宁可吵也别漏
+    return True
+
+
+def _stream_log_path(fd=1):
+    """拿到 fd 指向的文件路径（macOS 的 F_GETPATH）。
+
+    launchd 是用只写方式打开 StandardOutPath 的，fd 本身读不出来
+    （`os.pread` 和 `/dev/fd/1` 都会报错）；有了路径就能以只读重新打开，
+    读到尾部再写回去。
+    """
+    try:
+        import fcntl
+        raw = fcntl.fcntl(fd, 50, b"\0" * 1024)          # F_GETPATH
+    except (OSError, ImportError):
+        return None
+    if not isinstance(raw, bytes):
+        return None
+    return raw.split(b"\0", 1)[0].decode("utf-8", "replace") or None
+
+
+def _trim_log_stream(limit=2 * 1024 * 1024):
+    """日志被重定向到普通文件时，超过上限就只保留尾部。
+
+    launchd 的 StandardOutPath 是一直追加的，没有轮转：
+    每轮一行、一天几百轮，跑一年就是几十 MB，而真正有用的永远只有最后几行。
+    终端里跑（fd 不是普通文件）时这段什么都不做。
+    """
+    try:
+        info = os.fstat(1)
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= limit:
+            return
+        keep = limit // 2
+        tail = b""
+        path = _stream_log_path(1)
+        if path:
+            try:
+                with open(path, "rb") as handle:
+                    handle.seek(-keep, os.SEEK_END)
+                    tail = handle.read()
+            except OSError:
+                tail = b""
+        # 从中间切出来的第一行是残片，丢掉它，让日志从完整行开始
+        if tail and not tail.startswith(b"\n") and b"\n" in tail:
+            tail = tail.split(b"\n", 1)[1]
+        os.ftruncate(1, 0)
+        os.lseek(1, 0, os.SEEK_SET)
+        os.write(1, tail or b"[log] history trimmed\n")
+    except OSError:
+        return
+
+
+def _balance_refresh_due(db_path, config_path=None, now=None):
+    """余额是不是到了该刷新的时刻。只读一条状态，不起进程、不发请求。
+
+    没配余额、或者还在 refresh_seconds 冷却期内，都直接返回 False，
+    避免每次采集都白起一个 Python 进程。
+    """
+    try:
+        config = load_balances_config(config_path)
+        if not config["configured"]:
+            return False
+        now = time.time() if now is None else now
+        con = sqlite3.connect(str(db_path))
+        try:
+            row = con.execute("select max(last_attempt) from balance_state").fetchone()
+        finally:
+            con.close()
+        last = (row[0] or 0) if row else 0
+        return (not last) or (now - last >= config["refresh_seconds"])
+    except Exception:
+        return False
+
+
+def _spawn_balance_refresh(verbose=False):
+    """把余额刷新丢到独立进程里跑，采集本身不等网络。
+
+    余额是展示数据，和用量采集没有依赖关系。同步刷新时，两个 provider
+    各 6 秒超时就能把一次采集从 2 秒拉到 8 秒 —— 采集窗口长三倍，
+    但采到的数据一个字都不会多。
+    """
+    script = Path(__file__).resolve()
+    try:
+        subprocess.Popen(
+            [sys.executable, str(script), "balance", "--refresh"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL if not verbose else None,
+            stderr=subprocess.DEVNULL if not verbose else None,
+            start_new_session=True,          # 采集进程退出后继续跑完
+            close_fds=True,
+        )
+        return True
+    except OSError:
+        return False
+
+
 def scan(db_path, verbose=False, force_balance=False):
     con = connect(db_path)
     stats = {}
     for adapter in ADAPTERS:
         if getattr(adapter, "virtual", False):
+            origin = adapter.origin_key()
+            now = time.time()
+            if not _remote_should_try(con, origin, now):
+                # 退避期内：保留上次数据，也不去碰网络
+                stats[adapter.name] = (0, 0, 0)
+                continue
             ok, events = adapter.pull()
+            delay = _remote_after_attempt(
+                con, origin, ok, now, getattr(adapter, "last_error", None))
             if not ok:
+                con.commit()
                 # 连不上就保留上次抓到的数据，不能因为一次断网把历史清空
                 if verbose:
-                    print("  ! %s 连不上（%s），保留上次数据"
-                          % (agent_label(adapter.name), adapter.ssh_target))
+                    print("  ! %s 连不上（%s），保留上次数据；%d 秒后再试"
+                          % (agent_label(adapter.name), adapter.ssh_target, delay))
                 stats[adapter.name] = (1, 0, 0)
                 continue
-            origin = adapter.origin_key()
-            con.execute("delete from events where origin=?", (origin,))
             before = con.total_changes
-            for event in events:
-                insert_event(con, event, origin)
+            apply_snapshot(con, events, origin)
             inserted = con.total_changes - before
             con.execute(
                 "insert or replace into files (path, agent, size, mtime, offset, events)"
@@ -924,6 +1354,7 @@ def scan(db_path, verbose=False, force_balance=False):
             continue
 
         found = parsed = inserted = 0
+        now_stamp = time.time()
         for path in sorted(set(adapter.discover())):
             if adapter.mode == "snapshot" and path.name.endswith("-wal"):
                 continue
@@ -933,9 +1364,29 @@ def scan(db_path, verbose=False, force_balance=False):
             except OSError:
                 continue
             row = con.execute("select size, mtime from files where path=?", (str(path),)).fetchone()
-            if (not adapter.always_scan and row
-                    and row[0] == st.st_size and row[1] == st.st_mtime):
+            # always_scan 的源只有在"早就写完了"时才允许走 (size, mtime) 快路径。
+            # 正在被写的文件 mtime 就在刚才，这时解出来的流可能被截断；
+            # 万一真按半截记成"已处理"，之后文件不再变化就永久漏采。
+            # 凉了 90 秒还没有新写入，说明这个文件本轮之前就已经定稿了。
+            if not adapter.always_scan:
+                settled = True
+            elif adapter.can_settle and SETTLE_SECONDS > 0:
+                settled = (now_stamp - st.st_mtime) >= SETTLE_SECONDS
+            else:
+                settled = False       # mtime 不反映写入的源：只能每轮全读
+            if settled and row and row[0] == st.st_size and row[1] == st.st_mtime:
                 continue
+            # 累计快照类源自己判断数据有没有变：没变就整轮跳过，
+            # 既不重新解析，也不把同样的行删掉再写回去。
+            mark = fp_key = None
+            if adapter.mode == "snapshot":
+                mark = adapter.fingerprint(path)
+                if mark is not None:
+                    fp_key = "fp:" + str(path)
+                    cached = con.execute(
+                        "select value from scan_state where key=?", (fp_key,)).fetchone()
+                    if cached and cached[0] == mark:
+                        continue
             # 先把事件全部解出来，再动数据库：解析失败时什么都不能改
             try:
                 events = list(adapter.parse(path))
@@ -944,28 +1395,34 @@ def scan(db_path, verbose=False, force_balance=False):
                     print("  ~ %-6s %s（正在写入，下一轮重试）" % (adapter.name, path.name))
                 continue
             parsed += 1
-            if adapter.mode == "snapshot":
-                con.execute("delete from events where origin=?", (str(path),))
             before = con.total_changes
-            for event in events:
-                insert_event(con, event, str(path))
+            if adapter.mode == "snapshot":
+                # 累计快照：逐行覆盖 + 清理消失的行，别整表删了再插
+                count = apply_snapshot(con, events, str(path))
+            else:
+                for event in events:
+                    insert_event(con, event, str(path))
+                count = len(events)
             inserted += con.total_changes - before
             con.execute(
                 "insert or replace into files (path, agent, size, mtime, offset, events)"
                 " values (?,?,?,?,?,?)",
                 (str(path), adapter.name, st.st_size, st.st_mtime, 0, inserted),
             )
+            if mark is not None and fp_key is not None:
+                # 记下这次的指纹，下一轮数据没变就直接跳过
+                con.execute("insert or replace into scan_state (key, value) values (?,?)",
+                            (fp_key, mark))
             if verbose:
                 print("  + %-6s %s" % (adapter.name, path))
         con.commit()
         stats[adapter.name] = (found, parsed, inserted)
     con.close()
-    # 余额是可选功能；配置缺失时这里会立刻返回，不发请求。
-    try:
-        refresh_balances(db_path, force=force_balance, verbose=verbose)
-    except Exception:
-        if verbose:
-            print("  ! 余额刷新异常，保留上次缓存")
+    # 余额是可选功能；配置缺失、或还在冷却期内，这里什么都不做。
+    # 该刷新时也只起一个独立进程，采集立刻返回。
+    if force_balance or _balance_refresh_due(db_path):
+        if not _spawn_balance_refresh(verbose=verbose) and verbose:
+            print("  ! 余额刷新进程起不来，保留上次缓存")
     return stats
 
 
@@ -1299,34 +1756,54 @@ def report(db_path, days, group_by):
 
 
 def daily_filled(items, days, now=None):
-    """最近 N 天，缺的日子补 0；token 和金额一起返回。"""
+    """最近 N 天，缺的日子补 0；token 和金额一起返回。
+
+    只处理落在窗口内的事件：面板每次刷新都会走这里，而历史有上万条，
+    窗口外的一律跳过。日期用序数分桶，`strftime` 只对输出的那几天做。
+    """
+    now = time.time() if now is None else now
+    today = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = (today - timedelta(days=days - 1)).timestamp()
     buckets = {}
     for item in items:
-        day = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d")
-        bucket = buckets.setdefault(day, {"tokens": 0.0, "cost": 0.0})
+        ts = item["ts"]
+        if ts < cutoff:
+            continue
+        day = datetime.fromtimestamp(ts).toordinal()
+        bucket = buckets.get(day)
+        if bucket is None:
+            bucket = buckets[day] = {"tokens": 0.0, "cost": 0.0}
         bucket["tokens"] += item["total"]
         bucket["cost"] += item["cost"]
-    today = datetime.fromtimestamp(time.time() if now is None else now).replace(
-        hour=0, minute=0, second=0, microsecond=0)
     out = []
     for offset in range(days - 1, -1, -1):
-        day = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
-        bucket = buckets.get(day, {"tokens": 0.0, "cost": 0.0})
-        out.append({"date": day, "tokens": bucket["tokens"],
-                    "cost": round(bucket["cost"], 6)})
+        moment = today - timedelta(days=offset)
+        bucket = buckets.get(moment.toordinal())
+        out.append({"date": moment.strftime("%Y-%m-%d"),
+                    "tokens": bucket["tokens"] if bucket else 0,
+                    "cost": round(bucket["cost"], 6) if bucket else 0})
     return out
 
 
 def enrich(rows, prices):
-    """一次遍历把每条事件的成本算好（峰谷 + 单价），后面只做加总。"""
+    """一次遍历把每条事件的成本算好（峰谷 + 单价），后面只做加总。
+
+    `row_cost` 内部已经算过一次型号匹配，展示名直接复用它：
+    原来这里又单独调了一次 `model_label`，等于每条事件做两遍匹配。
+    """
     out = []
     for row in rows:
         cost, matched, stored = row_cost(row, prices)
+        if stored:
+            # 用的是来源自带成本，型号名还是按本地价格表展示
+            label = model_label(row[3], row[0], prices)
+        else:
+            label = matched or (row[3] or "(未知)")
         out.append({
             "ts": row[0],
             "agent": agent_label(row[1]),
             "provider": row[2] or "(未记录)",
-            "model": model_label(row[3], row[0], prices),
+            "model": label,
             "input": row[4] or 0,
             "output": row[5] or 0,
             "cache_read": row[6] or 0,
@@ -2983,6 +3460,66 @@ def cmd_models(_args):
     print()
 
 
+def migrate_snapshot_ids(db_path, dry_run=False):
+    """把累计快照源的事件 id 补齐成「全部主键列」。
+
+    旧 id 只拼了 session/model/provider/task 四列，而 hermes 的主键其实是六列
+    （还含 billing_base_url 和 billing_mode）。服务地址实际出现过 `/v1` 和 `/v1/`
+    两种写法，同会话两行就会撞同一个 id；撞上时数据库按 id 覆盖，
+    后写的盖掉先写的——静默少一行用量，而且不报错。
+
+    旧 id 用冒号拼接，字段本身可能含冒号，没法反解析出原值，所以只能
+    **删掉这些源在库里的行、按源库当前内容重扫一遍**。
+    代价：源库已经清理掉的历史会话会随之消失。跑之前先备份 usage.db。
+    """
+    if not db_path.exists():
+        print("还没有数据。")
+        return 1
+    con = connect(db_path)
+    targets = []
+    for adapter in ADAPTERS:
+        if getattr(adapter, "virtual", False) or adapter.mode != "snapshot":
+            continue
+        for path in sorted(adapter.discover()):
+            if path.name.endswith("-wal"):
+                continue
+            origin = str(path)
+            before = con.execute(
+                "select count(*) from events where origin=?", (origin,)).fetchone()[0]
+            targets.append((adapter, path, origin, before))
+
+    if not targets:
+        print("没有需要迁移的快照源。")
+        con.close()
+        return 0
+
+    if dry_run:
+        for adapter, path, origin, before in targets:
+            print("  %-10s %s" % (adapter.name, origin))
+            print("             库里现有 %d 行，迁移后会按源库当前内容重写" % before)
+        print("\n（--dry-run，什么都没改）")
+        con.close()
+        return 0
+
+    for adapter, path, origin, before in targets:
+        try:
+            events = list(adapter.parse(path))
+        except SourceBusy:
+            # 源正在写或读不出来：这一轮不碰它的数据，下次再迁
+            print("  %-10s %s 读不出来，跳过" % (adapter.name, origin))
+            continue
+        con.execute("delete from events where origin=?", (origin,))
+        apply_snapshot(con, events, origin)
+        # 指纹作废，让下一轮按新数据重新判定，而不是拿旧指纹直接跳过
+        con.execute("delete from scan_state where key=?", ("fp:" + origin,))
+        con.commit()
+        after = con.execute(
+            "select count(*) from events where origin=?", (origin,)).fetchone()[0]
+        print("  %-10s %d 行 → %d 行" % (adapter.name, before, after))
+    con.close()
+    return 0
+
+
 def cmd_reset(args):
     """清掉某个来源的数据和文件游标，下次 scan 会重新解析。"""
     if not DEFAULT_DB.exists():
@@ -3255,6 +3792,11 @@ def main(argv=None):
     sub.add_parser("models", help="列出所有见过的模型及其定价状态")
     sub.add_parser("health", help="体检数据源是否还在、是否静默停止解析")
 
+    migrate_parser = sub.add_parser(
+        "migrate-ids",
+        help="把累计快照源的事件 id 补齐到全主键（一次性，跑之前先备份 usage.db）")
+    migrate_parser.add_argument("--dry-run", action="store_true", help="只看会影响哪些源")
+
     reset_parser = sub.add_parser("reset", help="清掉某个来源的数据，下次扫描重算")
     reset_parser.add_argument("--agent", help="例如 dsh / codex / hermes；不填则清全部")
 
@@ -3297,6 +3839,7 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     if args.command == "scan":
+        _trim_log_stream()
         stats = scan(DEFAULT_DB, verbose=args.verbose, force_balance=args.force_balance)
         total = 0
         parts = []
@@ -3305,10 +3848,8 @@ def main(argv=None):
             parts.append("%s %d/%d→%d" % (name, parsed, found, inserted))
         print("扫描完成：新增 %d 条事件  [%s]" % (total, "，".join(parts)))
         if DEFAULT_DB.exists():
-            _rows, _ = load_all_rows(DEFAULT_DB)
-            new_models = aggregate(_rows, load_prices() if load_prices() else {},
-                                   time.time() - 86400)["unpriced"]
-            if new_models:
+            new_models = _unpriced_models(DEFAULT_DB, time.time() - 86400)
+            if new_models and _warn_unpriced_once(DEFAULT_DB, new_models):
                 print("⚠ 有未定价模型：%s（补到 %s）" % ("、".join(new_models), PRICES_PATH))
     elif args.command == "report":
         report(DEFAULT_DB, args.days, args.by)
@@ -3386,6 +3927,8 @@ def main(argv=None):
         cmd_health(args)
     elif args.command == "reset":
         cmd_reset(args)
+    elif args.command == "migrate-ids":
+        return migrate_snapshot_ids(DEFAULT_DB, dry_run=args.dry_run)
     elif args.command == "breakdown":
         cmd_breakdown(args)
     elif args.command == "serve":
