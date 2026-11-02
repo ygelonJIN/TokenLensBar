@@ -77,6 +77,7 @@ cat > "$AGENTS/$SCAN_LABEL.plist" <<PLIST
         <string>/usr/bin/python3</string>
         <string>$RUNTIME/tokenlensbar.py</string>
         <string>scan</string>
+        <string>--no-balance</string>
     </array>
     <key>StartInterval</key><integer>300</integer>
     <key>RunAtLoad</key><true/>

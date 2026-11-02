@@ -13,6 +13,16 @@
       "name": "Xiaomi MiMo",
       "enabled": false,
       "secret": "mimo_cookie"
+    },
+    {
+      "id": "opencode-go",
+      "type": "opencode",
+      "name": "OpenCode Go",
+      "enabled": false,
+      "secret": "opencode_cookie",
+      "workspace_id": "",
+      "window": "monthly",
+      "mode": "go"
     }
   ]
 }

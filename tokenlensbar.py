@@ -23,6 +23,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -1317,7 +1318,7 @@ def _spawn_balance_refresh(verbose=False):
         return False
 
 
-def scan(db_path, verbose=False, force_balance=False):
+def scan(db_path, verbose=False, force_balance=False, skip_balance=False):
     con = connect(db_path)
     stats = {}
     for adapter in ADAPTERS:
@@ -1420,7 +1421,9 @@ def scan(db_path, verbose=False, force_balance=False):
     con.close()
     # 余额是可选功能；配置缺失、或还在冷却期内，这里什么都不做。
     # 该刷新时也只起一个独立进程，采集立刻返回。
-    if force_balance or _balance_refresh_due(db_path):
+    # skip_balance 给 launchd 用：那个上下文没有 Apple 事件/磁盘权限，
+    # 让它去刷只有失败（还会把错误写进状态、占用刷新窗口），余额交给 App 触发。
+    if not skip_balance and (force_balance or _balance_refresh_due(db_path)):
         if not _spawn_balance_refresh(verbose=verbose) and verbose:
             print("  ! 余额刷新进程起不来，保留上次缓存")
     return stats
@@ -2026,7 +2029,9 @@ def load_balances_config(path=None):
         if not pid or not ptype:
             continue
         default_names = {"deepseek": "DeepSeek", "mimo": "Xiaomi MiMo",
-                         "mimo_cookie": "Xiaomi MiMo"}
+                         "mimo_cookie": "Xiaomi MiMo",
+                         "opencode": "OpenCode Go", "opencode_go": "OpenCode Go"}
+        limits = entry.get("limits")
         providers.append({
             "id": pid,
             "type": ptype,
@@ -2036,6 +2041,11 @@ def load_balances_config(path=None):
             "enabled": entry.get("enabled", True) is not False,
             "auto_cookie": entry.get("auto_cookie", True) is not False,
             "via_browser": entry.get("via_browser", True) is not False,
+            # OpenCode 专用：工作区 id、读哪个额度窗口、go / zen 两种取数方式
+            "workspace_id": str(entry.get("workspace_id") or "").strip(),
+            "window": str(entry.get("window") or "monthly").strip().lower(),
+            "mode": str(entry.get("mode") or "go").strip().lower(),
+            "limits": dict(limits) if isinstance(limits, dict) else {},
         })
     return {"configured": bool(providers), "refresh_seconds": refresh,
             "providers": providers, "error": None}
@@ -2306,6 +2316,743 @@ def _fetch_mimo_items(entry, key):
     except BalanceAuthError as exc:
         # 保留鉴权语义（上层会换 Cookie 重试），但把代查失败的原因一起带上，
         # 免得真正的病灶被 401 的报错盖住。
+        if notes:
+            raise BalanceAuthError("%s；%s" % (exc, "；".join(notes)))
+        raise
+    except BalanceError as exc:
+        if notes:
+            raise BalanceError("%s；%s" % (exc, "；".join(notes)))
+        raise
+
+
+# --------------------------------------------------------------------------
+# OpenCode（Go 订阅 / Zen 预付费）：只有控制台页面，没有公开余额接口
+#
+# 控制台是 SolidStart SSR，数据直接写在 HTML 里：对象是 key:$R[n]={...}，
+# 标量是 key:值。所以取数 = 带 auth Cookie GET 页面 + 正则抽字段。
+#   /workspace/wrk_xxx/go   → rollingUsage / weeklyUsage / monthlyUsage
+#                             {status, resetInSec, usagePercent}
+#   /workspace/wrk_xxx      → balance（1e-8 美元，负数才是可用余额）
+# Go 的额度上限来自官方文档：滚动 5 小时 12 美元、每周 30、每月 60。
+# 余额栏显示"剩余额度" = 上限 × (1 - usagePercent/100)。
+# 未登录会 3xx 到 /console/login，所以这里不跟随重定向，直接判会话失效。
+# --------------------------------------------------------------------------
+
+OPENCODE_BASE = "https://opencode.ai"
+OPENCODE_COOKIE_DOMAIN = "opencode.ai"
+OPENCODE_COOKIE_NAMES = ("auth",)
+OPENCODE_COOKIE_SECRET = "opencode_cookie"
+OPENCODE_GO_LIMITS = {"rolling": 12.0, "weekly": 30.0, "monthly": 60.0}
+OPENCODE_BALANCE_UNIT = 1e8
+OPENCODE_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """控制台未登录会 3xx 到登录页：不跟随，才能认出"会话过期"。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENCODE_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _http_text(url, cookie=None, timeout=8.0,
+               auth_error="opencode.ai 会话已失效，请重新登录控制台"):
+    headers = {
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "User-Agent": OPENCODE_USER_AGENT,
+        "Cache-Control": "no-cache",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with _OPENCODE_OPENER.open(request, timeout=timeout) as response:
+            return response.read(4_000_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise BalanceAuthError(auth_error)
+        if 300 <= exc.code < 400:
+            location = (exc.headers.get("Location") or "") if exc.headers else ""
+            if "login" in location.lower():
+                raise BalanceAuthError("%s（被重定向到登录页）" % auth_error)
+            raise BalanceError("页面重定向到 %s" % (location or exc.code))
+        if exc.code == 429:
+            raise BalanceError("请求过于频繁")
+        raise BalanceError("HTTP %s" % exc.code)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        text = str(reason).lower()
+        if isinstance(reason, TimeoutError) or "timed out" in text or "timeout" in text:
+            raise BalanceError("网络超时")
+        raise BalanceError("网络错误")
+    except TimeoutError:
+        raise BalanceError("网络超时")
+
+
+def _to_float(value):
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _rsc_object(html, key):
+    """抽 `key:$R[n]={a:1,b:"x"}` 这种对象，返回 {字段: 原始字符串}。"""
+    if not html:
+        return None
+    pattern = r'(?:^|[^\w$])%s["\']?:\$R\[\d+\]=\{([^{}]*)\}' % re.escape(key)
+    match = re.search(pattern, html, re.I)
+    if not match:
+        return None
+    out = {}
+    for pair in match.group(1).split(","):
+        if ":" not in pair:
+            continue
+        name, raw = pair.split(":", 1)
+        name = name.strip().strip("\"'")
+        if not name:
+            continue
+        out[name] = raw.strip().strip("\"'")
+    return out
+
+
+def _ssr_scalar(html, key):
+    """抽 SolidJS SSR 标量：key:1.2 / key:"str" / key:!0 / key:null。"""
+    if not html:
+        return None
+    pattern = (r'(?:^|[^\w$])%s["\']?:\s*'
+               r'("([^"]*)"|(-?\d+(?:\.\d+)?)|(![01])|true|false|null)'
+               % re.escape(key))
+    match = re.search(pattern, html, re.I)
+    if not match:
+        return None
+    if match.group(2) is not None:
+        text = match.group(2)
+        number = _to_float(text)
+        return text if number is None else number
+    if match.group(3) is not None:
+        number = _to_float(match.group(3))
+        return number
+    if match.group(4) is not None:
+        return match.group(4) == "!0"
+    return None
+
+
+def opencode_windows(html):
+    """页面里的三个额度窗口：rolling（5 小时）/ weekly / monthly。"""
+    out = {}
+    for name in ("rollingUsage", "weeklyUsage", "monthlyUsage"):
+        obj = _rsc_object(html, name)
+        if not obj:
+            continue
+        percent = _to_float(obj.get("usagePercent"))
+        if percent is None:
+            continue
+        window = name[:-len("Usage")].lower()
+        out[window] = {
+            "usage_percent": percent,
+            "reset_in": _to_float(obj.get("resetInSec")
+                                  or obj.get("resetsInSeconds")),
+            "status": obj.get("status") or "",
+        }
+    return out
+
+
+def opencode_go_items(html, entry):
+    """Go 订阅：把 usagePercent 换算成剩余额度（美元）。"""
+    windows = opencode_windows(html)
+    if not windows:
+        raise BalanceError("页面里没有 Go 额度数据（可能不是 Go 订阅）")
+    window = str(entry.get("window") or "monthly").lower()
+    if window not in windows:
+        raise BalanceError("没有 %s 窗口数据（页面只有 %s）"
+                           % (window, "、".join(sorted(windows))))
+    limits = dict(OPENCODE_GO_LIMITS)
+    for name, value in (entry.get("limits") or {}).items():
+        number = _to_float(value)
+        if name in limits and number:
+            limits[str(name)] = number
+    limit = float(limits.get(window) or 0.0)
+    if limit <= 0:
+        raise BalanceError("额度上限没配")
+    percent = max(0.0, min(100.0, windows[window]["usage_percent"]))
+    remaining = limit * (1.0 - percent / 100.0)
+    return [{"currency": "USD", "total": round(remaining, 2),
+             "granted": None, "topped_up": None, "available": True}]
+
+
+def opencode_zen_items(html):
+    """Zen 预付费：balance 是 1e-8 美元，负数代表可用余额。"""
+    raw = _ssr_scalar(html, "balance")
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        raise BalanceError("页面里没有余额字段（可能不是 Zen 预付费）")
+    total = abs(float(raw)) / OPENCODE_BALANCE_UNIT
+    return [{"currency": "USD", "total": round(total, 4),
+             "granted": None, "topped_up": None, "available": True}]
+
+
+def validate_opencode_cookie(value):
+    """接受 `auth=Fe26.2**...` 或裸令牌，统一成 Cookie 头。只返回值，不打印。"""
+    text = " ".join(str(value or "").split())
+    if text.lower().startswith("cookie:"):
+        text = text[len("cookie:"):].strip()
+    if not text:
+        raise BalanceAuthError("未配置 opencode.ai 的 auth Cookie")
+    if text.startswith("auth="):
+        return text
+    return "auth=" + text
+
+
+def opencode_workspace_id(entry, cookie, timeout=8.0):
+    """控制台 id 优先取配置；没配就去 /console、/workspace 看它重定向到哪个 id。
+
+    新版控制台是 org_xxx（/console/org_xxx），老版是 wrk_xxx（/workspace/wrk_xxx）。
+    """
+    fixed = str(entry.get("workspace_id") or "").strip()
+    if re.match(r"(?:wrk|org)_[A-Za-z0-9]{8,}$", fixed):
+        return fixed
+    last_error = None
+    for base in ("/console", "/workspace"):
+        request = urllib.request.Request(
+            OPENCODE_BASE + base,
+            headers={"User-Agent": OPENCODE_USER_AGENT, "Cookie": cookie})
+        location = ""
+        body = ""
+        try:
+            with _OPENCODE_OPENER.open(request, timeout=timeout) as response:
+                body = response.read(1_000_000).decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            location = (exc.headers.get("Location") or "") if exc.headers else ""
+            if exc.code in (401, 403) or "login" in location.lower():
+                last_error = BalanceAuthError("opencode.ai 会话已失效，请重新登录控制台")
+                continue
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            text = str(reason).lower()
+            if isinstance(reason, TimeoutError) or "timed out" in text or "timeout" in text:
+                raise BalanceError("网络超时")
+            raise BalanceError("网络错误")
+        except TimeoutError:
+            raise BalanceError("网络超时")
+        for text in (location, body):
+            match = re.search(r"((?:wrk|org)_[A-Za-z0-9]{8,})", text)
+            if match:
+                return match.group(1)
+    if last_error is not None:
+        raise last_error
+    raise BalanceError("认不出控制台 id，请在 balances.json 里填 workspace_id")
+
+
+OPENCODE_ID_RE = r"(?:wrk|org)_[A-Za-z0-9]+"
+# 控制台的路径有两种写法：新版是 /console/org_xxx[/go]，老版是 /workspace/wrk_xxx[/go]。
+# 都试一遍，谁先给出额度数据就用谁。
+OPENCODE_BASES = ("/console", "/workspace")
+
+OPENCODE_SAFARI_JS = (
+    "(function(){try{function org(){var o='';try{o=localStorage.getItem('op"
+    "encode-console.org-id')||'';}catch(e){}var q=String.fromCharCode(34);o"
+    "=o.split(q).join('');o=o.split(' ').join('');if(o.indexOf('org_')<0){v"
+    "ar m=(location.href||'').match(/org_[A-Za-z0-9]+/);o=m?m[0]:'';}return"
+    " o;}function get(p){var x=new XMLHttpRequest();x.open('GET',p,false);x"
+    ".withCredentials=true;x.setRequestHeader('Accept','application/json');"
+    "var o=org();if(o){x.setRequestHeader('x-org-id',o);}x.send();return {s"
+    ":x.status,t:x.responseText||'',u:x.responseURL||''};}var go=get('/cons"
+    "ole/api/go/status');var bill=get('/console/api/billing/status');var tx"
+    "t=(document.body&&document.body.innerText)?document.body.innerText:'';"
+    'return JSON.stringify({org:org(),goStatus:go.s,go:go.t.slice(0,5000),b'
+    'illStatus:bill.s,bill:bill.t.slice(0,2500),text:txt.slice(0,2500)});}c'
+    "atch(e){return 'ERR:JS '+String(e);}})()"
+)
+OPENCODE_SAFARI_SPLIT = "<<<ROOT>>>"
+
+# Chrome 的 AppleScript 只认 `execute ... javascript`，而且要用户在
+# 「视图 → 开发者」里勾上「允许 Apple 事件中的 JavaScript」。两个都要试：
+# 用哪个浏览器登录控制台是用户的自由，我们只找带 opencode.ai 的那个标签页。
+BROWSER_APPS = (
+    ("Safari", "do JavaScript"),
+    ("Google Chrome", "execute t javascript"),
+)
+
+
+def _tabs_script(app, needle):
+    """列出某个浏览器里 URL 含 needle 的标签：每行 `窗口序号,标签序号,URL`。
+
+    这里刻意不用局部变量：AppleScript 在 tell 块里对变量的作用域很不友好
+    （实测会报「变量 r 没有定义」），全部用内联表达式最省事。
+    """
+    return ('tell application "%s"\n'
+            '  set out to ""\n'
+            '  repeat with wi from 1 to count of windows\n'
+            '    repeat with ti from 1 to count of tabs of window wi\n'
+            '      if ((URL of tab ti of window wi) contains "%s") then\n'
+            '        set out to out & (wi as text) & "," & (ti as text) & "," '
+            '& (URL of tab ti of window wi) & linefeed\n'
+            '      end if\n'
+            '    end repeat\n'
+            '  end repeat\n'
+            '  return out\n'
+            'end tell' % (app, needle))
+
+
+def _tab_js_script(app, window_index, tab_index, js):
+    if app == "Safari":
+        return ('tell application "Safari" to return do JavaScript "%s" '
+                'in tab %d of window %d' % (js, tab_index, window_index))
+    return ('tell application "Google Chrome" to return execute '
+            '(tab %d of window %d) javascript "%s"'
+            % (tab_index, window_index, js))
+
+
+def _osascript(script, timeout):
+    proc = subprocess.run(["/usr/bin/osascript", "-e", script],
+                          capture_output=True, timeout=timeout)
+    text = proc.stdout.decode("utf-8", "replace").strip()
+    if proc.returncode != 0 or not text:
+        err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise BalanceError(err[-1] if err else "osascript 无输出")
+    return text
+
+
+def browser_tabs(app, needle="opencode.ai", timeout=10.0):
+    """[(窗口序号, 标签序号, url)]；浏览器没跑返回 None，权限问题往上抛。
+
+    判断"没跑"用 osascript 自己的错误码（-600 / 连接无效），不再依赖 pgrep：
+    沙箱里 pgrep 可能被拦，会把"没权限"误判成"没在运行"。
+    """
+    try:
+        text = _osascript(_tabs_script(app, needle), timeout)
+    except subprocess.TimeoutExpired:
+        raise BalanceError("%s 枚举标签超时" % app)
+    except OSError:
+        return None
+    except BalanceError as exc:
+        message = str(exc)
+        if "-600" in message or "not running" in message.lower() \
+                or "连接无效" in message or "Application isn" in message:
+            return None
+        raise
+    tabs = []
+    for line in text.splitlines():
+        parts = line.split(",", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            tabs.append((int(parts[0]), int(parts[1]), parts[2].strip()))
+        except ValueError:
+            continue
+    return tabs
+
+
+def _run_browser_js(js, needle, timeout=15.0):
+    """在装有目标页面的浏览器标签里跑 JS：Safari 优先，Chrome 兜底。
+
+    某个标签页没登录（被跳到 /console/login）不算终点——同一浏览器可能还有
+    别的标签页、别的浏览器可能登录着，所以逐个试，全部失败才报错。
+    """
+    notes = []
+    started = False
+    logged_out = False
+    for app, _call in BROWSER_APPS:
+        try:
+            tabs = browser_tabs(app, needle)
+        except BalanceError as exc:
+            notes.append("%s：%s" % (app, exc))
+            continue
+        if tabs is None:
+            continue
+        started = True
+        if not tabs:
+            notes.append("%s 里没有 %s 的标签页" % (app, needle))
+            continue
+        for window_index, tab_index, url in tabs:
+            try:
+                text = _osascript(
+                    _tab_js_script(app, window_index, tab_index, js), timeout)
+            except subprocess.TimeoutExpired:
+                notes.append("%s 标签页超时" % app)
+                continue
+            except OSError:
+                notes.append("%s：osascript 不可用" % app)
+                continue
+            except BalanceError as exc:
+                notes.append("%s：%s" % (app, _safari_error_hint(str(exc))))
+                continue
+            if text.startswith("ERR:LOGIN"):
+                logged_out = True
+                notes.append("%s 的标签页没登录（%s）" % (app, url[:60]))
+                continue
+            if text.startswith("ERR:"):
+                notes.append("%s：%s" % (app, text[:80]))
+                continue
+            return text
+    if not started:
+        raise BalanceError("Safari / Chrome 都没在运行（代查需要开着控制台标签页）")
+    if logged_out:
+        raise BalanceAuthError(
+            "浏览器里的 opencode.ai 没登录（页面被跳到 /console/login）："
+            "在标签页里登录控制台后点「立即采集」。明细：%s" % "；".join(notes))
+    raise BalanceError("；".join(notes) if notes else "代查失败")
+
+
+OPENCODE_PROBE_JS = (
+    '(function(){try{var NL=String.fromCharCode(10),out=[],i;function get(p'
+    "){var x=new XMLHttpRequest();x.open('GET',p,false);x.withCredentials=t"
+    "rue;x.setRequestHeader('Accept','text/html,application/xhtml+xml');x.s"
+    'end();return x;}var dom=document.documentElement?document.documentElem'
+    "ent.outerHTML:'';var here=location.href||'';out.push('here='+here);out"
+    ".push('domLen='+dom.length+' monthly='+(dom.indexOf('monthlyUsage')>=0"
+    ")+' rolling='+(dom.indexOf('rollingUsage')>=0)+' usagePercent='+(dom.i"
+    "ndexOf('usagePercent')>=0)+' balanceKey='+(dom.indexOf('balance')>=0))"
+    ';var it=(document.body&&document.body.innerText)?document.body.innerTe'
+    "xt:'';it=it.split(String.fromCharCode(13)).join(' ');it=it.split(Strin"
+    "g.fromCharCode(10)).join(' | ');out.push('innerText='+it.slice(0,1400)"
+    ");var res=[];try{var en=performance.getEntriesByType('resource');for(i"
+    "=0;i<en.length&&res.length<60;i++){var nm=en[i].name;if(nm.indexOf('/_"
+    "build/')>=0||nm.indexOf('.js')>=0||nm.indexOf('.css')>=0||nm.indexOf('"
+    ".woff')>=0||nm.indexOf('.svg')>=0||nm.indexOf('.png')>=0){continue;}re"
+    "s.push(en[i].initiatorType+' '+nm.split('opencode.ai').pop());}}catch("
+    "e){res.push('ERR');}out.push('resources='+res.join(' ; '));var ls=[];t"
+    'ry{for(i=0;i<localStorage.length;i++){ls.push(localStorage.key(i));}}c'
+    "atch(e){ls.push('ERR');}out.push('localStorage='+ls.join(','));out.pus"
+    "h('docCookie='+document.cookie.length);var m=here.match(/(wrk|org)_[A-"
+    "Za-z0-9]{8,}/);out.push('tabId='+(m?m[0]:'none'));return out.join(NL);"
+    "}catch(e){return 'ERR:JS '+String(e);}})()"
+)
+
+
+def browser_probe(js=OPENCODE_SAFARI_JS, needle="opencode.ai", timeout=15.0):
+    """逐浏览器、逐标签页跑一次代查，把原始结果摊开——排查用。"""
+    out = []
+    for app, _call in BROWSER_APPS:
+        try:
+            tabs = browser_tabs(app, needle)
+        except BalanceError as exc:
+            out.append((app, "枚举标签失败：%s" % exc))
+            continue
+        if tabs is None:
+            out.append((app, "没在运行"))
+            continue
+        if not tabs:
+            out.append((app, "没有 %s 的标签页" % needle))
+            continue
+        for window_index, tab_index, url in tabs:
+            try:
+                text = _osascript(
+                    _tab_js_script(app, window_index, tab_index, js), timeout)
+            except subprocess.TimeoutExpired:
+                out.append((app, "标签 %s：超时" % url[:48]))
+                continue
+            except (OSError, BalanceError) as exc:
+                out.append((app, "标签 %s：%s" % (url[:48], exc)))
+                continue
+            out.append((app, "标签 %s → %s" % (url[:48],
+                                               text.splitlines()[0][:70])))
+            if not text.startswith("ERR:"):
+                break
+    return out
+
+
+OPENCODE_GO_JSON_JS = (
+    "(function(){try{function org(){var o='';try{o=localStorage.getItem('op"
+    "encode-console.org-id')||'';}catch(e){}var q=String.fromCharCode(34);o"
+    "=o.split(q).join('');o=o.split(' ').join('');if(o.indexOf('org_')<0){v"
+    "ar m=(location.href||'').match(/org_[A-Za-z0-9]+/);o=m?m[0]:'';}return"
+    " o;}function get(p){var x=new XMLHttpRequest();x.open('GET',p,false);x"
+    ".withCredentials=true;x.setRequestHeader('Accept','application/json');"
+    "var o=org();if(o){x.setRequestHeader('x-org-id',o);}x.send();return x."
+    "status+'|'+(x.responseText||'');}var out=[];out.push('ORG_ID='+org());"
+    "out.push('GO_STATUS='+get('/console/api/go/status').slice(0,2500));out"
+    ".push('BILLING_STATUS='+get('/console/api/billing/status').slice(0,120"
+    "0));out.push('DRAWER='+get('/console/api/billing/drawer/usage').slice("
+    "0,1200));return out.join(String.fromCharCode(10));}catch(e){return 'ER"
+    "R:JS '+String(e);}})()"
+)
+
+
+def opencode_probe_report(timeout=20.0):
+    """把控制台的各条路由逐个探一遍，回报状态码和有没有余额/额度字段。"""
+    return _run_browser_js(OPENCODE_PROBE_JS, "opencode.ai", timeout=timeout)
+
+
+OPENCODE_WINDOW_HINTS = (
+    ("rolling", ("rolling", "5-hour", "5hour", "five-hour", "fivehour", "hourly",
+                 "shortterm", "short-term")),
+    ("weekly", ("weekly", "week", "7-day", "7day")),
+    ("monthly", ("monthly", "month", "30-day", "30day")),
+)
+
+
+def _opencode_window_name(parts):
+    joined = " ".join(parts).lower()
+    for window, hints in OPENCODE_WINDOW_HINTS:
+        for hint in hints:
+            if hint in joined:
+                return window
+    return None
+
+
+def _opencode_percent_windows(node):
+    """在不知道 JSON 结构的前提下，按"键名里带 percent"把三个窗口的比例挖出来。"""
+    found = {}
+
+    def walk(item, path):
+        if isinstance(item, dict):
+            for key, value in item.items():
+                lower = str(key).lower()
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    if "percent" in lower or lower in ("pct", "usage", "usedratio"):
+                        window = _opencode_window_name(path + [lower])
+                        if window and window not in found:
+                            found[window] = float(value)
+                else:
+                    walk(value, path + [lower])
+        elif isinstance(item, list):
+            for value in item:
+                walk(value, path)
+
+    walk(node, [])
+    # 有的接口给 0~1 的比例，有的给 0~100 的百分数
+    if found and all(0.0 <= value <= 1.0 for value in found.values()):
+        found = {key: value * 100.0 for key, value in found.items()}
+    return found
+
+
+def _opencode_percent_from_text(text):
+    """兜底：从渲染出来的页面文字里抠 `5-hour window … 12% used`。"""
+    out = {}
+    patterns = {
+        "rolling": r"(?:5-hour window|five-hour window|rolling window|rolling)",
+        "weekly": r"(?:weekly|this week)",
+        "monthly": r"(?:monthly|this month)",
+    }
+    for window, label in patterns.items():
+        match = re.search(
+            r"%s[^0-9%%]{0,60}([0-9]+(?:\.[0-9]+)?)\s*%%\s*used" % label,
+            text or "", re.I)
+        if match:
+            out[window] = float(match.group(1))
+    return out
+
+
+def _opencode_credit_usd(text):
+    match = re.search(r"\$([0-9]+(?:\.[0-9]+)?)[^0-9]{0,12}available credit",
+                      text or "", re.I)
+    return float(match.group(1)) if match else None
+
+
+OPENCODE_MICRO_CENTS = 1e8  # 1 美元 = 1e8 micro-cents
+OPENCODE_METERS = (("fiveHour", "rolling"), ("week", "weekly"),
+                   ("month", "monthly"))
+
+
+def _opencode_meters(go_json):
+    """从 access.meters 里读每个窗口的 limit/used（单位 micro-cents）。
+
+    这是最准的一路：接口直接给了金额，不用拿百分比乘猜测的上限。
+    """
+    if not isinstance(go_json, dict):
+        return {}
+    access = go_json.get("access")
+    meters = (access or {}).get("meters") if isinstance(access, dict) else None
+    if not isinstance(meters, dict):
+        return {}
+    out = {}
+    for source, window in OPENCODE_METERS:
+        item = meters.get(source)
+        if not isinstance(item, dict):
+            continue
+        limit = _to_float(item.get("limitMicroCents"))
+        used = _to_float(item.get("usedMicroCents")) or 0.0
+        if limit is None or limit <= 0:
+            continue
+        out[window] = {
+            "limit": limit / OPENCODE_MICRO_CENTS,
+            "used": used / OPENCODE_MICRO_CENTS,
+            "remaining": max(0.0, (limit - used) / OPENCODE_MICRO_CENTS),
+        }
+    return out
+
+
+def opencode_items_from_payload(payload, entry):
+    """从控制台 JSON + 渲染文字里算出余额项。"""
+    go_json = payload.get("go_json") or {}
+    mode = str(entry.get("mode") or "go").lower()
+    if mode == "go":
+        meters = _opencode_meters(go_json)
+        if meters:
+            window = str(entry.get("window") or "monthly").lower()
+            if window not in meters:
+                raise BalanceError("接口里没有 %s 窗口（只有 %s）"
+                                   % (window, "、".join(sorted(meters))))
+            return [{"currency": "USD", "total": round(meters[window]["remaining"], 2),
+                     "granted": None, "topped_up": None, "available": True}]
+    windows = _opencode_percent_windows(go_json)
+    if not windows and payload.get("go_text"):
+        # 老版 /workspace 页面把窗口塞在 SSR 里，兜住这种
+        legacy = opencode_windows(payload["go_text"])
+        if legacy:
+            windows = {name: item["usage_percent"] for name, item in legacy.items()}
+    if not windows:
+        windows = _opencode_percent_from_text(payload.get("text") or "")
+    if not windows:
+        raise BalanceError("控制台没有给出额度数据（接口 %s，JSON 开头 %r）"
+                           % (payload.get("go_status"), (payload.get("go_text") or "")[:120]))
+    mode = str(entry.get("mode") or "go").lower()
+    if mode == "zen":
+        credit = _opencode_credit_usd(payload.get("text") or "")
+        if credit is None:
+            raise BalanceError("页面里没找到可用额度（available credit）")
+        return [{"currency": "USD", "total": round(credit, 2),
+                 "granted": None, "topped_up": None, "available": True}]
+    window = str(entry.get("window") or "monthly").lower()
+    if window not in windows:
+        raise BalanceError("没有 %s 窗口数据（接口只给了 %s）"
+                           % (window, "、".join(sorted(windows))))
+    limits = dict(OPENCODE_GO_LIMITS)
+    for name, value in (entry.get("limits") or {}).items():
+        number = _to_float(value)
+        if name in limits and number:
+            limits[str(name)] = number
+    percent = max(0.0, min(100.0, windows[window]))
+    remaining = float(limits.get(window) or 0.0) * (1.0 - percent / 100.0)
+    return [{"currency": "USD", "total": round(remaining, 2),
+             "granted": None, "topped_up": None, "available": True}]
+
+
+def _opencode_payload_from_text(text):
+    """把代查返回的 JSON 串拆成 {go_status, go_json, go_text, text}。"""
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        raise BalanceError("代查返回格式异常")
+    if not isinstance(raw, dict):
+        raise BalanceError("代查返回格式异常")
+    go_text = str(raw.get("go") or "")
+    go_json = None
+    if go_text.strip().startswith("{"):
+        try:
+            go_json = json.loads(go_text)
+        except ValueError:
+            go_json = None
+    return {
+        "go_status": raw.get("goStatus"),
+        "go_text": go_text,
+        "go_json": go_json,
+        "bill": raw.get("bill") or "",
+        "text": str(raw.get("text") or ""),
+    }
+
+
+def fetch_opencode_balance_via_safari(entry, timeout=20.0):
+    """浏览器代查：让已登录的标签页去打控制台自己的 JSON 接口。
+
+    这条路不碰 Cookie 文件，也就不需要完全磁盘访问权限——页面自己的登录态
+    会带上，我们只拿结果。接口给的 JSON 认不出来时，退回解析页面渲染文字。
+    """
+    text = _run_browser_js(OPENCODE_SAFARI_JS, "opencode.ai", timeout=timeout)
+    if text.startswith("ERR:NO_TAB"):
+        raise BalanceError("浏览器里没有打开 opencode.ai 标签页（开着就能代查）")
+    if text.startswith("ERR:LOGIN"):
+        raise BalanceAuthError(
+            "浏览器里的 opencode.ai 没登录（被跳到 /console/login）："
+            "在标签页里登录控制台后点「立即采集」")
+    if text.startswith("ERR:JS"):
+        raise BalanceError(_safari_error_hint(text[6:].strip()))
+    payload = _opencode_payload_from_text(text)
+    return opencode_items_from_payload(payload, entry)
+
+
+def fetch_opencode_balance(entry, cookie, timeout=8.0):
+    """直连控制台接口：`/console/api/go/status` 给额度，billing 给可用额度。"""
+    header = validate_opencode_cookie(cookie)
+    org_id = str(entry.get("workspace_id") or "").strip()
+    if not org_id:
+        try:
+            org_id = opencode_workspace_id(entry, header, timeout=timeout)
+        except BalanceError:
+            org_id = ""
+    payload = {"go_status": None, "go_text": "", "go_json": None,
+               "bill": "", "text": ""}
+    last_error = None
+    for path in ("/console/api/go/status", "/workspace/api/go/status"):
+        try:
+            body = _http_text(OPENCODE_BASE + path, header, timeout=timeout)
+        except BalanceAuthError:
+            raise
+        except BalanceError as exc:
+            last_error = exc
+            continue
+        payload["go_status"] = 200
+        payload["go_text"] = body
+        if body.lstrip().startswith("{"):
+            try:
+                payload["go_json"] = json.loads(body)
+            except ValueError:
+                payload["go_json"] = None
+        break
+    if payload["go_json"] is None and not payload["go_text"]:
+        raise BalanceError("控制台接口读不到（%s）" % (last_error or "没有返回"))
+    try:
+        body = _http_text(OPENCODE_BASE + "/console/api/billing/status", header,
+                          timeout=timeout)
+        payload["bill"] = body
+        if body.lstrip().startswith("{"):
+            try:
+                credit = _opencode_percent_windows(json.loads(body))
+            except ValueError:
+                credit = {}
+            del credit  # 结构不确定，先只留原文
+        match = re.search(r'"(?:availableCredit|credit|balance)[A-Za-z]*"\s*:\s*(-?[0-9.]+)',
+                          body)
+        if match:
+            try:
+                value = float(match.group(1))
+            except ValueError:
+                value = None
+            if value is not None:
+                payload["credit_usd"] = abs(value) / 1e8 if abs(value) > 1000 else abs(value)
+    except BalanceError:
+        pass
+    if entry.get("mode", "go") == "zen":
+        credit = payload.get("credit_usd")
+        if credit is None:
+            raise BalanceError("控制台没有给出可用额度")
+        return [{"currency": "USD", "total": round(credit, 2),
+                 "granted": None, "topped_up": None, "available": True}]
+    return opencode_items_from_payload(payload, entry)
+
+
+def _fetch_opencode_items(entry, key):
+    """取数顺序：Safari 代查（不用权限）→ 磁盘 Cookie → secrets.json 里手填的。"""
+    notes = []
+    if entry.get("via_browser", True):
+        try:
+            return fetch_opencode_balance_via_safari(entry)
+        except BalanceAuthError as exc:
+            notes.append(str(exc))
+        except BalanceError as exc:
+            notes.append(str(exc))
+    cookie = ""
+    if entry.get("auto_cookie", True):
+        try:
+            cookie = read_safari_opencode_cookie()
+        except CookieError as exc:
+            notes.append(str(exc))
+    if not cookie and key:
+        cookie = key
+    if not cookie:
+        raise BalanceAuthError(
+            "没找到 opencode.ai 登录态%s。手动兜底：python3 tokenlensbar.py "
+            "cookie --opencode --from-clipboard"
+            % ("（%s）" % "；".join(notes) if notes else ""))
+    try:
+        return fetch_opencode_balance(entry, cookie)
+    except BalanceAuthError as exc:
         if notes:
             raise BalanceAuthError("%s；%s" % (exc, "；".join(notes)))
         raise
@@ -2631,20 +3378,74 @@ def _cookie_records(data, path):
     return _bc_records(data)
 
 
-def _mimo_picks(records):
-    """从记录里挑 MiMo 的两个字段；前两段字符串里名字和域名的顺序随版式变，顺序无关。"""
+def _cookie_picks(records, names, host_ok):
+    """从记录里挑指定字段；前两段字符串里名字和域名的顺序随版式变，所以顺序无关。
+
+    names 是本平台要的 Cookie 名，host_ok 判断这条记录是否属于该域。
+    同一个名字出现多次时取最近的一条。
+    """
     picks = {}
     for rec in records:
         strings = rec["strings"]
         head = strings[:2]
-        name = next((text for text in head if text in MIMO_COOKIE_NAMES), None)
-        if name is None or not any(_mimo_host_ok(text) for text in head):
+        name = next((text for text in head if text in names), None)
+        if name is None or not any(host_ok(text) for text in head):
             continue
         value = strings[3]
         old = picks.get(name)
         if old is None or (rec["ts"] or -1) >= (old[0] or -1):
             picks[name] = (rec["ts"], value)
     return picks
+
+
+def _mimo_picks(records):
+    """从记录里挑 MiMo 的两个字段。"""
+    return _cookie_picks(records, MIMO_COOKIE_NAMES, _mimo_host_ok)
+
+
+def _opencode_host_ok(domain):
+    host = domain.strip().lower()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0].split(":", 1)[0].lstrip(".")
+    return host == OPENCODE_COOKIE_DOMAIN or host.endswith("." + OPENCODE_COOKIE_DOMAIN)
+
+
+def read_safari_opencode_cookie(paths=None):
+    """从各 Cookie 库里取 opencode.ai 的 auth 会话。值只出现在返回值里。"""
+    candidates = list(paths) if paths else _cookie_file_candidates()
+    problems = []
+    best = None
+    for path in candidates:
+        path = Path(path).expanduser()
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            raise CookieError(
+                "没有权限读 Safari Cookie：系统设置 → 隐私与安全性 → 完全磁盘访问权限，"
+                "给运行它的程序（终端或 TokenLensBar）授权后重试")
+        except OSError as exc:
+            problems.append("%s：%s" % (path.name, exc))
+            continue
+        try:
+            fields = _cookie_picks(_cookie_records(data, path),
+                                   OPENCODE_COOKIE_NAMES, _opencode_host_ok)
+        except (CookieError, sqlite3.Error) as exc:
+            problems.append("%s：%s" % (path.name, exc))
+            continue
+        if "auth" not in fields or not fields["auth"][1]:
+            problems.append("%s：没有 opencode.ai 的 auth" % path.name)
+            continue
+        stamp = fields["auth"][0] or 0
+        if best is None or stamp >= best[0]:
+            best = (stamp, "auth=" + fields["auth"][1])
+    if best is not None:
+        return best[1]
+    raise CookieError("没找到 opencode.ai 的登录会话%s" % (
+        "（%s）" % "；".join(problems) if problems else
+        "（先在 Safari 登录 opencode.ai 控制台）"))
 
 
 def read_safari_mimo_cookie(paths=None):
@@ -2769,6 +3570,8 @@ def _provider_key(secrets, entry):
         key = os.environ.get("DEEPSEEK_API_KEY")
     if not key and entry["type"] in ("mimo", "mimo_cookie"):
         key = os.environ.get("MIMO_COOKIE")
+    if not key and entry["type"] in ("opencode", "opencode_go"):
+        key = os.environ.get("OPENCODE_COOKIE")
     return (key or "").strip()
 
 
@@ -2812,8 +3615,12 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
         # 浏览器代查不需要 Key；开着代查时没配 Cookie 也照常取数。
         browser_ready = (entry["type"] in ("mimo", "mimo_cookie")
                          and entry.get("via_browser", True))
+        # OpenCode 的登录态默认就从 Safari 读，没有 Cookie 也能取。
+        if entry["type"] in ("opencode", "opencode_go") and entry.get("auto_cookie", True):
+            browser_ready = True
         if not key and not browser_ready:
-            missing = ("未配置 Cookie" if entry["type"] in ("mimo", "mimo_cookie")
+            missing = ("未配置 Cookie" if entry["type"] in ("mimo", "mimo_cookie",
+                                                            "opencode", "opencode_go")
                        else "未配置 Key")
             message = secret_error or missing
             con.execute(
@@ -2833,6 +3640,8 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
                 got = fetch_deepseek_balance(entry, entry_key)
             elif entry["type"] in ("mimo", "mimo_cookie"):
                 got = _fetch_mimo_items(entry, entry_key)
+            elif entry["type"] in ("opencode", "opencode_go"):
+                got = _fetch_opencode_items(entry, entry_key)
             else:
                 raise BalanceError("暂不支持 %s" % entry["type"])
             if not got:
@@ -3048,6 +3857,8 @@ def _provider_aliases(entry):
         aliases.add("deepseek")
     if ptype in ("mimo", "mimo_cookie"):
         aliases.update({"xiaomi", "mimo", "xiaomi mimo"})
+    if ptype in ("opencode", "opencode_go"):
+        aliases.update({"opencode", "opencode-go", "opencode zen", "zen"})
     return {item for item in aliases if item}
 
 
@@ -3058,10 +3869,15 @@ def _event_matches_provider(item, entry):
         for alias in aliases:
             if alias == provider or alias in provider or provider in alias:
                 return True
+        # 有明确的 provider 且对不上，就不再按型号瞎猜：
+        # 否则 opencode-go 上跑的 deepseek 模型会被算进 DeepSeek 的余额缺口。
+        return False
     model = (item.get("model") or "").lower()
     if "deepseek" in aliases and "deepseek" in model:
         return True
     if "mimo" in aliases and ("mimo" in model or "xiaomi" in model):
+        return True
+    if "opencode" in aliases and "opencode" in model:
         return True
     return False
 
@@ -3335,7 +4151,9 @@ def _cookie_check():
 
 
 def cmd_cookie(args):
-    """MiMo 余额 Cookie：默认从 Safari 自动续期，--from-clipboard 剪贴板兜底。"""
+    """余额 Cookie：MiMo 默认从 Safari 自动续期；`--opencode` 处理 opencode.ai。"""
+    if getattr(args, "opencode", False):
+        return _cookie_opencode(args)
     if getattr(args, "check", False):
         return _cookie_check()
     try:
@@ -3351,6 +4169,86 @@ def cmd_cookie(args):
         print("Cookie 更新失败：%s" % exc)
         return 1
     print("MiMo Cookie 已更新（内容不显示）。点「立即采集」或 "
+          "python3 tokenlensbar.py balance --refresh 生效。")
+    return 0
+
+
+def _opencode_cookie_secret_name(config_path=None):
+    config = load_balances_config(config_path)
+    for entry in config["providers"]:
+        if entry.get("type") in ("opencode", "opencode_go"):
+            return entry.get("secret") or entry["id"], entry
+    return OPENCODE_COOKIE_SECRET, None
+
+
+def _cookie_opencode(args):
+    """opencode.ai 的 auth Cookie：从 Safari 读，或从剪贴板粘。值不打印。"""
+    secret_name, entry = _opencode_cookie_secret_name()
+    if getattr(args, "probe", False):
+        if getattr(args, "json", False):
+            try:
+                print(_run_browser_js(OPENCODE_GO_JSON_JS, "opencode.ai", timeout=20.0))
+            except BalanceError as exc:
+                print("探测失败：%s" % exc)
+                return 1
+            return 0
+        try:
+            report = opencode_probe_report()
+        except BalanceError as exc:
+            print("探测失败：%s" % exc)
+            return 1
+        print(report)
+        try:
+            Path("/tmp/tokenlensbar-probe.txt").write_text(report + "\n",
+                                                           encoding="utf-8")
+            print("\n（结果也写进了 /tmp/tokenlensbar-probe.txt）")
+        except OSError:
+            pass
+        return 0
+    if getattr(args, "check", False):
+        stored, _secret_error = load_secrets()
+        lines = ["opencode.ai 登录态体检",
+                 "  secrets 字段：%s（%s）" % (
+                     secret_name, "已配置" if stored.get(secret_name) else "未配置")]
+        try:
+            read_safari_opencode_cookie()
+            lines.append("  Safari 里的 Cookie 库：找到 auth")
+        except CookieError as exc:
+            lines.append("  Safari 里的 Cookie 库：%s" % exc)
+        try:
+            items = fetch_opencode_balance_via_safari(
+                entry or {"type": "opencode", "window": "monthly"})
+            lines.append("  Safari 代查：可用，当前剩余 %s" %
+                         ("$%.2f" % items[0]["total"]))
+        except BalanceError as exc:
+            lines.append("  Safari 代查：%s" % exc)
+        for app, detail in browser_probe():
+            lines.append("    %s：%s" % (app, detail))
+        if entry:
+            lines.append("  工作区：%s" % (entry.get("workspace_id") or "自动探测"))
+            lines.append("  取数窗口：%s（%s）" % (entry["window"], entry["mode"]))
+        # 读 Cookie 的权限是按"真正去打开文件的那个可执行文件"算的，
+        # 不是按菜单栏 App。给 App 开的完全磁盘访问权限传不到 python 子进程，
+        # 所以这里把当前解释器真身打出来，方便直接往 FDA 里加。
+        lines.append("  当前解释器：%s" % os.path.realpath(sys.executable))
+        lines.append("  想不用权限：Safari 开着任意 opencode.ai 页面，走代查")
+        print("\n".join(lines))
+        return 0
+    try:
+        if getattr(args, "from_clipboard", False):
+            proc = subprocess.run(["pbpaste"], capture_output=True, check=False)
+            header = validate_opencode_cookie(proc.stdout.decode("utf-8", "replace"))
+        else:
+            header = read_safari_opencode_cookie()
+    except (CookieError, BalanceError) as exc:
+        print("Cookie 更新失败：%s" % exc)
+        return 1
+    try:
+        save_mimo_cookie(header, secret_name=secret_name)
+    except CookieError as exc:
+        print("Cookie 保存失败：%s" % exc)
+        return 1
+    print("OpenCode Cookie 已更新（内容不显示）。点「立即采集」或 "
           "python3 tokenlensbar.py balance --refresh 生效。")
     return 0
 
@@ -3783,6 +4681,8 @@ def main(argv=None):
     scan_parser.add_argument("-v", "--verbose", action="store_true")
     scan_parser.add_argument("--force-balance", action="store_true",
                              help="忽略余额缓存间隔，立即刷新余额")
+    scan_parser.add_argument("--no-balance", action="store_true",
+                             help="本轮不碰余额（launchd 用：那个上下文没有浏览器权限）")
 
     report_parser = sub.add_parser("report", help="看报表")
     report_parser.add_argument("--days", type=int, default=7, help="0 = 全部历史")
@@ -3832,6 +4732,12 @@ def main(argv=None):
                                help="从剪贴板读 Cookie 写入（自动读不到时的手动兜底）")
     cookie_parser.add_argument("--check", action="store_true",
                                help="只体检状态，不改任何东西")
+    cookie_parser.add_argument("--opencode", action="store_true",
+                               help="处理 opencode.ai 的 auth Cookie（Go/Zen 余额）")
+    cookie_parser.add_argument("--probe", action="store_true",
+                               help="逐个探测 opencode 控制台路由，回报哪条页面有数据")
+    cookie_parser.add_argument("--json", action="store_true",
+                               help="配合 --probe：直接打印 go/status 等接口的原始 JSON")
 
     serve_parser = sub.add_parser("serve", help="启动本地看板")
     serve_parser.add_argument("--port", type=int, default=8787)
@@ -3840,7 +4746,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "scan":
         _trim_log_stream()
-        stats = scan(DEFAULT_DB, verbose=args.verbose, force_balance=args.force_balance)
+        stats = scan(DEFAULT_DB, verbose=args.verbose,
+                     force_balance=args.force_balance,
+                     skip_balance=getattr(args, "no_balance", False))
         total = 0
         parts = []
         for name, (found, parsed, inserted) in stats.items():
