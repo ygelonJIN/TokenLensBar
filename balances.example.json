@@ -17,9 +17,9 @@
     {
       "id": "opencode-go",
       "type": "opencode",
-      "name": "OpenCode Go",
+      "name": "OpenCode Go 额度",
       "enabled": false,
-      "secret": "opencode_cookie",
+      "secret": "opencode_key",
       "workspace_id": "",
       "window": "monthly",
       "mode": "go"

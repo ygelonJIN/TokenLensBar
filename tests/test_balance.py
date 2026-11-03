@@ -52,6 +52,20 @@ class FakeResponse:
         return False
 
 
+def _no_key_error():
+    """辅助：没有 Key 时 fetch_opencode_balance_by_key 抛什么。"""
+    import tokenlensbar as tl_mod
+    original = tl_mod.opencode_api_key
+    tl_mod.opencode_api_key = lambda entry, key: ""
+    try:
+        tl_mod.fetch_opencode_balance_by_key({}, "")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return exc
+    finally:
+        tl_mod.opencode_api_key = original
+
+
 def main():
     passed = True
     with tempfile.TemporaryDirectory() as tmp:
@@ -386,6 +400,8 @@ def main():
 
         original_browser = tl._run_browser_js
         original_read = tl.read_safari_opencode_cookie
+        original_key = tl.opencode_api_key
+        tl.opencode_api_key = lambda entry, key: ""
 
         def no_cookie(paths=None):
             raise tl.CookieError("没有权限读 Safari Cookie")
@@ -399,6 +415,7 @@ def main():
         finally:
             tl._run_browser_js = original_browser
             tl.read_safari_opencode_cookie = original_read
+            tl.opencode_api_key = original_key
         passed &= check("代查优先且不碰 Cookie 文件", via[0]["total"], 54.0)
 
         # 10f2. 真实接口结构：access.meters 里是 micro-cents，直接算剩余
@@ -425,12 +442,69 @@ def main():
             missing_window = str(exc)
         passed &= check("没这个窗口时报清楚", "weekly" in missing_window, True)
 
+        # 10f3. API Key 直连：不需要浏览器，也不需要 Cookie
+        real_status = json.dumps({"product": "go", "access": {"meters": {
+            "fiveHour": {"limitMicroCents": "1200000000", "usedMicroCents": "600000000"},
+            "week": {"limitMicroCents": "3000000000", "usedMicroCents": "1270000000"},
+            "month": {"limitMicroCents": "6000000000", "usedMicroCents": "1270000000"},
+        }}})
+        seen_headers = {}
+
+        def fake_get(url, headers, timeout=8.0, auth_error=""):
+            seen_headers.clear()
+            seen_headers.update(headers)
+            seen_headers["_url"] = url
+            return real_status
+
+        original_get = tl._http_get
+        tl._http_get = fake_get
+        try:
+            item = tl.fetch_opencode_balance_by_key({"window": "monthly"}, "oc_sk_test")
+        finally:
+            tl._http_get = original_get
+        passed &= check("Key 直连算月度剩余", item[0]["total"], 47.3)
+        passed &= check("走的是状态接口", seen_headers["_url"].endswith("/console/api/go/status"), True)
+        passed &= check("用 Bearer 鉴权", seen_headers["Authorization"], "Bearer oc_sk_test")
+
+        # 10f4. DSH 凭证库能读出来（只认名字，不碰别的）
+        creds = tmp / "credentials.yaml"
+        creds.write_text("records:\n  - name: X\n    OPENCODE_GO_API_KEY: oc_sk_from_yaml\n",
+                         encoding="utf-8")
+        passed &= check("凭证库解析", tl.dsh_credential("OPENCODE_GO_API_KEY", creds),
+                        "oc_sk_from_yaml")
+        passed &= check("凭证库没有的键返回空", tl.dsh_credential("NOPE", creds), "")
+
+        # 10f5. 没有 Key 时明确报鉴权错，不静默
+        saved_env = {k: os.environ.get(k) for k in ("OPENCODE_GO_API_KEY",)}
+        for name in saved_env:
+            os.environ.pop(name, None)
+        passed &= check("没 Key 时报鉴权错误",
+                        isinstance(_no_key_error(), tl.BalanceAuthError), True)
+        for name, value in saved_env.items():
+            if value is not None:
+                os.environ[name] = value
+
+        # 10f6. 面板提示：过时要说清"多久没更新 + 下一步点哪"
+        hint = tl._balance_hint({"type": "mimo_cookie"}, "Cookie 已失效", 26.4)
+        passed &= check("过时提示带小时数", "26 小时没更新" in hint, True)
+        passed &= check("过时提示给下一步", "粘一次 Cookie" in hint, True)
+        passed &= check("刚更新过不说没更新", "刚刚更新过" in tl._balance_hint(
+            {"type": "mimo_cookie"}, "Cookie 已失效", 0.2), True)
+        passed &= check("DeepSeek 不加提示",
+                        tl._balance_hint({"type": "deepseek"}, "未配置 Key", 30), None)
+        near = tl._cookie_age_hint({"type": "mimo_cookie"}, "1700000000", 1700000000 + 21 * 3600)
+        passed &= check("Cookie 20 小时后提前提醒", "随时可能过期" in near, True)
+        passed &= check("Cookie 才 5 小时不提醒",
+                        tl._cookie_age_hint({"type": "mimo_cookie"}, "1700000000",
+                                            1700000000 + 5 * 3600), None)
+
         # 10g. 没开标签页：退回 Cookie 路线，报错里两路原因都在
         def no_tab(js, needle, timeout=15.0):
             return "ERR:NO_TAB"
 
         tl._run_browser_js = no_tab
         tl.read_safari_opencode_cookie = no_cookie
+        tl.opencode_api_key = lambda entry, key: ""
         try:
             try:
                 tl._fetch_opencode_items({"type": "opencode", "window": "monthly",
@@ -442,6 +516,7 @@ def main():
         finally:
             tl._run_browser_js = original_browser
             tl.read_safari_opencode_cookie = original_read
+            tl.opencode_api_key = original_key
         passed &= check("代查没标签页时报出来", "标签页" in both_notes, True)
         passed &= check("Cookie 文件失败也报出来", "没有权限" in both_notes, True)
 
@@ -451,6 +526,7 @@ def main():
 
         tl._run_browser_js = logged_out
         tl.read_safari_opencode_cookie = no_cookie
+        tl.opencode_api_key = lambda entry, key: ""
         try:
             try:
                 tl._fetch_opencode_items({"type": "opencode", "window": "monthly",
@@ -462,6 +538,7 @@ def main():
         finally:
             tl._run_browser_js = original_browser
             tl.read_safari_opencode_cookie = original_read
+            tl.opencode_api_key = original_key
         passed &= check("没登录时提示去登录", "没登录" in login_note, True)
 
         # 10e. 有 provider 就对不上时要分开算，别把 opencode 的用量算给 DeepSeek

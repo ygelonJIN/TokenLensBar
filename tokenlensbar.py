@@ -2342,6 +2342,10 @@ OPENCODE_BASE = "https://opencode.ai"
 OPENCODE_COOKIE_DOMAIN = "opencode.ai"
 OPENCODE_COOKIE_NAMES = ("auth",)
 OPENCODE_COOKIE_SECRET = "opencode_cookie"
+OPENCODE_KEY_SECRET = "opencode_key"
+OPENCODE_STATUS_URL = OPENCODE_BASE + "/console/api/go/status"
+OPENCODE_USAGE_URL = OPENCODE_BASE + "/zen/go/v1/usage"
+DSH_CREDENTIALS = "~/.dsh/.credentials.yaml"
 OPENCODE_GO_LIMITS = {"rolling": 12.0, "weekly": 30.0, "monthly": 60.0}
 OPENCODE_BALANCE_UNIT = 1e8
 OPENCODE_USER_AGENT = (
@@ -2357,6 +2361,82 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 _OPENCODE_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _http_get(url, headers, timeout=8.0, auth_error="Key 无效或没有权限"):
+    """带浏览器 UA 的 GET，返回文本。Cloudflare 没有 UA 会直接 1010 拦掉。"""
+    base = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "User-Agent": OPENCODE_USER_AGENT,
+        "Cache-Control": "no-cache",
+    }
+    base.update(headers or {})
+    request = urllib.request.Request(url, headers=base)
+    try:
+        with _OPENCODE_OPENER.open(request, timeout=timeout) as response:
+            return response.read(2_000_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise BalanceAuthError(auth_error)
+        if exc.code == 429:
+            raise BalanceError("请求过于频繁")
+        raise BalanceError("HTTP %s" % exc.code)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        text = str(reason).lower()
+        if isinstance(reason, TimeoutError) or "timed out" in text or "timeout" in text:
+            raise BalanceError("网络超时")
+        raise BalanceError("网络错误")
+    except TimeoutError:
+        raise BalanceError("网络超时")
+
+
+def dsh_credential(name, path=None):
+    """从 DSH 的 ~/.dsh/.credentials.yaml 里取一个凭证值（只取值，不打印）。"""
+    p = Path(path or DSH_CREDENTIALS).expanduser()
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = re.search(r"^\s*%s:\s*(\S+)\s*$" % re.escape(name), text, re.M)
+    return match.group(1) if match else ""
+
+
+def opencode_api_key(entry, key):
+    """OpenCode 的 API Key 来源：配置/环境 → DSH 凭证库。"""
+    for candidate in (key, os.environ.get("OPENCODE_GO_API_KEY"),
+                      dsh_credential("OPENCODE_GO_API_KEY")):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+    return ""
+
+
+def fetch_opencode_balance_by_key(entry, key, timeout=8.0):
+    """纯 HTTP：用 API Key 打控制台状态接口，不需要浏览器、不需要 Cookie。
+
+    `oc_sk_...` 这类 Key 走 Bearer，接口直接回 `access.meters`
+    （limitMicroCents / usedMicroCents），换上浏览器 UA 才能过 Cloudflare。
+    """
+    api_key = opencode_api_key(entry, key)
+    if not api_key:
+        raise BalanceAuthError("没有 OpenCode Key")
+    headers = {"Authorization": "Bearer " + api_key}
+    org_id = str(entry.get("workspace_id") or "").strip()
+    if org_id:
+        headers["x-org-id"] = org_id
+    body = _http_get(OPENCODE_STATUS_URL, headers, timeout=timeout,
+                     auth_error="OpenCode Key 无效或没有权限")
+    payload = {"go_status": 200, "go_text": body, "go_json": None,
+               "bill": "", "text": ""}
+    if body.lstrip().startswith("{"):
+        try:
+            payload["go_json"] = json.loads(body)
+        except ValueError:
+            payload["go_json"] = None
+    if payload["go_json"] is None:
+        raise BalanceError("控制台接口返回的不是 JSON")
+    return opencode_items_from_payload(payload, entry)
 
 
 def _http_text(url, cookie=None, timeout=8.0,
@@ -3028,8 +3108,14 @@ def fetch_opencode_balance(entry, cookie, timeout=8.0):
 
 
 def _fetch_opencode_items(entry, key):
-    """取数顺序：Safari 代查（不用权限）→ 磁盘 Cookie → secrets.json 里手填的。"""
+    """取数顺序：API Key 直连（最稳）→ 浏览器代查 → 磁盘 Cookie → 手填 Cookie。"""
     notes = []
+    try:
+        return fetch_opencode_balance_by_key(entry, key)
+    except BalanceAuthError as exc:
+        notes.append(str(exc))
+    except BalanceError as exc:
+        notes.append(str(exc))
     if entry.get("via_browser", True):
         try:
             return fetch_opencode_balance_via_safari(entry)
@@ -3549,6 +3635,8 @@ def save_mimo_cookie(header, secrets_path=None, secret_name=None):
         if not isinstance(data, dict):
             raise CookieError("%s 格式不对，先修好再自动更新" % path.name)
     data[secret_name or MIMO_COOKIE_SECRET] = header
+    # 存字符串：load_secrets 只收字符串，存 int 会被丢掉
+    data["%s_at" % (secret_name or MIMO_COOKIE_SECRET)] = str(int(time.time()))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
@@ -3566,6 +3654,9 @@ def refresh_mimo_cookie(secrets_path=None, secret_name=None, paths=None):
 
 def _provider_key(secrets, entry):
     key = secrets.get(entry.get("secret") or entry["id"])
+    if not key and entry["type"] in ("opencode", "opencode_go"):
+        # 一个 provider 可能同时配了 Cookie 和 Key，两个都兜一下
+        key = secrets.get(OPENCODE_KEY_SECRET) or secrets.get(OPENCODE_COOKIE_SECRET) or ""
     if not key and entry["type"] == "deepseek":
         key = os.environ.get("DEEPSEEK_API_KEY")
     if not key and entry["type"] in ("mimo", "mimo_cookie"):
@@ -3721,6 +3812,48 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
     return result
 
 
+def _cookie_age_hint(entry, cookie_at, now):
+    """Cookie 还没失效、但按寿命推算快到期时，提前提醒一次。"""
+    ptype = str(entry.get("type") or "").lower()
+    if ptype not in ("mimo", "mimo_cookie") or not cookie_at:
+        return None
+    age_hours = max(0.0, (now - float(cookie_at)) / 3600.0)
+    if age_hours < 20:
+        return None
+    return ("Cookie 已用 %d 小时，随时可能过期 · 粘一次更稳"
+            % int(age_hours))
+
+
+def cookie_at_name(entry):
+    return "%s_at" % (entry.get("secret") or entry["id"])
+
+
+def _balance_hint(entry, error, age_hours):
+    """面板上显示的短提示：说清"多久没更新"和"下一步点哪里"。
+
+    只在 Cookie/浏览器类 provider 上用，把技术原因挪到 detail 里，
+    免得菜单栏那行被一长串报错占满。
+    """
+    ptype = str(entry.get("type") or "").lower()
+    if ptype not in ("mimo", "mimo_cookie", "opencode", "opencode_go"):
+        return None
+    if not error:
+        return None
+    if age_hours is None:
+        head = "还没成功过"
+    elif age_hours >= 20:
+        head = "已 %d 小时没更新" % int(age_hours)
+    elif age_hours >= 2:
+        head = "%d 小时前更新" % int(age_hours)
+    else:
+        head = "刚刚更新过"
+    if ptype in ("mimo", "mimo_cookie"):
+        tail = "Safari 开 MiMo 控制台页，或粘一次 Cookie（约一天一换）"
+    else:
+        tail = "检查 opencode_key，或 Safari 开控制台页"
+    return "%s · %s" % (head, tail)
+
+
 def balance_payload(db_path, config_path=None, now=None):
     """给菜单栏用的余额缓存。只读 SQLite，不发网络请求。"""
     config = load_balances_config(config_path)
@@ -3729,6 +3862,7 @@ def balance_payload(db_path, config_path=None, now=None):
                 "providers": []}
     con = connect(db_path)
     now = time.time() if now is None else now
+    secrets, _secret_error = load_secrets()
     providers = []
     for entry in config["providers"]:
         rows = con.execute(
@@ -3741,6 +3875,13 @@ def balance_payload(db_path, config_path=None, now=None):
         if fetched_at is None and state:
             fetched_at = state[1]
         error = state[2] if state else None
+        last_success = state[1] if state else None
+        age_hours = None
+        if last_success:
+            age_hours = max(0.0, (now - last_success) / 3600.0)
+        hint = _balance_hint(entry, error, age_hours)
+        if hint is None and not error:
+            hint = _cookie_age_hint(entry, secrets.get(cookie_at_name(entry)), now)
         providers.append({
             "id": entry["id"],
             "name": entry["name"],
@@ -3754,7 +3895,11 @@ def balance_payload(db_path, config_path=None, now=None):
             } for row in rows],
             "fetched_at": fetched_at,
             "last_attempt": state[0] if state else None,
-            "error": error,
+            "last_success": last_success,
+            "error": hint or error,
+            "detail": error,
+            "hint": hint,
+            "age_hours": None if age_hours is None else round(age_hours, 2),
             "stale": bool(fetched_at and now - fetched_at > config["refresh_seconds"] * 2),
         })
     con.close()
