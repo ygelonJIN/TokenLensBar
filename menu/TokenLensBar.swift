@@ -59,13 +59,19 @@ struct Snapshot: Decodable {
         let items: [BalanceItem]?
         let fetchedAt: Double?
         let lastAttempt: Double?
+        let lastSuccess: Double?
         let error: String?
+        let hint: String?
+        let detail: String?
+        let ageHours: Double?
         let stale: Bool?
 
         enum CodingKeys: String, CodingKey {
-            case id, name, type, items, error, stale
+            case id, name, type, items, error, stale, hint, detail
             case fetchedAt = "fetched_at"
             case lastAttempt = "last_attempt"
+            case lastSuccess = "last_success"
+            case ageHours = "age_hours"
         }
     }
     struct Balances: Decodable {
@@ -325,6 +331,16 @@ func balanceText(_ value: Double, currency: String) -> String {
     let number = formatter.string(from: NSNumber(value: abs(value)))
         ?? String(format: "%.2f", abs(value))
     return (value < 0 ? "-" : "") + symbol + number
+}
+
+/// 余额行：数字后面挂一个警告标记，说明这个数已经不再更新。
+func providerBalanceTextMarked(_ provider: Snapshot.BalanceProvider) -> String {
+    let base = providerBalanceText(provider)
+    guard provider.hint != nil else { return base }
+    if let hours = provider.ageHours, hours >= 1 {
+        return "\(base)  ⚠︎\(Int(hours))h"
+    }
+    return "\(base)  ⚠︎"
 }
 
 func providerBalanceText(_ provider: Snapshot.BalanceProvider) -> String {
@@ -1071,8 +1087,11 @@ struct OverviewSections: View {
                     NativeSection("余额") {
                         ForEach(Array(providers.enumerated()), id: \.offset) { _, provider in
                             SummaryRow(label: provider.name ?? provider.id ?? "余额",
-                                       value: providerBalanceText(provider),
-                                       help: provider.error)
+                                       value: providerBalanceTextMarked(provider),
+                                       help: provider.detail ?? provider.error)
+                            if let hint = provider.hint {
+                                BalanceWarningRow(text: hint)
+                            }
                         }
                     }
                 }
@@ -1268,6 +1287,28 @@ struct SummaryRow: View {
             Divider()
                 .padding(.leading, 12)
         }
+    }
+}
+
+/// 余额过时/取不到的橙色提示行。
+struct BalanceWarningRow: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+            Text(text)
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 3)
+        .copyable(text, help: text + "\n\n点击复制")
     }
 }
 
