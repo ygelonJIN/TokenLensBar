@@ -252,6 +252,40 @@ def main():
         passed &= check("CNY 不受 USD 影响", buckets.get("CNY"), 6.0, 1e-6)
         passed &= check("USD 有符号", history["currencies"][1]["symbol"], "$")
 
+        # 8.4 官方按天用量优先于余额差分（额度 meter 批量入账，按天会错位）
+        con = tl.connect(db)
+        con.execute(
+            "insert or replace into usage_days"
+            " (provider, day, currency, amount, requests, fetched_at)"
+            " values (?,?,?,?,?,?)",
+            ("opencode-go", "2026-10-25", "USD", 1.23, 10, now))
+        con.commit()
+        con.close()
+        history = tl.spend_daily(db, prices, items=None, days=None,
+                                 now=now, config_path=config)
+        buckets = {item["currency"]: item["total"] for item in history["currencies"]}
+        passed &= check("官方用量覆盖余额差分", buckets.get("USD"), 1.23, 1e-9)
+        passed &= check("来源标记 mixed", history["source"], "mixed")
+        days_usd = {d["date"]: d["amounts"].get("USD") for d in history["days"]}
+        passed &= check("当天按官方数", days_usd.get("2026-10-25"), 1.23, 1e-9)
+
+        spend = tl.today_spend(db, prices, items=None, now=now, config_path=config)
+        usd_bucket = [c for c in spend["currencies"] if c["currency"] == "USD"][0]
+        passed &= check("今日消费也走官方",
+                        usd_bucket["providers"][0]["spent"], 1.23, 1e-9)
+        passed &= check("今日消费标来源",
+                        usd_bucket["providers"][0]["source"], "usage")
+
+        # 8.5 只有官方用量、今天没有余额样本时也要出这一行
+        con = tl.connect(db)
+        con.execute("delete from balance_samples")
+        con.commit()
+        con.close()
+        spend = tl.today_spend(db, prices, items=None, now=now, config_path=config)
+        usd_bucket = [c for c in spend["currencies"] if c["currency"] == "USD"][0]
+        passed &= check("没有余额样本也能显示官方用量",
+                        usd_bucket["providers"][0]["spent"], 1.23, 1e-9)
+
         # 9. 命令行补记
         #    必须显式 --date：tl.main 拿不到测试里的假 now，
         #    不传就按真实的今天记账，钉错那天会误判成上一条（Baz）。

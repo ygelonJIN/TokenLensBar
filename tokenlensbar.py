@@ -1030,6 +1030,15 @@ CREATE TABLE IF NOT EXISTS balance_samples (
     PRIMARY KEY (provider, currency, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_balance_samples_ts ON balance_samples(ts);
+CREATE TABLE IF NOT EXISTS usage_days (
+    provider   TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    currency   TEXT NOT NULL,
+    amount     REAL NOT NULL DEFAULT 0,
+    requests   INTEGER DEFAULT 0,
+    fetched_at REAL NOT NULL,
+    PRIMARY KEY (provider, day, currency)
+);
 CREATE TABLE IF NOT EXISTS manual_entries (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     day        TEXT NOT NULL,
@@ -2364,6 +2373,7 @@ OPENCODE_COOKIE_SECRET = "opencode_cookie"
 OPENCODE_KEY_SECRET = "opencode_key"
 OPENCODE_STATUS_URL = OPENCODE_BASE + "/console/api/go/status"
 OPENCODE_USAGE_URL = OPENCODE_BASE + "/zen/go/v1/usage"
+OPENCODE_CONSOLE_USAGE_URL = OPENCODE_BASE + "/console/api/usage/summary"
 DSH_CREDENTIALS = "~/.dsh/.credentials.yaml"
 OPENCODE_GO_LIMITS = {"rolling": 12.0, "weekly": 30.0, "monthly": 60.0}
 OPENCODE_BALANCE_UNIT = 1e8
@@ -2429,6 +2439,28 @@ def opencode_api_key(entry, key):
         if candidate and str(candidate).strip():
             return str(candidate).strip()
     return ""
+
+
+def fetch_opencode_usage_day(entry, key, day, timeout=8.0):
+    """官方按天用量：控制台「Usage」页用的就是这个接口。
+
+    `/console/api/usage/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` 回
+    totalCostMicroCents（1 美元 = 1e8）。额度 meter 是批量入账的，按天归属
+    会错位；这个接口才是按天准确的数额。
+    """
+    api_key = opencode_api_key(entry, key)
+    if not api_key:
+        raise BalanceAuthError("没有 OpenCode Key")
+    url = "%s?from=%s&to=%s" % (OPENCODE_CONSOLE_USAGE_URL, day, day)
+    body = _http_get(url, {"Authorization": "Bearer " + api_key,
+                           "User-Agent": OPENCODE_USER_AGENT},
+                     timeout=timeout, auth_error="OpenCode Key 无效或没有权限")
+    data = json.loads(body)
+    cost = _to_float(data.get("totalCostMicroCents")) or 0.0
+    return {
+        "amount": round(cost / OPENCODE_MICRO_CENTS, 6),
+        "requests": int(_to_float(data.get("totalRequests")) or 0),
+    }
 
 
 def fetch_opencode_balance_by_key(entry, key, timeout=8.0):
@@ -3685,6 +3717,65 @@ def _provider_key(secrets, entry):
     return (key or "").strip()
 
 
+def refresh_usage_days(db_path, config=None, secrets=None, now=None,
+                       lookback=30, backfill=5, config_path=None,
+                       secrets_path=None, fetcher=None):
+    """把官方按天用量写进 usage_days；余额 meter 只用来兜早期日期。
+
+    每次最多补 backfill 天老数据，今天每 5 分钟刷一次；这样不会一次发 30 个
+    请求把余额刷新拖住，历史也会在几轮里补齐。
+    """
+    now = time.time() if now is None else now
+    config = config or load_balances_config(config_path)
+    if secrets is None:
+        secrets, _ = load_secrets(secrets_path)
+    today = _local_day(now)
+    saved = 0
+    con = connect(db_path)
+    try:
+        for entry in config["providers"]:
+            if str(entry.get("type")) not in ("opencode", "opencode_go"):
+                continue
+            key = _provider_key(secrets, entry)
+            # Key 可能只在 DSH 凭证库里，交给 opencode_api_key 兜底判断
+            if not opencode_api_key(entry, key):
+                continue
+            known = {row[0]: row[1] for row in con.execute(
+                "select day, fetched_at from usage_days where provider=?",
+                (entry["id"],))}
+            wanted = []
+            if now - float(known.get(today) or 0) >= 300:
+                wanted.append(today)
+            missing = 0
+            for back in range(1, lookback + 1):
+                day = _local_day(now - back * 86400)
+                fetched = known.get(day)
+                if fetched is None or now - fetched >= 12 * 3600:
+                    wanted.append(day)
+                    missing += 1
+                    if missing >= backfill:
+                        break
+            for day in wanted:
+                try:
+                    got = (fetcher(entry, day) if fetcher is not None
+                           else fetch_opencode_usage_day(entry, key, day))
+                except Exception:
+                    continue
+                if not got:
+                    continue
+                con.execute(
+                    "insert or replace into usage_days"
+                    " (provider, day, currency, amount, requests, fetched_at)"
+                    " values (?,?,?,?,?,?)",
+                    (entry["id"], day, "USD", float(got.get("amount") or 0),
+                     int(got.get("requests") or 0), now))
+                con.commit()
+                saved += 1
+    finally:
+        con.close()
+    return saved
+
+
 def refresh_balances(db_path, force=False, verbose=False, config_path=None,
                      secrets_path=None, fetcher=None, now=None,
                      cookie_refresher=None):
@@ -3828,6 +3919,13 @@ def refresh_balances(db_path, force=False, verbose=False, config_path=None,
         if verbose:
             print("  ✓ %s 余额已更新" % entry["name"])
     con.close()
+    # 余额 meter 按天会错位，顺手把官方按天用量也拉一遍；自定义 fetcher 的
+    # 测试场景不发请求。
+    if fetcher is None and config_path is None and secrets_path is None:
+        try:
+            refresh_usage_days(db_path, config=config, secrets=secrets, now=now)
+        except Exception:
+            pass
     return result
 
 
@@ -4102,6 +4200,11 @@ def today_spend(db_path, prices=None, items=None, now=None, config_path=None):
             for (currency,) in latest:
                 if currency not in existing:
                     series[(entry["id"], currency)] = []
+        # 今天还没采到余额样本、但官方有今天用量的 provider 也要露头
+        for pid, currency in con.execute(
+                "select provider, currency from usage_days where day=?", (day,)):
+            if (pid, currency) not in series:
+                series[(pid, currency)] = []
         con.close()
 
     currency_buckets = {}
@@ -4138,6 +4241,21 @@ def today_spend(db_path, prices=None, items=None, now=None, config_path=None):
                 if total_weight > 0:
                     gap_share = gap_drop * weights.get(day, 0.0) / total_weight
                     spent += gap_share
+        # 官方按天用量优先：额度 meter 是批量入账的，余额差分会把几天的量
+        # 记到同一天；有官方数就按官方数显示。
+        source = "balance"
+        official = None
+        if db_path.exists():
+            con = connect(db_path)
+            official = con.execute(
+                "select amount from usage_days"
+                " where provider=? and day=? and currency=?",
+                (pid, day, currency)).fetchone()
+            con.close()
+        if official is not None and official[0] is not None:
+            spent = float(official[0])
+            gap_share = 0.0
+            source = "usage"
         bucket["providers"].append({
             "id": pid,
             "name": entry.get("name") or pid,
@@ -4146,6 +4264,7 @@ def today_spend(db_path, prices=None, items=None, now=None, config_path=None):
             "start_ts": start_ts,
             "samples": len(samples),
             "gap": round(gap_share, 6),
+            "source": source,
         })
         if spent is not None:
             bucket["automatic"] = round((bucket["automatic"] or 0.0) + spent, 6)
@@ -4205,14 +4324,15 @@ def spend_daily(db_path, prices=None, items=None, days=None, now=None, config_pa
     ordered = sorted(items or [], key=lambda item: item.get("ts") or 0)
     stamps = [item.get("ts") or 0 for item in ordered]
 
-    amounts = {}
+    # 每个 provider 单独记，最后再合并：官方按天用量要按 provider 覆盖余额差分。
+    per_provider = {}
 
-    def record(day, currency, amount, allow_negative=False):
+    def record(pid, day, currency, amount, allow_negative=False):
         if not day or (start_day and day < start_day):
             return
         if not allow_negative and amount <= 0:
             return
-        bucket = amounts.setdefault(day, {})
+        bucket = per_provider.setdefault(pid, {}).setdefault(day, {})
         bucket[currency] = bucket.get(currency, 0.0) + amount
 
     def gap_weights(entry, gap_start, gap_end):
@@ -4228,6 +4348,18 @@ def spend_daily(db_path, prices=None, items=None, days=None, now=None, config_pa
                 weight = float(item.get("total") or 1.0)
             weights[day] = weights.get(day, 0.0) + weight
         return weights
+
+    # 官方按天用量（OpenCode 控制台接口写进来的）：有它的 provider，
+    # 覆盖范围内的日期以官方为准，余额 meter 只用来兜住更早的日期。
+    official = {}
+    if db_path.exists():
+        con = connect(db_path)
+        for pid, day, currency, amount in con.execute(
+                "select provider, day, currency, amount from usage_days"):
+            if start_day and day < start_day:
+                continue
+            official.setdefault(pid, {})[day] = (currency, amount)
+        con.close()
 
     if config["configured"] and db_path.exists():
         con = connect(db_path)
@@ -4254,7 +4386,7 @@ def spend_daily(db_path, prices=None, items=None, days=None, now=None, config_pa
                         continue
                     prev_day, day = _local_day(prev_ts), _local_day(ts)
                     if prev_day == day:
-                        record(day, currency, drop)
+                        record(entry["id"], day, currency, drop)
                         continue
                     weights = gap_weights(entry, prev_ts, ts)
                     total_weight = sum(weights.values())
@@ -4263,7 +4395,8 @@ def spend_daily(db_path, prices=None, items=None, days=None, now=None, config_pa
                         # 和「今日消费」保持同一口径，也不把整段摊到某一天。
                         continue
                     for gap_day, weight in weights.items():
-                        record(gap_day, currency, drop * weight / total_weight)
+                        record(entry["id"], gap_day, currency,
+                               drop * weight / total_weight)
         if days is None:
             manual = con.execute("select day, amount from manual_entries").fetchall()
         else:
@@ -4272,8 +4405,39 @@ def spend_daily(db_path, prices=None, items=None, days=None, now=None, config_pa
                 (start_day,)).fetchall()
         for day, amount in manual:
             if amount:
-                record(day, primary, float(amount), allow_negative=True)
+                record("manual", day, primary, float(amount), allow_negative=True)
         con.close()
+
+    amounts = {}
+    sources = set()
+    first_official = {pid: min(days) for pid, days in official.items() if days}
+
+    def merge(day, currency, amount):
+        bucket = amounts.setdefault(day, {})
+        bucket[currency] = bucket.get(currency, 0.0) + amount
+
+    for pid, days in per_provider.items():
+        coverage = first_official.get(pid)
+        for day, bucket in days.items():
+            if coverage and day >= coverage:
+                continue  # 官方覆盖的日期不用余额差分，避免重复
+            for currency, amount in bucket.items():
+                merge(day, currency, amount)
+            sources.add("balance")
+    for pid, days in official.items():
+        for day, (currency, amount) in days.items():
+            merge(day, currency, amount)
+        if days:
+            sources.add("usage")
+
+    if sources == {"usage"}:
+        source = "usage"
+    elif "usage" in sources:
+        source = "mixed"
+    elif sources:
+        source = "balance"
+    else:
+        source = None
 
     def totals(since_day=""):
         out = {}
@@ -4295,6 +4459,7 @@ def spend_daily(db_path, prices=None, items=None, days=None, now=None, config_pa
     return {
         "configured": bool(config["configured"]),
         "primary": primary,
+        "source": source,
         "currencies": rows_of(totals()),
         "week": rows_of(totals(_local_day(now - 6 * 86400))),
         "days": [
@@ -4302,6 +4467,7 @@ def spend_daily(db_path, prices=None, items=None, days=None, now=None, config_pa
              "amounts": {currency: round(value, 6)
                          for currency, value in sorted(bucket.items())}}
             for day, bucket in sorted(amounts.items())
+            if any(abs(value) > 1e-9 for value in bucket.values())
         ],
     }
 
@@ -5085,9 +5251,11 @@ def main(argv=None):
                     if provider["spent"] is not None:
                         started = (datetime.fromtimestamp(provider["start_ts"])
                                    .strftime("%H:%M") if provider["start_ts"] else "—")
-                        print("    %-12s %s%.2f（%s 起）" % (
+                        origin = ("官方用量" if provider.get("source") == "usage"
+                                  else "%s 起" % started)
+                        print("    %-12s %s%.2f（%s）" % (
                             provider["name"], bucket["symbol"],
-                            provider["spent"], started))
+                            provider["spent"], origin))
                     else:
                         print("    %-12s —（今天还没采到余额）" % provider["name"])
                 if bucket["manual"]:

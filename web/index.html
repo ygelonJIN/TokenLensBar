@@ -266,9 +266,9 @@ function render(d) {
         <div class="sub">峰 ${cash(bands.peak, symbol)} · 谷 ${cash(bands.off_peak, symbol)}</div>
       </div>
       <div class="card">
-        <div class="k">实际消费（余额差分）</div>
+        <div class="k">实际消费</div>
         <div class="v">${spendValue}${spendRest.length ? `<small>+ ${spendRest.join(' + ')}</small>` : ''}</div>
-        <div class="sub">${spendRowsTotal.length ? '按余额下降累加 · 充值不计' : (spend.configured ? '窗口内还没有余额样本' : '未配置余额查询')}</div>
+        <div class="sub">${spendRowsTotal.length ? (spend.source === 'usage' ? '官方按天用量' : (spend.source === 'mixed' ? '官方用量 + 余额差分' : '按余额下降累加 · 充值不计')) : (spend.configured ? '窗口内还没有余额样本' : '未配置余额查询')}</div>
       </div>
       <div class="card">
         <div class="k">缓存命中率</div>
@@ -341,8 +341,8 @@ function render(d) {
   }).join('');
   const spendBlock = spendDays.length ? `
     <section>
-      <h2>每日实付（余额差分）</h2>
-      <div class="hint">按余额下降累加，充值和退款不计；跨天缺口按会话结束日归因 · 共 ${spendDays.length} 天有消费${spendDays.length > 31 ? '，只列最近 31 天' : ''}</div>
+      <h2>每日实付</h2>
+      <div class="hint">${spend.source === 'usage' ? 'OpenCode 取官方按天用量' : (spend.source === 'mixed' ? 'OpenCode 取官方按天用量，其余按余额下降 + 跨天归因' : '按余额下降累加，充值不计；跨天缺口按会话结束日归因')} · 共 ${spendDays.length} 天有消费${spendDays.length > 31 ? '，只列最近 31 天' : ''}</div>
       <div class="table-wrap">
         <table class="narrow">
           <thead><tr><th>日期</th><th>实付</th><th>Token 估算</th></tr></thead>

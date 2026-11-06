@@ -93,9 +93,10 @@ struct Snapshot: Decodable {
             let startTs: Double?
             let samples: Int?
             let gap: Double?
+            let source: String?
 
             enum CodingKeys: String, CodingKey {
-                case id, name, currency, spent, samples, gap
+                case id, name, currency, spent, samples, gap, source
                 case startTs = "start_ts"
             }
         }
@@ -1179,6 +1180,12 @@ struct TodaySpendRow: View {
 
     private var note: String {
         guard let primary else { return "Token 估算" }
+        let providers = (spend?.currencies ?? []).flatMap { $0.providers ?? [] }
+        let hasUsage = providers.contains { $0.source == "usage" }
+        let hasBalance = providers.contains { $0.source != "usage" && $0.spent != nil }
+        if hasUsage {
+            return hasBalance ? "官方 + 余额" : "官方用量"
+        }
         let starts = (primary.providers ?? []).compactMap { $0.startTs }
         if let earliest = starts.min() {
             return "\(clockText(earliest)) 起"
@@ -1270,7 +1277,7 @@ struct HistorySections: View {
                    let totals = spend.currencies, !totals.isEmpty {
                     SummaryRow(label: "实际消费",
                                value: spendTotalsText(totals),
-                               help: "按余额下降累加，充值和退款不计；跨天缺口按会话结束日归因。下面是 Token 估算，两套口径不可相加。")
+                               help: "OpenCode 取官方按天用量；其余平台按余额下降累加，充值不计。下面是 Token 估算，两套口径不可相加。")
                     if let week = spend.week,
                        week.contains(where: { ($0.total ?? 0) > 0 }) {
                         SummaryRow(label: "近 7 天", value: spendTotalsText(week))
