@@ -193,6 +193,65 @@ def main():
         passed &= check("余额栏仍返回当前余额",
                         payload["balances"]["providers"][0]["items"][0]["total"], 94.0)
 
+        # 8.1 按天消费：跨天缺口按会话结束日归因，今日必须和 today_spend 一致
+        db, prices, config = make_fixture(
+            tmp,
+            [("deepseek", "CNY", y23, 100.0),
+             ("deepseek", "CNY", day_start, 95.0),
+             ("deepseek", "CNY", day9, 94.0)],
+            [{"ts": y2330, "input": 1_500_000},
+             {"ts": t2, "input": 3_000_000}],
+        )
+        spend_items = tl.enrich(tl.fetch_rows(db, 0)[0], prices)
+        history = tl.spend_daily(db, prices, items=spend_items, days=None,
+                                 now=now, config_path=config)
+        days = {item["date"]: item["amounts"]["CNY"] for item in history["days"]}
+        passed &= check("按天：昨天 1.666667", days["2026-10-24"], 1.666667, 1e-6)
+        passed &= check("按天：今天 4.333333", days["2026-10-25"], 4.333333, 1e-6)
+        passed &= check("按天：合计", history["currencies"][0]["total"], 6.0, 1e-6)
+        passed &= check("按天：近 7 天合计", history["week"][0]["total"], 6.0, 1e-6)
+        window = tl.spend_daily(db, prices, items=spend_items, days=1,
+                                now=now, config_path=config)
+        passed &= check("按天：窗口一天只算今天",
+                        window["currencies"][0]["total"], 4.333333, 1e-6)
+        passed &= check("按天：窗口外不计入", len(window["days"]), 1)
+        today = tl.today_spend(db, prices, items=spend_items, now=now, config_path=config)
+        passed &= check("按天：与今日消费同口径",
+                        window["currencies"][0]["total"],
+                        today["currencies"][0]["total"], 1e-6)
+
+        # 8.2 status_json / api_payload 都带余额差分
+        payload = tl.status_json(db, prices, now=now, config_path=config)
+        passed &= check("status_json 带 spend_history",
+                        payload["spend_history"]["currencies"][0]["total"], 6.0, 1e-6)
+        board = tl.api_payload(db, 1, now=now, prices=prices)
+        passed &= check("看板 payload 带 spend", "spend" in board, True)
+        passed &= check("看板今日实付",
+                        board["spend"]["currencies"][0]["total"], 4.333333, 1e-6)
+        passed &= check("看板实付带每天明细",
+                        [item["date"] for item in board["spend"]["days"]], ["2026-10-25"])
+
+        # 8.3 币种分桶：USD 单独算，和 CNY 不混
+        config_data = json.loads(config.read_text(encoding="utf-8"))
+        config_data["providers"].append(
+            {"id": "opencode-go", "type": "opencode", "name": "OpenCode Go",
+             "enabled": True})
+        write_json(config, config_data)
+        con = tl.connect(db)
+        for ts, total in ((day_start, 60.0), (day9, 57.5)):
+            con.execute(
+                "insert into balance_samples"
+                " (provider, currency, ts, total, available) values (?,?,?,?,1)",
+                ("opencode-go", "USD", ts, total))
+        con.commit()
+        con.close()
+        history = tl.spend_daily(db, prices, items=spend_items, days=None,
+                                 now=now, config_path=config)
+        buckets = {item["currency"]: item["total"] for item in history["currencies"]}
+        passed &= check("USD 单独一桶", buckets.get("USD"), 2.5, 1e-6)
+        passed &= check("CNY 不受 USD 影响", buckets.get("CNY"), 6.0, 1e-6)
+        passed &= check("USD 有符号", history["currencies"][1]["symbol"], "$")
+
         # 9. 命令行补记
         #    必须显式 --date：tl.main 拿不到测试里的假 now，
         #    不传就按真实的今天记账，钉错那天会误判成上一条（Baz）。

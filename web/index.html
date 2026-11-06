@@ -64,7 +64,7 @@
   .seg button:hover { color: var(--text); }
   .seg button.on { background: var(--panel); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(0, 0, 0, .14); }
 
-  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 26px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(188px, 1fr)); gap: 12px; margin-bottom: 26px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 15px 17px; }
   .card .k { color: var(--muted); font-size: 12px; margin-bottom: 7px; letter-spacing: .3px; }
   .card .v { font-size: 25px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.5px; }
@@ -111,6 +111,9 @@
 
   .table-wrap { overflow-x: auto; }
   .table-wrap table { min-width: 700px; }
+  .table-wrap table.narrow { min-width: 0; width: auto; }
+  .table-wrap table.narrow th, .table-wrap table.narrow td { padding-right: 34px; }
+  .table-wrap table.narrow th:last-child, .table-wrap table.narrow td:last-child { padding-right: 10px; }
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
   th { text-align: right; font-weight: 500; color: var(--muted); font-size: 12px; padding: 0 10px 9px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; }
@@ -197,6 +200,8 @@ const cash = (n, s) => {
 };
 
 let symbol = '$';
+let spendByDay = {};
+let spendSymbols = {};
 let current = 30;
 let metric = 'tokens';
 let lastPayload = null;
@@ -226,6 +231,21 @@ function render(d) {
   const pad2 = (n) => String(n).padStart(2, '0');
   const costPct = (cost) => totalCost ? (cost / totalCost * 100) : 0;
   const unitPrice = (cost, tokens) => tokens ? cash(cost / tokens * 1e6, symbol) : '—';
+
+  // 实际消费：余额差额，按币种分桶，USD 和 CNY 不混
+  const spend = d.spend || {};
+  const spendCurrencyList = spend.currencies || [];
+  spendSymbols = {};
+  spendCurrencyList.forEach(c => { spendSymbols[c.currency] = c.symbol || (c.currency + ' '); });
+  const spendRowsTotal = spendCurrencyList
+    .filter(c => Math.abs(Number(c.total) || 0) > 0)
+    .sort((a, b) => Math.abs(Number(b.total)) - Math.abs(Number(a.total)));
+  const spendMain = spendRowsTotal[0];
+  const spendValue = spendMain ? cash(Number(spendMain.total), spendMain.symbol || spendMain.currency) : '—';
+  const spendRest = spendRowsTotal.slice(1).map(c => cash(Number(c.total), c.symbol || c.currency));
+  spendByDay = {};
+  (spend.days || []).forEach(item => { spendByDay[item.date] = item.amounts || {}; });
+
   const seg = `
     <div class="seg" data-seg>
       <button data-metric="tokens" class="${metric === 'tokens' ? 'on' : ''}">Token</button>
@@ -244,6 +264,11 @@ function render(d) {
         <div class="v">${cash(t.cost, symbol)}</div>
         <div class="sub">${d.priced ? '按本地单价表，不含余额差异' : '未配置单价表'}</div>
         <div class="sub">峰 ${cash(bands.peak, symbol)} · 谷 ${cash(bands.off_peak, symbol)}</div>
+      </div>
+      <div class="card">
+        <div class="k">实际消费（余额差分）</div>
+        <div class="v">${spendValue}${spendRest.length ? `<small>+ ${spendRest.join(' + ')}</small>` : ''}</div>
+        <div class="sub">${spendRowsTotal.length ? '按余额下降累加 · 充值不计' : (spend.configured ? '窗口内还没有余额样本' : '未配置余额查询')}</div>
       </div>
       <div class="card">
         <div class="k">缓存命中率</div>
@@ -288,10 +313,43 @@ function render(d) {
   const chart = `
     <section>
       <div class="sec-head"><h2>每日用量</h2>${seg}</div>
-      <div class="hint">共 ${activeDays} 天有记录 · 峰值 ${peakText}/天 · 悬停或聚焦看当日金额</div>
+      <div class="hint">共 ${activeDays} 天有记录 · 峰值 ${peakText}/天 · 悬停或聚焦看当日金额与实付</div>
       <div class="chart${metric === 'cost' ? ' cost' : ''}"${daily.length > 60 ? ' style="gap:1px"' : ''}>${bars}</div>
       ${axis}
     </section>`;
+
+  // 每日实付：和上面的「成本（Token 估算）」是两套口径，分开列清楚
+  const dayCost = {};
+  daily.forEach(x => { dayCost[x.date] = x.cost; });
+  const spendDays = Object.keys(spendByDay)
+    .filter(day => Object.values(spendByDay[day]).some(v => Math.abs(Number(v)) > 0))
+    .sort()
+    .reverse();
+  const spendTableRows = spendDays.slice(0, 31).map(day => {
+    const amounts = spendByDay[day];
+    const paid = Object.keys(amounts)
+      .filter(k => Math.abs(Number(amounts[k])) > 0)
+      .sort()
+      .map(k => cash(Number(amounts[k]), spendSymbols[k] || (k + ' ')))
+      .join(' + ');
+    const est = dayCost[day] == null ? '—' : cash(dayCost[day], symbol);
+    return `<tr>
+      <td>${day}</td>
+      <td class="cost">${paid}</td>
+      <td>${est}</td>
+    </tr>`;
+  }).join('');
+  const spendBlock = spendDays.length ? `
+    <section>
+      <h2>每日实付（余额差分）</h2>
+      <div class="hint">按余额下降累加，充值和退款不计；跨天缺口按会话结束日归因 · 共 ${spendDays.length} 天有消费${spendDays.length > 31 ? '，只列最近 31 天' : ''}</div>
+      <div class="table-wrap">
+        <table class="narrow">
+          <thead><tr><th>日期</th><th>实付</th><th>Token 估算</th></tr></thead>
+          <tbody>${spendTableRows}</tbody>
+        </table>
+      </div>
+    </section>` : '';
 
   const heat = d.heatmap || [];
   const heatBy = {};
@@ -419,7 +477,7 @@ function render(d) {
       </div>
     </section>` : '';
 
-  box.innerHTML = cars + warn + chart + heatBlock + models + agents + matrix + outsideBlock;
+  box.innerHTML = cars + warn + chart + spendBlock + heatBlock + models + agents + matrix + outsideBlock;
 
   document.getElementById('src').textContent =
     '数据源：' + d.sources.map(s => `${s.agent}(${s.files})`).join('  ') + ' · 本机 SQLite';
@@ -436,9 +494,19 @@ function showTip(el) {
   const tokens = Number(el.dataset.tokens) || 0;
   const count = Number(el.dataset.count) || 0;
   const cost = Number(el.dataset.cost) || 0;
-  tipDate.textContent = el.dataset.title || el.dataset.date || '';
+  const day = el.dataset.title || el.dataset.date || '';
+  tipDate.textContent = day;
   tipCost.textContent = cash(cost, symbol);
-  tipMeta.textContent = el.dataset.meta || `${fmt(tokens)} tokens · ${count} 次`;
+  let meta = el.dataset.meta || `${fmt(tokens)} tokens · ${count} 次`;
+  const spendAmounts = spendByDay[day];
+  if (spendAmounts) {
+    const parts = Object.keys(spendAmounts)
+      .filter(k => Math.abs(Number(spendAmounts[k])) > 0)
+      .sort()
+      .map(k => cash(Number(spendAmounts[k]), spendSymbols[k] || (k + ' ')));
+    meta += ' · 实付 ' + (parts.length ? parts.join(' + ') : '—');
+  }
+  tipMeta.textContent = meta;
   tipEl.classList.remove('on');
 
   const r = el.getBoundingClientRect();

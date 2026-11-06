@@ -19,6 +19,7 @@ TokenLensBar — 本地 token 用量采集器
 """
 
 import argparse
+import bisect
 import hashlib
 import json
 import math
@@ -1715,6 +1716,15 @@ def report(db_path, days, group_by):
     print("    ├ 输出     %s" % human(totals["output"]))
     print("    └ 缓存写   %s" % human(totals["cache_write"]))
 
+    try:
+        spend = spend_daily(db_path, prices, items=enrich(rows, prices),
+                            days=None if days <= 0 else days)
+    except Exception:
+        spend = {"currencies": []}
+    if spend["currencies"]:
+        print("  实付     %s（余额差分，不含充值）" % " + ".join(
+            "%s%.2f" % (item["symbol"], item["total"]) for item in spend["currencies"]))
+
     label = {"model": "模型", "agent": "Agent", "provider": "厂商"}[group_by]
     header = [label, "总量", "输入", "输出", "占比", "次数", "成本"]
     widths = [max(display_width(h), 10) for h in header]
@@ -1910,6 +1920,13 @@ def status_json(db_path, prices=None, now=None, config_path=None):
         spend = {"configured": False, "day": _local_day(now), "currencies": [],
                  "manual": {"amount": 0, "tokens": 0, "entries": []},
                  "tokens": 0, "error": str(exc)}
+    try:
+        spend_history = spend_daily(db_path, prices, items=items, days=None,
+                                    now=now, config_path=config_path)
+    except Exception as exc:
+        spend_history = {"configured": False, "primary": None,
+                         "currencies": [], "week": [], "days": [],
+                         "error": str(exc)}
 
     return {
         "ok": True,
@@ -1952,6 +1969,8 @@ def status_json(db_path, prices=None, now=None, config_path=None):
         "all_events": len(items),
         "all_cost": round(all_cost, 6),
         "today_spend": spend,
+        # 「历史」页签用：全部历史的余额差额消费，含每天明细
+        "spend_history": spend_history,
         "last_event": rows[-1][0],
         "priced": bool(prices),
         "balances": balances,
@@ -4161,6 +4180,132 @@ def today_spend(db_path, prices=None, items=None, now=None, config_path=None):
     }
 
 
+def spend_daily(db_path, prices=None, items=None, days=None, now=None, config_path=None):
+    """按日历日算余额差额消费：和「今日消费」同一套口径，可跨多天。
+
+    days=None 表示全部历史；否则从今天往前数 days 天（含今天）。
+    返回总消费、近 7 天合计和每天明细，币种按 provider 的余额币种分桶，
+    手动补记统一记在主币种（`prices.currency`）。
+    """
+    db_path = Path(db_path)
+    prices = prices if prices is not None else load_prices()
+    now = time.time() if now is None else now
+    primary = (prices.get("currency") or "CNY").upper()
+    config = load_balances_config(config_path)
+
+    if days is None:
+        start_day = ""
+        start_ts = 0.0
+    else:
+        start_day = _local_day(now - (max(1, int(days)) - 1) * 86400)
+        start_ts = _day_bounds(start_day)[0]
+
+    # 跨天缺口按会话结束日归因时要用事件；先按时间排好，二分取区间，
+    # 免得每个跨天缺口都扫一遍全部历史事件。
+    ordered = sorted(items or [], key=lambda item: item.get("ts") or 0)
+    stamps = [item.get("ts") or 0 for item in ordered]
+
+    amounts = {}
+
+    def record(day, currency, amount, allow_negative=False):
+        if not day or (start_day and day < start_day):
+            return
+        if not allow_negative and amount <= 0:
+            return
+        bucket = amounts.setdefault(day, {})
+        bucket[currency] = bucket.get(currency, 0.0) + amount
+
+    def gap_weights(entry, gap_start, gap_end):
+        lo = bisect.bisect_right(stamps, gap_start)
+        hi = bisect.bisect_right(stamps, gap_end)
+        weights = {}
+        for item in ordered[lo:hi]:
+            if not _event_matches_provider(item, entry):
+                continue
+            day = _local_day(item["ts"])
+            weight = item.get("cost") or 0.0
+            if weight <= 0:
+                weight = float(item.get("total") or 1.0)
+            weights[day] = weights.get(day, 0.0) + weight
+        return weights
+
+    if config["configured"] and db_path.exists():
+        con = connect(db_path)
+        for entry in config["providers"]:
+            by_currency = {}
+            for currency, ts, total in con.execute(
+                    "select currency, ts, total from balance_samples"
+                    " where provider=? and available=1 and ts>=?"
+                    " order by currency, ts", (entry["id"], start_ts)):
+                by_currency.setdefault(currency, []).append((ts, total))
+            for currency, samples in by_currency.items():
+                if start_ts > 0:
+                    # 窗口前最近一条样本：跨天缺口要靠它补起点
+                    previous = con.execute(
+                        "select ts, total from balance_samples"
+                        " where provider=? and currency=? and available=1 and ts<?"
+                        " order by ts desc limit 1",
+                        (entry["id"], currency, start_ts)).fetchone()
+                    if previous:
+                        samples.insert(0, (previous[0], previous[1]))
+                for (prev_ts, prev_total), (ts, total) in zip(samples, samples[1:]):
+                    drop = prev_total - total
+                    if drop <= 0:  # 充值 / 退款 / 额度重置：不冲减，也不显示
+                        continue
+                    prev_day, day = _local_day(prev_ts), _local_day(ts)
+                    if prev_day == day:
+                        record(day, currency, drop)
+                        continue
+                    weights = gap_weights(entry, prev_ts, ts)
+                    total_weight = sum(weights.values())
+                    if total_weight <= 0:
+                        # 没有会话可归因的跨天缺口：静默忽略，
+                        # 和「今日消费」保持同一口径，也不把整段摊到某一天。
+                        continue
+                    for gap_day, weight in weights.items():
+                        record(gap_day, currency, drop * weight / total_weight)
+        if days is None:
+            manual = con.execute("select day, amount from manual_entries").fetchall()
+        else:
+            manual = con.execute(
+                "select day, amount from manual_entries where day>=?",
+                (start_day,)).fetchall()
+        for day, amount in manual:
+            if amount:
+                record(day, primary, float(amount), allow_negative=True)
+        con.close()
+
+    def totals(since_day=""):
+        out = {}
+        for day, bucket in amounts.items():
+            if since_day and day < since_day:
+                continue
+            for currency, amount in bucket.items():
+                out[currency] = out.get(currency, 0.0) + amount
+        return out
+
+    def rows_of(values):
+        return [
+            {"currency": currency, "symbol": _currency_symbol(currency),
+             "total": round(total, 6)}
+            for currency, total in sorted(
+                values.items(), key=lambda kv: (kv[0] != primary, kv[0]))
+        ]
+
+    return {
+        "configured": bool(config["configured"]),
+        "primary": primary,
+        "currencies": rows_of(totals()),
+        "week": rows_of(totals(_local_day(now - 6 * 86400))),
+        "days": [
+            {"date": day,
+             "amounts": {currency: round(value, 6)
+                         for currency, value in sorted(bucket.items())}}
+            for day, bucket in sorted(amounts.items())
+        ],
+    }
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -4731,6 +4876,15 @@ def api_payload(db_path, days, now=None, prices=None):
             "agents": sorted(seen.get(model, {}).get("agents", [])),
         })
 
+    try:
+        # 跨天缺口要靠「缺口里有哪些会话」来归因，所以取全量事件而不是窗口内的。
+        all_rows, _ = fetch_rows(db_path, 0.0)
+        spend = spend_daily(db_path, prices, items=enrich(all_rows, prices),
+                            days=days, now=now)
+    except Exception as exc:
+        spend = {"configured": False, "primary": None, "currencies": [],
+                 "week": [], "days": [], "error": str(exc)}
+
     return {
         "ok": bool(rows),
         "days": days,
@@ -4754,6 +4908,7 @@ def api_payload(db_path, days, now=None, prices=None):
         "outside": outside_cells(db_path, breakdown(rows, prices, since), prices),
         "daily": daily_series(rows, since, prices, now),
         "heatmap": heatmap_series(rows, since, prices),
+        "spend": spend,
         "bands": {"peak": round(peak_cost, 6), "off_peak": round(off_peak_cost, 6)},
         "unpriced": agg["unpriced"],
         "sources": [{"agent": name, "files": count} for name, count in sources],

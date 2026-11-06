@@ -134,6 +134,26 @@ struct Snapshot: Decodable {
         let error: String?
     }
 
+    /// 全部历史的余额差额消费（「历史」页签用），口径同今日消费。
+    struct SpendHistory: Decodable {
+        struct Total: Decodable {
+            let currency: String?
+            let symbol: String?
+            let total: Double?
+        }
+        struct Day: Decodable {
+            let date: String?
+            let amounts: [String: Double]?
+        }
+
+        let configured: Bool?
+        let primary: String?
+        let currencies: [Total]?
+        let week: [Total]?
+        let days: [Day]?
+        let error: String?
+    }
+
     let ok: Bool
     let symbol: String?
     let windows: [String: Window]?
@@ -147,6 +167,7 @@ struct Snapshot: Decodable {
     let allEvents: Int?
     let allCost: Double?
     let todaySpend: TodaySpend?
+    let spendHistory: SpendHistory?
     let unpriced: [String]?
     let priced: Bool?
     let balances: Balances?
@@ -159,6 +180,7 @@ struct Snapshot: Decodable {
         case allEvents = "all_events"
         case allCost = "all_cost"
         case todaySpend = "today_spend"
+        case spendHistory = "spend_history"
         case modelsToday = "models_today"
         case agentsToday = "agents_today"
     }
@@ -1242,10 +1264,38 @@ struct HistorySections: View {
     var body: some View {
         if let snap = model.snapshot, snap.ok {
             NativeSection("全部历史") {
-                SummaryRow(label: "总金额（Token 估算）",
-                           value: money(modelCost(snap), snap.symbol ?? "¥"))
+                // 真正花掉的钱放第一行：按余额差分算，USD / CNY 分币种并排。
+                // 下面的「Token 估算」是本地单价表算出来的另一套口径，两者不能相加。
+                if let spend = snap.spendHistory, spend.configured == true,
+                   let totals = spend.currencies, !totals.isEmpty {
+                    SummaryRow(label: "实际消费",
+                               value: spendTotalsText(totals),
+                               help: "按余额下降累加，充值和退款不计；跨天缺口按会话结束日归因。下面是 Token 估算，两套口径不可相加。")
+                    if let week = spend.week,
+                       week.contains(where: { ($0.total ?? 0) > 0 }) {
+                        SummaryRow(label: "近 7 天", value: spendTotalsText(week))
+                    }
+                }
+                SummaryRow(label: "Token 估算",
+                           value: money(modelCost(snap), snap.symbol ?? "¥"),
+                           help: "按本地单价表算，不含余额差异；和上面的实际消费是两套口径。")
                 SummaryRow(label: "总 Token", value: cn(snap.allTokens ?? 0))
                 SummaryRow(label: "请求", value: countText(snap.allEvents ?? 0))
+            }
+
+            if let spend = snap.spendHistory, spend.configured == true {
+                let recent = Array((spend.days ?? []).filter { day in
+                    (day.amounts ?? [:]).contains { abs($0.value) > 0 }
+                }.suffix(7))
+                if !recent.isEmpty {
+                    NativeSection("每日消费（最近 7 条）") {
+                        ForEach(Array(recent.enumerated()), id: \.offset) { _, day in
+                            SummaryRow(label: shortDate(day.date ?? "—"),
+                                       value: spendDayText(day, snap: snap),
+                                       help: "余额差额，不含充值；看板里有更多天")
+                        }
+                    }
+                }
             }
 
             NativeSection("按模型") {
@@ -1262,6 +1312,30 @@ struct HistorySections: View {
 
     private func modelCost(_ snap: Snapshot) -> Double {
         (snap.models ?? []).reduce(0.0) { $0 + $1.cost }
+    }
+
+    /// 多个币种并排显示：¥12.30 + $4.56
+    private func spendTotalsText(_ totals: [Snapshot.SpendHistory.Total]) -> String {
+        let parts = totals.compactMap { item -> String? in
+            guard let total = item.total else { return nil }
+            return signedMoney(total, item.symbol ?? item.currency ?? "")
+        }
+        return parts.isEmpty ? "—" : parts.joined(separator: " + ")
+    }
+
+    /// 某一天的实付：按币种并排，符号取自总消费里的币种表。
+    private func spendDayText(_ day: Snapshot.SpendHistory.Day, snap: Snapshot) -> String {
+        var symbols: [String: String] = [:]
+        for item in snap.spendHistory?.currencies ?? [] {
+            if let code = item.currency {
+                symbols[code] = item.symbol ?? code
+            }
+        }
+        let parts = (day.amounts ?? [:])
+            .filter { abs($0.value) > 0 }
+            .sorted { $0.key < $1.key }
+            .map { signedMoney($0.value, symbols[$0.key] ?? ($0.key + " ")) }
+        return parts.isEmpty ? "—" : parts.joined(separator: " + ")
     }
 }
 
