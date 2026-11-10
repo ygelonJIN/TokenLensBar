@@ -1937,6 +1937,14 @@ def status_json(db_path, prices=None, now=None, config_path=None):
                          "currencies": [], "week": [], "days": [],
                          "error": str(exc)}
 
+    # 按模型 / 按 Agent 的金额要能显示美元（OpenCode 渠道），和「总金额」对得上。
+    primary_currency = prices.get("currency") or "CNY"
+    try:
+        costs = currency_split(rows, prices,
+                               usd_total=_usd_spend_total(db_path))
+    except Exception:
+        costs = {"models": {}, "agents": {}, "totals": {}}
+
     return {
         "ok": True,
         "symbol": symbol,
@@ -1949,12 +1957,14 @@ def status_json(db_path, prices=None, now=None, config_path=None):
         # 面板「今日」页签用：今天真正用过的模型 / Agent，口径和「全部」一致
         "models_today": [
             {"model": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
+             "costs": cost_rows(costs["models"].get(name, {}), primary_currency),
              "share": round(b["tokens"] / today_total, 4),
              "subscription": name in subscription_models}
             for name, b in sorted(today_models.items(), key=lambda kv: -kv[1]["tokens"])
         ],
         "agents_today": [
             {"agent": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
+             "costs": cost_rows(costs["agents"].get(name, {}), primary_currency),
              "share": round(b["tokens"] / today_total, 4),
              "subscription": agent_is_subscription(name)}
             for name, b in sorted(today_agents.items(), key=lambda kv: -kv[1]["tokens"])
@@ -1962,12 +1972,14 @@ def status_json(db_path, prices=None, now=None, config_path=None):
         "daily": daily_filled(items, 7, now=now),
         "models": [
             {"model": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
+             "costs": cost_rows(costs["models"].get(name, {}), primary_currency),
              "share": round(b["tokens"] / all_total, 4),
              "subscription": name in subscription_models}
             for name, b in sorted(all_models.items(), key=lambda kv: -kv[1]["tokens"])
         ],
         "agents": [
             {"agent": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
+             "costs": cost_rows(costs["agents"].get(name, {}), primary_currency),
              "share": round(b["tokens"] / all_total, 4),
              "subscription": agent_is_subscription(name)}
             for name, b in sorted(all_agents.items(), key=lambda kv: -kv[1]["tokens"])
@@ -4042,6 +4054,89 @@ def _currency_symbol(currency):
     return {"CNY": "¥", "USD": "$"}.get(code, code + " ")
 
 
+def _event_currency(provider, primary="CNY"):
+    """这条事件的钱从哪个币种的账上出。
+
+    OpenCode 的订阅用量按美元记（官方按天用量就是美元），其余走余额的平台
+    和主币种一致。只看 provider 字段，不看模型，因为同一个模型可以两边都跑。
+    """
+    if (provider or "").lower().startswith("opencode"):
+        return "USD"
+    return (primary or "CNY").upper()
+
+
+def _usd_spend_total(db_path, since=0.0, now=None):
+    """usage_days 里 USD 的累计（官方口径），给「按模型 / 按 Agent」分摊用。"""
+    if not db_path.exists():
+        return 0.0
+    start_day = _local_day(since) if since else ""
+    con = connect(db_path)
+    try:
+        if start_day:
+            row = con.execute(
+                "select coalesce(sum(amount), 0) from usage_days"
+                " where upper(currency)=? and day>=?", ("USD", start_day)).fetchone()
+        else:
+            row = con.execute(
+                "select coalesce(sum(amount), 0) from usage_days"
+                " where upper(currency)=?", ("USD",)).fetchone()
+    finally:
+        con.close()
+    return float(row[0] or 0.0)
+
+
+def currency_split(rows, prices, usd_total=0.0, since=0.0):
+    """把「按模型 / 按 Agent」的金额拆成 {模型/Agent: {币种: 金额}}。
+
+    人民币那边是本地单价表算出来的；OpenCode 那边官方只有整段美元总额，
+    没有逐请求美元价，所以按该渠道内**人民币估算金额**的占比分摊官方美元，
+    分摊后这些条目加起来正好等于 usage_days 的美元数。
+    """
+    primary = (prices.get("currency") or "CNY").upper()
+    usd_weight = 0.0
+    per_model, per_agent = {}, {}
+    staged = []
+    for row in rows:
+        if row[0] < since:
+            continue
+        cost, _, stored = row_cost(row, prices)
+        model = model_label(row[3], row[0], prices)
+        agent = agent_label(row[1])
+        currency = _event_currency(row[2], primary)
+        staged.append((model, agent, currency, cost))
+        if currency == "USD":
+            usd_weight += cost
+
+    per_pair = {}
+    split = {"models": {}, "agents": {}, "pairs": {},
+             "totals": {primary: 0.0, "USD": 0.0}}
+    for model, agent, currency, cost in staged:
+        if currency == "USD":
+            amount = usd_total * (cost / usd_weight) if (usd_weight > 0 and usd_total > 0) else 0.0
+        else:
+            amount = cost
+        for target, name in ((per_model, model), (per_agent, agent),
+                             (per_pair, (agent, model))):
+            bucket = target.setdefault(name, {})
+            bucket[currency] = bucket.get(currency, 0.0) + amount
+        split["totals"][currency] = split["totals"].get(currency, 0.0) + amount
+    split["models"], split["agents"], split["pairs"] = per_model, per_agent, per_pair
+    return split
+
+
+def cost_rows(amounts, primary="CNY"):
+    """{币种: 金额} → 面板要的并排列表（主币种在前，美元在后）。"""
+    primary = (primary or "CNY").upper()
+    return [
+        {"currency": currency, "symbol": _currency_symbol(currency),
+         "amount": round(amount, 6)}
+        for currency, amount in sorted(
+            amounts.items(),
+            key=lambda kv: (kv[0] != primary, kv[0]))
+        if abs(amount) > 1e-9
+    ]
+
+
 def add_manual_entry(amount=None, tokens=None, agent=None, model=None,
                      day=None, db_path=None, now=None):
     """补记一条手动消费/Token。金额和 Token 至少填一个。"""
@@ -5030,6 +5125,18 @@ def api_payload(db_path, days, now=None, prices=None):
             peak_cost += cost
 
     models = []
+    primary = prices.get("currency") or "CNY"
+    try:
+        costs = currency_split(rows, prices,
+                               usd_total=_usd_spend_total(db_path, since),
+                               since=since)
+    except Exception:
+        costs = {"models": {}, "agents": {}, "pairs": {}, "totals": {}}
+    matrix = breakdown(rows, prices, since)
+    for cell in matrix:
+        cell["costs"] = cost_rows(
+            (costs.get("pairs") or {}).get((cell["agent"], cell["model"]), {}),
+            primary)
     for model, bucket in sorted(agg["by_model"].items(), key=lambda kv: -kv[1]["total"]):
         models.append({
             "model": model,
@@ -5039,6 +5146,7 @@ def api_payload(db_path, days, now=None, prices=None):
             "cache_read": bucket["cache_read"],
             "events": bucket["count"],
             "cost": round(bucket["cost"], 6),
+            "costs": cost_rows(costs["models"].get(model, {}), primary),
             "agents": sorted(seen.get(model, {}).get("agents", [])),
         })
 
@@ -5067,10 +5175,12 @@ def api_payload(db_path, days, now=None, prices=None):
         },
         "models": models,
         "agents": [
-            {"agent": name, **{k: (round(v, 6) if k == "cost" else v) for k, v in bucket.items()}}
+            {"agent": name,
+             **{k: (round(v, 6) if k == "cost" else v) for k, v in bucket.items()},
+             "costs": cost_rows(costs["agents"].get(name, {}), primary)}
             for name, bucket in sorted(agg["by_agent"].items(), key=lambda kv: -kv[1]["total"])
         ],
-        "matrix": breakdown(rows, prices, since),
+        "matrix": matrix,
         "outside": outside_cells(db_path, breakdown(rows, prices, since), prices),
         "daily": daily_series(rows, since, prices, now),
         "heatmap": heatmap_series(rows, since, prices),

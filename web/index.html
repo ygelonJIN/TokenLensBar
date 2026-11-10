@@ -198,6 +198,12 @@ const cash = (n, s) => {
   if (n < 0.01) return s + n.toFixed(4);
   return s + n.toFixed(2);
 };
+// 按币种并排：¥293.90 + $32.64；没有分币种数据就退回单一估算值
+const cashList = (costs, fallback, fallbackSymbol) => {
+  const rows = (costs || []).filter(c => Math.abs(Number(c.amount) || 0) > 0);
+  if (!rows.length) return cash(Number(fallback) || 0, fallbackSymbol);
+  return rows.map(c => cash(Number(c.amount) || 0, c.symbol || c.currency || '')).join(' + ');
+};
 
 let symbol = '$';
 let spendByDay = {};
@@ -391,7 +397,7 @@ function render(d) {
       <td class="col-out">${fmt(m.output)}</td>
       <td class="col-cache">${fmt(m.cache_read)}</td>
       <td class="col-count">${m.events.toLocaleString()}</td>
-      <td class="cost">${cash(m.cost, symbol)}<span class="pct">${costPct(m.cost).toFixed(1)}%</span></td>
+      <td class="cost">${cashList(m.costs, m.cost, symbol)}<span class="pct">${costPct(m.cost).toFixed(1)}%</span></td>
       <td class="unit col-unit">${unitPrice(m.cost, m.tokens)}</td>
       <td class="col-share"><div class="share"><div class="track"><div class="fill" style="width:${(m.tokens / grand * 100).toFixed(1)}%"></div></div><span>${(m.tokens / grand * 100).toFixed(1)}%</span></div></td>
     </tr>`).join('');
@@ -415,7 +421,7 @@ function render(d) {
       <td class="col-in">${fmt(a.input)}</td>
       <td class="col-out">${fmt(a.output)}</td>
       <td>${a.count.toLocaleString()}</td>
-      <td class="cost">${cash(a.cost, symbol)}<span class="pct">${costPct(a.cost).toFixed(1)}%</span></td>
+      <td class="cost">${cashList(a.costs, a.cost, symbol)}<span class="pct">${costPct(a.cost).toFixed(1)}%</span></td>
       <td class="unit col-unit">${unitPrice(a.cost, a.total)}</td>
     </tr>`).join('');
 
@@ -439,7 +445,7 @@ function render(d) {
       <td class="col-in">${fmt(m.input)}</td>
       <td class="col-out">${fmt(m.output)}</td>
       <td class="col-count-m">${m.count.toLocaleString()}</td>
-      <td class="cost">${cash(m.cost, symbol)}<span class="pct">${costPct(m.cost).toFixed(1)}%</span></td>
+      <td class="cost">${cashList(m.costs, m.cost, symbol)}<span class="pct">${costPct(m.cost).toFixed(1)}%</span></td>
       <td class="unit col-unit">${unitPrice(m.cost, m.total)}</td>
     </tr>`).join('');
 

@@ -32,11 +32,18 @@ struct Snapshot: Decodable {
         let tokens: Double
         let cost: Double?
     }
+    /// 一笔钱挂在哪个币种的账上（模型 / Agent 行可能同时有人民币和美元）。
+    struct Money: Decodable {
+        let currency: String?
+        let symbol: String?
+        let amount: Double?
+    }
     struct Slice: Decodable {
         let model: String?
         let agent: String?
         let tokens: Double
         let cost: Double
+        let costs: [Money]?
         let share: Double
         let subscription: Bool?
     }
@@ -335,12 +342,6 @@ func logLine(_ message: String) {
     } else {
         FileManager.default.createFile(atPath: path, contents: data)
     }
-}
-
-func shortDate(_ text: String) -> String {
-    let parts = text.split(separator: "-")
-    guard parts.count == 3 else { return text }
-    return "\(parts[1])-\(parts[2])"
 }
 
 func balanceText(_ value: Double, currency: String) -> String {
@@ -1271,38 +1272,15 @@ struct HistorySections: View {
     var body: some View {
         if let snap = model.snapshot, snap.ok {
             NativeSection("全部历史") {
-                // 真正花掉的钱放第一行：按余额差分算，USD / CNY 分币种并排。
-                // 下面的「Token 估算」是本地单价表算出来的另一套口径，两者不能相加。
+                // 只显示一个金额：余额差分 + 早期按估算补记，美元单独记、不换汇。
                 if let spend = snap.spendHistory, spend.configured == true,
                    let totals = spend.currencies, !totals.isEmpty {
-                    SummaryRow(label: "实际消费",
+                    SummaryRow(label: "总金额",
                                value: spendTotalsText(totals),
-                               help: "OpenCode 取官方按天用量；其余平台按余额下降累加，充值不计。下面是 Token 估算，两套口径不可相加。")
-                    if let week = spend.week,
-                       week.contains(where: { ($0.total ?? 0) > 0 }) {
-                        SummaryRow(label: "近 7 天", value: spendTotalsText(week))
-                    }
+                               help: "余额下降累加，充值不计；2026-10-25 之前没有余额样本，按当日 Token 估算逐日补记。OpenCode 取官方按天用量，美元单独记、不换汇。")
                 }
-                SummaryRow(label: "Token 估算",
-                           value: money(modelCost(snap), snap.symbol ?? "¥"),
-                           help: "按本地单价表算，不含余额差异；和上面的实际消费是两套口径。")
                 SummaryRow(label: "总 Token", value: cn(snap.allTokens ?? 0))
                 SummaryRow(label: "请求", value: countText(snap.allEvents ?? 0))
-            }
-
-            if let spend = snap.spendHistory, spend.configured == true {
-                let recent = Array((spend.days ?? []).filter { day in
-                    (day.amounts ?? [:]).contains { abs($0.value) > 0 }
-                }.suffix(7))
-                if !recent.isEmpty {
-                    NativeSection("每日消费（最近 7 条）") {
-                        ForEach(Array(recent.enumerated()), id: \.offset) { _, day in
-                            SummaryRow(label: shortDate(day.date ?? "—"),
-                                       value: spendDayText(day, snap: snap),
-                                       help: "余额差额，不含充值；看板里有更多天")
-                        }
-                    }
-                }
             }
 
             NativeSection("按模型") {
@@ -1317,31 +1295,12 @@ struct HistorySections: View {
         }
     }
 
-    private func modelCost(_ snap: Snapshot) -> Double {
-        (snap.models ?? []).reduce(0.0) { $0 + $1.cost }
-    }
-
     /// 多个币种并排显示：¥12.30 + $4.56
     private func spendTotalsText(_ totals: [Snapshot.SpendHistory.Total]) -> String {
         let parts = totals.compactMap { item -> String? in
             guard let total = item.total else { return nil }
             return signedMoney(total, item.symbol ?? item.currency ?? "")
         }
-        return parts.isEmpty ? "—" : parts.joined(separator: " + ")
-    }
-
-    /// 某一天的实付：按币种并排，符号取自总消费里的币种表。
-    private func spendDayText(_ day: Snapshot.SpendHistory.Day, snap: Snapshot) -> String {
-        var symbols: [String: String] = [:]
-        for item in snap.spendHistory?.currencies ?? [] {
-            if let code = item.currency {
-                symbols[code] = item.symbol ?? code
-            }
-        }
-        let parts = (day.amounts ?? [:])
-            .filter { abs($0.value) > 0 }
-            .sorted { $0.key < $1.key }
-            .map { signedMoney($0.value, symbols[$0.key] ?? ($0.key + " ")) }
         return parts.isEmpty ? "—" : parts.joined(separator: " + ")
     }
 }
@@ -1425,8 +1384,7 @@ struct SliceRow: View {
                 Text(agent ? (slice.agent ?? "?") : (slice.model ?? "?"))
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                Text(costText(slice.cost, tokens: slice.tokens, symbol,
-                              subscription: slice.subscription ?? false))
+                Text(moneyText)
                     .monospacedDigit()
                 Text(cn(slice.tokens))
                     .monospacedDigit()
@@ -1439,11 +1397,21 @@ struct SliceRow: View {
         }
     }
 
+    /// 金额按币种并排：¥293.90 + $32.64；没有分币种数据就退回单一估算值。
+    private var moneyText: String {
+        if slice.subscription == true { return "订阅" }
+        let rows = (slice.costs ?? []).filter { ($0.amount ?? 0) > 0 }
+        if !rows.isEmpty {
+            return rows
+                .map { money($0.amount ?? 0, $0.symbol ?? ($0.currency ?? "")) }
+                .joined(separator: " + ")
+        }
+        return costText(slice.cost, tokens: slice.tokens, symbol, subscription: false)
+    }
+
     private var copyText: String {
         let name = agent ? (slice.agent ?? "?") : (slice.model ?? "?")
-        let price = costText(slice.cost, tokens: slice.tokens, symbol,
-                             subscription: slice.subscription ?? false)
-        return "\(name) · \(cn(slice.tokens)) tokens · \(price)"
+        return "\(name) · \(cn(slice.tokens)) tokens · \(moneyText)"
     }
 }
 
