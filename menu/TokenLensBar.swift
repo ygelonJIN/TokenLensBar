@@ -1113,9 +1113,16 @@ struct OverviewSections: View {
                             SummaryRow(label: provider.name ?? provider.id ?? "余额",
                                        value: providerBalanceTextMarked(provider),
                                        help: provider.detail ?? provider.error)
-                            if let hint = provider.hint {
-                                BalanceWarningRow(text: hint)
-                            }
+                        }
+                        // 过时、取不到这类提示不贴在每一行上：整段只在最后占一行，
+                        // 点开才逐条展开，平时不挤占余额本体的视线。
+                        let hints = providers.compactMap { provider -> BalanceHint? in
+                            guard let text = provider.hint else { return nil }
+                            return BalanceHint(name: provider.name ?? provider.id ?? "余额",
+                                               text: text)
+                        }
+                        if !hints.isEmpty {
+                            BalanceHintsRow(hints: hints)
                         }
                     }
                 }
@@ -1330,25 +1337,80 @@ struct SummaryRow: View {
     }
 }
 
-/// 余额过时/取不到的橙色提示行。
-struct BalanceWarningRow: View {
+/// 一条余额提示：哪个平台、什么情况。
+struct BalanceHint: Identifiable {
+    let name: String
     let text: String
+    var id: String { name + "\u{1}" + text }
+}
+
+/// 余额提示的收口：平时只占一行，点开才逐条展开。
+///
+/// 「已 21 小时没更新」这类话每次都在，条数又多，逐行贴着会把余额本体挤下去；
+/// 收成一行留给需要时查看。
+struct BalanceHintsRow: View {
+    let hints: [BalanceHint]
+
+    @State private var expanded = false
 
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.caption2)
-                .foregroundStyle(.orange)
-            Text(text)
-                .font(.caption2)
-                .foregroundStyle(.orange)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
+        VStack(spacing: 0) {
+            HStack(spacing: 5) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                Text(summary)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 6)
+                Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 2)
+            .padding(.bottom, 3)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.12)) { expanded.toggle() }
+            }
+            .copyable(allText, help: allText + "\n\n点击展开 / 收起，右键或长按可复制全部")
+
+            if expanded {
+                VStack(spacing: 0) {
+                    ForEach(hints) { hint in
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(hint.name)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Text(hint.text)
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .multilineTextAlignment(.leading)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 3)
+                        .copyable("\(hint.name): \(hint.text)",
+                                  help: "\(hint.name): \(hint.text)\n\n点击复制")
+                    }
+                }
+            }
+
+            Divider()
+                .padding(.leading, 12)
         }
-        .padding(.horizontal, 12)
-        .padding(.bottom, 3)
-        .copyable(text, help: text + "\n\n点击复制")
+    }
+
+    /// 收起时只要两个字：内容点开看，展开了就在下面，不必在收起态挤。
+    private var summary: String { "提示" }
+
+    private var allText: String {
+        hints.map { "\($0.name): \($0.text)" }.joined(separator: "\n")
     }
 }
 
