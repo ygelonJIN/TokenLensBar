@@ -2413,6 +2413,14 @@ OPENCODE_STATUS_URL = OPENCODE_BASE + "/console/api/go/status"
 OPENCODE_USAGE_URL = OPENCODE_BASE + "/zen/go/v1/usage"
 OPENCODE_CONSOLE_USAGE_URL = OPENCODE_BASE + "/console/api/usage/summary"
 DSH_CREDENTIALS = "~/.dsh/.credentials.yaml"
+# 控制台接口的 403 不是「Key 无效」：Key 能推理、只是权限没给到读用量。
+# 文档：Permissions 分 All / Restricted / Read only，Restricted 里 Usage 才有 Read，
+# 超出权限的请求一律 403；老 key 是「Inference only」时代建的，只有 Models: Request。
+OPENCODE_CONSOLE_403 = (
+    "OpenCode Key 没有控制台读权限（key 可能只勾了 Models: Request）"
+    "：控制台 Account › Personal API keys 里给这个 key 加 Usage 读权限，"
+    "或换一个有权限的 key")
+
 OPENCODE_GO_LIMITS = {"rolling": 12.0, "weekly": 30.0, "monthly": 60.0}
 OPENCODE_BALANCE_UNIT = 1e8
 OPENCODE_USER_AGENT = (
@@ -2515,7 +2523,7 @@ def fetch_opencode_usage_day(entry, key, day, timeout=8.0, cookie=""):
         raise BalanceAuthError("没有 OpenCode Key")
     url = "%s?from=%s&to=%s" % (OPENCODE_CONSOLE_USAGE_URL, day, day)
     body = _http_get(url, headers, timeout=timeout,
-                     auth_error="OpenCode Key 无效或没有权限")
+                     auth_error=OPENCODE_CONSOLE_403)
     data = json.loads(body)
     cost = _to_float(data.get("totalCostMicroCents")) or 0.0
     return {
@@ -2603,7 +2611,7 @@ def fetch_opencode_balance_by_key(entry, key, timeout=8.0):
     if org_id:
         headers["x-org-id"] = org_id
     body = _http_get(OPENCODE_STATUS_URL, headers, timeout=timeout,
-                     auth_error="OpenCode Key 无效或没有权限")
+                     auth_error=OPENCODE_CONSOLE_403)
     payload = {"go_status": 200, "go_text": body, "go_json": None,
                "bill": "", "text": ""}
     if body.lstrip().startswith("{"):
@@ -3797,15 +3805,25 @@ CHROME_SAFE_STORAGE_SERVICES = (
 )
 
 
-def _chrome_profile_dirs(roots=None):
-    """Chrome 的用户资料目录（Default / Profile 1 / …）。"""
+def _chrome_profile_dirs(roots=None, problems=None):
+    """Chrome 的用户资料目录（Default / Profile 1 / …）。
+
+    `problems` 收到被系统挡住的根目录，好把「没权限」和「没这个目录」分开报——
+    混成一句话时，用户会去反复确认 Chrome 有没有登录，其实只是少了权限。
+    """
     out = []
     for raw in (roots or CHROME_PROFILE_ROOTS):
         root = Path(raw).expanduser()
-        if not root.is_dir():
-            continue
+        # 不先 exists() 判断：权限不够时 stat 本身就可能失败，那样会被当成
+        # 「目录不存在」咽掉，正好丢掉要报的那种情况。直接进目录读，按错分。
         try:
             entries = sorted(root.iterdir())
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            if problems is not None:
+                problems.append(str(root))
+            continue
         except OSError:
             continue
         for entry in entries:
@@ -3913,12 +3931,17 @@ def _chrome_cookie_rows(path):
 
 def read_chrome_opencode_cookie(paths=None):
     """从 Chrome 的 Cookie 库里取 opencode.ai 的 auth 会话。值只出现在返回值里。"""
-    candidates = list(paths) if paths else _chrome_profile_dirs()
+    blocked = []
+    candidates = list(paths) if paths else _chrome_profile_dirs(problems=blocked)
     if not candidates:
+        if blocked:
+            raise CookieError(
+                "没有权限读 Chrome 的 Cookie 库（%s）：系统设置 → 隐私与安全性 → "
+                "完全磁盘访问权限，把 %s 加进去后重试"
+                % ("、".join(blocked), os.path.realpath(sys.executable)))
         raise CookieError(
-            "没找到 Chrome 的 Cookie 库（%s）。Chrome 开着但没登录过，"
-            "或者当前程序没有完全磁盘访问权限"
-            % "、".join(CHROME_PROFILE_ROOTS))
+            "没找到 Chrome 的 Cookie 库（%s）。Chrome 里没登录过 opencode.ai，"
+            "或者这个 Chrome 装在别处" % "、".join(CHROME_PROFILE_ROOTS))
     problems = []
     key = None
     best = None
