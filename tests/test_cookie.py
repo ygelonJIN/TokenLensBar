@@ -600,6 +600,145 @@ def main():
             tl.fetch_mimo_balance_via_safari = real_browser
             tl.fetch_mimo_balance = real_cookie
 
+        # ------------------------------------------------------------------
+        # Chrome 的 Cookie：第二份登录态在 Chrome 里，值是加密的（v10）
+        # ------------------------------------------------------------------
+        def chrome_fixture(directory, password, cookies):
+            """造一个 Chrome 风格的库：encrypted_value = "v10" + AES-128-CBC。"""
+            key = tl.hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"),
+                                         b"saltysalt", 1003, 16)
+            db = directory / "Cookies"
+            con = sqlite3.connect(str(db))
+            con.execute("create table cookies (host_key text, name text,"
+                        " value text, encrypted_value blob, creation_utc integer)")
+            for host, name, value in cookies:
+                raw = value.encode("utf-8")
+                # -nopad 要自己补齐到 16 字节；PKCS7 的补位解出来正好被去掉
+                pad = 16 - len(raw) % 16
+                raw = raw + bytes([pad]) * pad
+                proc = tl.subprocess.run(
+                    ["/usr/bin/openssl", "enc", "-aes-128-cbc", "-e", "-nopad",
+                     "-K", key.hex(), "-iv", (b" " * 16).hex()],
+                    input=raw, capture_output=True, check=True)
+                con.execute("insert into cookies values (?,?,?,?,?)",
+                            (host, name, "", b"v10" + proc.stdout, 1))
+            con.commit()
+            con.close()
+            return db
+
+        real_password = tl._chrome_safe_storage_password
+        try:
+            chrome_dir = tmp / "chrome"
+            chrome_dir.mkdir()
+            db = chrome_fixture(chrome_dir, "the-safe-storage-secret",
+                                [(".opencode.ai", "auth", "sess_chrome_abc"),
+                                 (".example.com", "auth", "not-ours")])
+            tl._chrome_safe_storage_password = lambda: "the-safe-storage-secret"
+            passed &= check("Chrome 的 v10 Cookie 能解出来",
+                            tl.read_chrome_opencode_cookie([db]),
+                            "auth=sess_chrome_abc")
+
+            # Keychain 口令不对时要报错，不能把乱码当 Cookie 发出去
+            tl._chrome_safe_storage_password = lambda: "wrong-secret"
+            try:
+                tl.read_chrome_opencode_cookie([db])
+                message = ""
+            except tl.CookieError as exc:
+                message = str(exc)
+            passed &= check("口令不对时报错而不是返回乱码",
+                            "没找到 opencode.ai 的登录会话" in message, True)
+
+            # 没有 opencode 的 Cookie 时不返回别的域
+            tl._chrome_safe_storage_password = lambda: "the-safe-storage-secret"
+            other = chrome_fixture(tmp / "chrome2"
+                                   if (tmp / "chrome2").mkdir() is None else None,
+                                   "the-safe-storage-secret",
+                                   [(".example.com", "auth", "not-ours")])
+            try:
+                tl.read_chrome_opencode_cookie([other])
+                message = ""
+            except tl.CookieError as exc:
+                message = str(exc)
+            passed &= check("Chrome 里没有 opencode 会话时报错",
+                            "没找到 opencode.ai 的登录会话" in message, True)
+
+            # v20（应用绑定加密）要说清原因，不能当成 v10 硬解
+            v20_dir = tmp / "chrome3"
+            v20_dir.mkdir()
+            v20 = v20_dir / "Cookies"
+            con = sqlite3.connect(str(v20))
+            con.execute("create table cookies (host_key text, name text,"
+                        " value text, encrypted_value blob, creation_utc integer)")
+            con.execute("insert into cookies values (?,?,?,?,?)",
+                        (".opencode.ai", "auth", "", b"v20" + b"x" * 32, 1))
+            con.commit()
+            con.close()
+            try:
+                tl.read_chrome_opencode_cookie([v20])
+                message = ""
+            except tl.CookieError as exc:
+                message = str(exc)
+            passed &= check("v20 明确报不可解", "v20" in message, True)
+
+            # 条目声明的浏览器要决定读哪份库
+            calls = []
+            real_safari = tl.read_safari_opencode_cookie
+            real_chrome = tl.read_chrome_opencode_cookie
+            tl.read_safari_opencode_cookie = lambda: calls.append("safari") or "auth=s"
+            tl.read_chrome_opencode_cookie = lambda: calls.append("chrome") or "auth=c"
+            tl._opencode_cookie_for({"browser": "chrome"})
+            tl._opencode_cookie_for({"browser": "safari"})
+            tl._opencode_cookie_for({})
+            passed &= check("browser=chrome 读 Chrome", calls[:1], ["chrome"])
+            passed &= check("browser=safari 读 Safari", calls[1:2], ["safari"])
+            passed &= check("没写 browser 默认 Safari", calls[2:3], ["safari"])
+
+            # 两个号的取数路径不能串：1036 那号只认 Chrome
+            routes = []
+
+            def fake_key(entry, key):
+                routes.append(("key", entry.get("id")))
+                raise tl.BalanceAuthError("403 Forbidden")
+
+            def fake_via_safari(entry):
+                routes.append(("safari-probe", entry.get("id")))
+                raise tl.BalanceError("no safari")
+
+            def fake_balance(entry, cookie):
+                routes.append(("cookie", entry.get("id"), cookie))
+                return sample_items(1.0)
+
+            saved = (tl.fetch_opencode_balance_by_key,
+                     tl.fetch_opencode_balance_via_safari,
+                     tl.fetch_opencode_balance)
+            tl.fetch_opencode_balance_by_key = fake_key
+            tl.fetch_opencode_balance_via_safari = fake_via_safari
+            tl.fetch_opencode_balance = fake_balance
+            try:
+                tl._fetch_opencode_items({"id": "opencode-go-1036", "type": "opencode",
+                                          "browser": "chrome"}, "")
+            finally:
+                (tl.fetch_opencode_balance_by_key,
+                 tl.fetch_opencode_balance_via_safari,
+                 tl.fetch_opencode_balance) = saved
+            passed &= check("Chrome 那号也走代查（Key 403 之后）",
+                            [step[0] for step in routes],
+                            ["key", "safari-probe", "cookie"])
+            passed &= check("代查只在自己那个浏览器里做",
+                            tl._browser_apps_for({"browser": "chrome"}),
+                            ("Google Chrome",))
+            passed &= check("Safari 那号不碰 Chrome",
+                            tl._browser_apps_for({"browser": "safari"}),
+                            ("Safari",))
+            passed &= check("没写 browser 时只在 Safari 里代查",
+                            tl._browser_apps_for({}), ("Safari",))
+            passed &= check("Chrome 那号用的是 Chrome 的 Cookie",
+                            routes[-1][2], "auth=c")
+            tl.read_safari_opencode_cookie = real_safari
+            tl.read_chrome_opencode_cookie = real_chrome
+        finally:
+            tl._chrome_safe_storage_password = real_password
+
     print()
     print("全部通过" if passed else "有失败项")
     return 0 if passed else 1

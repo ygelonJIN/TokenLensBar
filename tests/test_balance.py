@@ -385,7 +385,7 @@ def main():
         passed &= check("OpenCode 币种", payload["providers"][0]["items"][0]["currency"], "USD")
 
         # 10f. 浏览器代查：不读 Cookie 文件，直接把页面拉回来
-        def fake_browser(js, needle, timeout=15.0):
+        def fake_browser(js, needle, timeout=15.0, apps=None):
             if js is not tl.OPENCODE_SAFARI_JS or needle != "opencode.ai":
                 return "1+1"
             return json.dumps({
@@ -499,7 +499,7 @@ def main():
                                             1700000000 + 5 * 3600), None)
 
         # 10g. 没开标签页：退回 Cookie 路线，报错里两路原因都在
-        def no_tab(js, needle, timeout=15.0):
+        def no_tab(js, needle, timeout=15.0, apps=None):
             return "ERR:NO_TAB"
 
         tl._run_browser_js = no_tab
@@ -521,7 +521,7 @@ def main():
         passed &= check("Cookie 文件失败也报出来", "没有权限" in both_notes, True)
 
         # 10h. 标签页在但没登录：直接说清要登录，别绕 Cookie
-        def logged_out(js, needle, timeout=15.0):
+        def logged_out(js, needle, timeout=15.0, apps=None):
             return "ERR:LOGIN"
 
         tl._run_browser_js = logged_out
@@ -557,6 +557,43 @@ def main():
                                         "model": "deepseek-flash"},
                                        {"id": "opencode-go", "type": "opencode",
                                         "name": "OpenCode Go"}), True)
+
+        # 10f. 同一个平台开两个号：点名 DSH 凭证的条目不能借用全局那份 Key
+        creds = tmp / "credentials.yaml"
+        creds.write_text(
+            "refs:\n"
+            "  OPENCODE_GO_API_KEY: sk-first-account\n"
+            "  OPENCODE_GO_1036_API_KEY: sk-second-account\n",
+            encoding="utf-8")
+        saved_creds = tl.DSH_CREDENTIALS
+        saved_env = os.environ.pop("OPENCODE_GO_API_KEY", None)
+        tl.DSH_CREDENTIALS = str(creds)
+        try:
+            second = {"id": "opencode-go-1036", "type": "opencode",
+                      "credential": "OPENCODE_GO_1036_API_KEY"}
+            first = {"id": "opencode-go", "type": "opencode",
+                     "secret": "opencode_key"}
+            broken = {"id": "opencode-go-x", "type": "opencode",
+                      "credential": "NOT_EXIST_REF"}
+            passed &= check("点名凭证的号取自己那份 Key",
+                            tl.opencode_api_key(second, ""), "sk-second-account")
+            passed &= check("没点名的号仍走全局那份",
+                            tl.opencode_api_key(first, ""), "sk-first-account")
+            passed &= check("点名取不到时不借用全局那份",
+                            tl.opencode_api_key(broken, ""), "")
+            passed &= check("_provider_key 也认点名凭证",
+                            tl._provider_key({}, second), "sk-second-account")
+            passed &= check("_provider_key 取不到时不借用别的号的 Key",
+                            tl._provider_key({"opencode_key": "sk-leak"}, broken), "")
+            passed &= check("配置读进来保留 credential 字段",
+                            tl.load_balances_config(write_json(
+                                tmp / "balances-cred.json",
+                                {"providers": [dict(second, enabled=True)]})
+                            )["providers"][0]["credential"], "OPENCODE_GO_1036_API_KEY")
+        finally:
+            tl.DSH_CREDENTIALS = saved_creds
+            if saved_env is not None:
+                os.environ["OPENCODE_GO_API_KEY"] = saved_env
 
         # 8. 401 不泄露 Key
         def fake_401(request, timeout=0):

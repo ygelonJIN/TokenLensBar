@@ -31,6 +31,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -1938,12 +1939,21 @@ def status_json(db_path, prices=None, now=None, config_path=None):
                          "error": str(exc)}
 
     # 按模型 / 按 Agent 的金额要能显示美元（OpenCode 渠道），和「总金额」对得上。
+    # 全量一套给「历史」页签，今日一套给「概览」页签：切片的 Token 是分窗口的，
+    # 金额也必须跟着同一个窗口截断，否则今日那一行会挂上历史累计的金额。
     primary_currency = prices.get("currency") or "CNY"
     try:
         costs = currency_split(rows, prices,
-                               usd_total=_usd_spend_total(db_path))
+                               usd_total=_usd_spend_total(db_path),
+                               usd_by_provider=_usd_spend_by_provider(db_path))
+        today_costs = currency_split(
+            rows, prices,
+            usd_total=_usd_spend_total(db_path, since=today_start),
+            since=today_start,
+            usd_by_provider=_usd_spend_by_provider(db_path, since=today_start))
     except Exception:
         costs = {"models": {}, "agents": {}, "totals": {}}
+        today_costs = {"models": {}, "agents": {}, "totals": {}}
 
     return {
         "ok": True,
@@ -1957,14 +1967,14 @@ def status_json(db_path, prices=None, now=None, config_path=None):
         # 面板「今日」页签用：今天真正用过的模型 / Agent，口径和「全部」一致
         "models_today": [
             {"model": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
-             "costs": cost_rows(costs["models"].get(name, {}), primary_currency),
+             "costs": cost_rows(today_costs["models"].get(name, {}), primary_currency),
              "share": round(b["tokens"] / today_total, 4),
              "subscription": name in subscription_models}
             for name, b in sorted(today_models.items(), key=lambda kv: -kv[1]["tokens"])
         ],
         "agents_today": [
             {"agent": name, "tokens": b["tokens"], "cost": round(b["cost"], 6),
-             "costs": cost_rows(costs["agents"].get(name, {}), primary_currency),
+             "costs": cost_rows(today_costs["agents"].get(name, {}), primary_currency),
              "share": round(b["tokens"] / today_total, 4),
              "subscription": agent_is_subscription(name)}
             for name, b in sorted(today_agents.items(), key=lambda kv: -kv[1]["tokens"])
@@ -2078,6 +2088,13 @@ def load_balances_config(path=None):
             "name": str(entry.get("name") or default_names.get(ptype, pid)),
             "url": str(entry.get("url") or "").strip(),
             "secret": str(entry.get("secret") or "").strip(),
+            # 点名一个 DSH 凭证引用（~/.dsh/.credentials.yaml 里的键名）。
+            # 同一个平台开多个号时用它：secrets.json 不用重复存 Key，也不会
+            # 掉进「全局 OPENCODE_GO_API_KEY」那个兜底，把两个号混成一个。
+            "credential": str(entry.get("credential") or "").strip(),
+            # 这个号的登录态在哪个浏览器里：safari（默认）/ chrome。
+            # 两个号分在两个浏览器时靠它区分，不然会一起读 Safari 那份。
+            "browser": str(entry.get("browser") or "safari").strip().lower(),
             "enabled": entry.get("enabled", True) is not False,
             "auto_cookie": entry.get("auto_cookie", True) is not False,
             "via_browser": entry.get("via_browser", True) is not False,
@@ -2286,8 +2303,17 @@ MIMO_SAFARI_PROBE = (
 )
 
 
-def _safari_error_hint(err):
+def _safari_error_hint(err, app="Safari"):
     text = str(err or "").strip()
+    if app != "Safari":
+        # Chrome 的开关是「查看 → 开发者 → 允许 Apple 事件中的 JavaScript」，
+        # 报错原文就带着 "execution error" 和 -1743。
+        if ("AppleScript" in text or "Apple 事件" in text
+                or "Apple events" in text or "-1743" in text):
+            return ("%s 没允许 JS 自动化：菜单栏「查看 → 开发者 → "
+                    "允许 Apple 事件中的 JavaScript」，勾上再试" % app)
+        tail = text.splitlines()[-1] if text else ""
+        return "%s 代查失败（%s）" % (app, tail) if tail else "%s 代查失败" % app
     if "Apple 事件" in text or "Apple events" in text or "-1743" in text:
         return ("Safari 拒绝自动化：系统设置 → 隐私与安全性 → 自动化，"
                 "允许本程序控制 Safari")
@@ -2444,35 +2470,123 @@ def dsh_credential(name, path=None):
     return match.group(1) if match else ""
 
 
+def entry_credential(entry):
+    """条目点名的 DSH 凭证（如 OPENCODE_GO_1036_API_KEY），没点名返回空。"""
+    name = str(entry.get("credential") or "").strip()
+    return dsh_credential(name) if name else ""
+
+
 def opencode_api_key(entry, key):
-    """OpenCode 的 API Key 来源：配置/环境 → DSH 凭证库。"""
-    for candidate in (key, os.environ.get("OPENCODE_GO_API_KEY"),
+    """OpenCode 的 API Key 来源：配置里的 key → 条目点名的 DSH 凭证 → 全局兜底。
+
+    条目点名了 credential 就只认它：取不到返回空（界面报错），不再往下兜底到全局
+    的 OPENCODE_GO_API_KEY。否则第二个号会静默借用第一个号的 Key，余额和用量
+    都记成同一个号，而且看不出错。
+    """
+    for candidate in (key, entry_credential(entry)):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+    if str(entry.get("credential") or "").strip():
+        return ""
+    for candidate in (os.environ.get("OPENCODE_GO_API_KEY"),
                       dsh_credential("OPENCODE_GO_API_KEY")):
         if candidate and str(candidate).strip():
             return str(candidate).strip()
     return ""
 
 
-def fetch_opencode_usage_day(entry, key, day, timeout=8.0):
+def fetch_opencode_usage_day(entry, key, day, timeout=8.0, cookie=""):
     """官方按天用量：控制台「Usage」页用的就是这个接口。
 
     `/console/api/usage/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` 回
     totalCostMicroCents（1 美元 = 1e8）。额度 meter 是批量入账的，按天归属
     会错位；这个接口才是按天准确的数额。
+
+    带 `cookie` 时走浏览器会话：有的号 Key 能推理但没有控制台读权限
+    （`/console/api/*` 一律 403），这时只有登录态能读用量。
     """
     api_key = opencode_api_key(entry, key)
-    if not api_key:
+    headers = {"User-Agent": OPENCODE_USER_AGENT}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    elif cookie:
+        headers["Cookie"] = cookie
+    else:
         raise BalanceAuthError("没有 OpenCode Key")
     url = "%s?from=%s&to=%s" % (OPENCODE_CONSOLE_USAGE_URL, day, day)
-    body = _http_get(url, {"Authorization": "Bearer " + api_key,
-                           "User-Agent": OPENCODE_USER_AGENT},
-                     timeout=timeout, auth_error="OpenCode Key 无效或没有权限")
+    body = _http_get(url, headers, timeout=timeout,
+                     auth_error="OpenCode Key 无效或没有权限")
     data = json.loads(body)
     cost = _to_float(data.get("totalCostMicroCents")) or 0.0
     return {
         "amount": round(cost / OPENCODE_MICRO_CENTS, 6),
         "requests": int(_to_float(data.get("totalRequests")) or 0),
     }
+
+
+def _opencode_cookie_for(entry):
+    """按条目声明的浏览器读登录态；读不到返回空串（不抛）。"""
+    try:
+        if str(entry.get("browser") or "safari").lower() == "chrome":
+            return read_chrome_opencode_cookie()
+        return read_safari_opencode_cookie()
+    except CookieError:
+        return ""
+
+
+def _opencode_usage_js(days):
+    """在已登录标签页里一次性把几天的官方用量取回来。
+
+    循环写在 JS 里：一天一次 osascript 要一两秒，补 6 天就卡住采集。
+    """
+    return (
+        "(function(){try{function org(){var o='';try{o=localStorage.getIte"
+        "m('opencode-console.org-id')||'';}catch(e){}var q=String.fromCharC"
+        "ode(34);o=o.split(q).join('').split(' ').join('');if(o.indexOf('or"
+        "g_')<0){var m=(location.href||'').match(/org_[A-Za-z0-9]+/);o=m?m["
+        "0]:'';}return o;}function get(p){var x=new XMLHttpRequest();x.open"
+        "('GET',p,false);x.withCredentials=true;x.setRequestHeader('Accept'"
+        ",'application/json');var o=org();if(o){x.setRequestHeader('x-org-i"
+        "d',o);}x.send();return {s:x.status,t:x.responseText||''};}var days="
+        "%s,out={},i;for(i=0;i<days.length;i++){try{var r=get('/console/api"
+        "/usage/summary?from='+days[i]+'&to='+days[i]);out[days[i]]={s:r.s,t"
+        ":r.t.slice(0,400)};}catch(e){out[days[i]]={s:0,t:''};}}return JSON."
+        "stringify(out);}catch(e){return 'ERR:JS '+String(e);}})()"
+        % ("[" + ",".join("'%s'" % day for day in days) + "]")
+    )
+
+
+def fetch_opencode_usage_days_via_browser(entry, days, timeout=25.0):
+    """浏览器代查官方按天用量：Key 没有控制台读权限时的第二条路。
+
+    返回 {day: {amount, requests}}；只带 200 的那些天。
+    """
+    if not days:
+        return {}
+    apps = _browser_apps_for(entry)
+    text = _run_browser_js(_opencode_usage_js(days), "opencode.ai",
+                           timeout=timeout, apps=apps)
+    if text.startswith("ERR:NO_TAB"):
+        raise BalanceError("浏览器里没有打开 opencode.ai 标签页")
+    if text.startswith("ERR:LOGIN"):
+        raise BalanceAuthError("浏览器里的 opencode.ai 没登录")
+    if text.startswith("ERR:JS"):
+        raise BalanceError(_safari_error_hint(text[6:].strip(), apps[0]))
+    raw = json.loads(text)
+    out = {}
+    for day, item in raw.items():
+        if int(item.get("s") or 0) != 200:
+            continue
+        try:
+            body = json.loads(item.get("t") or "{}")
+        except ValueError:
+            continue
+        cost = _to_float(body.get("totalCostMicroCents")) or 0.0
+        out[day] = {
+            "amount": round(cost / OPENCODE_MICRO_CENTS, 6),
+            "requests": int(_to_float(body.get("totalRequests")) or 0),
+        }
+    return out
 
 
 def fetch_opencode_balance_by_key(entry, key, timeout=8.0):
@@ -2743,12 +2857,15 @@ def _tabs_script(app, needle):
 
 
 def _tab_js_script(app, window_index, tab_index, js):
+    # AppleScript 的字符串里双引号必须转义，否则 osascript 直接报
+    # 「数字不能跟在"之后」这类语法错（真正的错因在 JS 的引号上）。
+    escaped = str(js).replace("\\", "\\\\").replace('"', '\\"')
     if app == "Safari":
         return ('tell application "Safari" to return do JavaScript "%s" '
-                'in tab %d of window %d' % (js, tab_index, window_index))
+                'in tab %d of window %d' % (escaped, tab_index, window_index))
     return ('tell application "Google Chrome" to return execute '
             '(tab %d of window %d) javascript "%s"'
-            % (tab_index, window_index, js))
+            % (tab_index, window_index, escaped))
 
 
 def _osascript(script, timeout):
@@ -2791,16 +2908,20 @@ def browser_tabs(app, needle="opencode.ai", timeout=10.0):
     return tabs
 
 
-def _run_browser_js(js, needle, timeout=15.0):
+def _run_browser_js(js, needle, timeout=15.0, apps=None):
     """在装有目标页面的浏览器标签里跑 JS：Safari 优先，Chrome 兜底。
 
     某个标签页没登录（被跳到 /console/login）不算终点——同一浏览器可能还有
     别的标签页、别的浏览器可能登录着，所以逐个试，全部失败才报错。
+
+    `apps` 把搜索范围限制在某个浏览器：两个号分在两个浏览器时，不限制就会
+    用 Safari 的登录态去回答 Chrome 那个号的问题，数字张冠李戴。
     """
     notes = []
     started = False
     logged_out = False
-    for app, _call in BROWSER_APPS:
+    candidates = tuple(a for a in BROWSER_APPS if apps is None or a[0] in apps)
+    for app, _call in candidates:
         try:
             tabs = browser_tabs(app, needle)
         except BalanceError as exc:
@@ -2823,7 +2944,7 @@ def _run_browser_js(js, needle, timeout=15.0):
                 notes.append("%s：osascript 不可用" % app)
                 continue
             except BalanceError as exc:
-                notes.append("%s：%s" % (app, _safari_error_hint(str(exc))))
+                notes.append("%s：%s" % (app, _safari_error_hint(str(exc), app)))
                 continue
             if text.startswith("ERR:LOGIN"):
                 logged_out = True
@@ -2834,7 +2955,8 @@ def _run_browser_js(js, needle, timeout=15.0):
                 continue
             return text
     if not started:
-        raise BalanceError("Safari / Chrome 都没在运行（代查需要开着控制台标签页）")
+        raise BalanceError("%s 都没在运行（代查需要开着控制台标签页）"
+                           % " / ".join(a[0] for a in candidates))
     if logged_out:
         raise BalanceAuthError(
             "浏览器里的 opencode.ai 没登录（页面被跳到 /console/login）："
@@ -3091,13 +3213,27 @@ def _opencode_payload_from_text(text):
     }
 
 
+def _browser_apps_for(entry):
+    """这个号该在哪个浏览器里代查。
+
+    只认条目声明的那个：两个号分别在 Safari 和 Chrome 时，放开搜就一定会
+    用错账号的登录态，数字看起来正常但是别人的。
+    """
+    browser = str(entry.get("browser") or "safari").lower()
+    app = "Google Chrome" if browser == "chrome" else "Safari"
+    return (app,)
+
+
 def fetch_opencode_balance_via_safari(entry, timeout=20.0):
     """浏览器代查：让已登录的标签页去打控制台自己的 JSON 接口。
 
     这条路不碰 Cookie 文件，也就不需要完全磁盘访问权限——页面自己的登录态
     会带上，我们只拿结果。接口给的 JSON 认不出来时，退回解析页面渲染文字。
     """
-    text = _run_browser_js(OPENCODE_SAFARI_JS, "opencode.ai", timeout=timeout)
+    apps = _browser_apps_for(entry)
+    text = _run_browser_js(OPENCODE_SAFARI_JS, "opencode.ai", timeout=timeout,
+                           apps=apps)
+    label = apps[0]
     if text.startswith("ERR:NO_TAB"):
         raise BalanceError("浏览器里没有打开 opencode.ai 标签页（开着就能代查）")
     if text.startswith("ERR:LOGIN"):
@@ -3105,7 +3241,7 @@ def fetch_opencode_balance_via_safari(entry, timeout=20.0):
             "浏览器里的 opencode.ai 没登录（被跳到 /console/login）："
             "在标签页里登录控制台后点「立即采集」")
     if text.startswith("ERR:JS"):
-        raise BalanceError(_safari_error_hint(text[6:].strip()))
+        raise BalanceError(_safari_error_hint(text[6:].strip(), label))
     payload = _opencode_payload_from_text(text)
     return opencode_items_from_payload(payload, entry)
 
@@ -3171,7 +3307,12 @@ def fetch_opencode_balance(entry, cookie, timeout=8.0):
 
 
 def _fetch_opencode_items(entry, key):
-    """取数顺序：API Key 直连（最稳）→ 浏览器代查 → 磁盘 Cookie → 手填 Cookie。"""
+    """取数顺序：API Key 直连（最稳）→ 浏览器代查 → 磁盘 Cookie → 手填 Cookie。
+
+    `browser` 决定「磁盘 Cookie」读谁的库：safari（默认）或 chrome。
+    两个号分在两个浏览器时，这一步不能串。
+    """
+    browser = str(entry.get("browser") or "safari").lower()
     notes = []
     try:
         return fetch_opencode_balance_by_key(entry, key)
@@ -3180,6 +3321,7 @@ def _fetch_opencode_items(entry, key):
     except BalanceError as exc:
         notes.append(str(exc))
     if entry.get("via_browser", True):
+        # 代查只在自己那个浏览器里做（browser 决定），不放开搜。
         try:
             return fetch_opencode_balance_via_safari(entry)
         except BalanceAuthError as exc:
@@ -3189,7 +3331,8 @@ def _fetch_opencode_items(entry, key):
     cookie = ""
     if entry.get("auto_cookie", True):
         try:
-            cookie = read_safari_opencode_cookie()
+            cookie = (read_chrome_opencode_cookie() if browser == "chrome"
+                      else read_safari_opencode_cookie())
         except CookieError as exc:
             notes.append(str(exc))
     if not cookie and key:
@@ -3197,8 +3340,9 @@ def _fetch_opencode_items(entry, key):
     if not cookie:
         raise BalanceAuthError(
             "没找到 opencode.ai 登录态%s。手动兜底：python3 tokenlensbar.py "
-            "cookie --opencode --from-clipboard"
-            % ("（%s）" % "；".join(notes) if notes else ""))
+            "cookie --opencode%s --from-clipboard"
+            % ("（%s）" % "；".join(notes) if notes else "",
+               " --chrome" if browser == "chrome" else ""))
     try:
         return fetch_opencode_balance(entry, cookie)
     except BalanceAuthError as exc:
@@ -3636,6 +3780,193 @@ def read_safari_mimo_cookie(paths=None):
         "（可能已退出登录，请重新登录控制台）"))
 
 
+# --------------------------------------------------------------------------
+# Chrome 的 Cookie（第二个账号是 Chrome 登录的，Safari 那份是第一个账号的）
+# --------------------------------------------------------------------------
+
+CHROME_PROFILE_ROOTS = (
+    "~/Library/Application Support/Google/Chrome",
+    "~/Library/Application Support/Google/Chrome Beta",
+    "~/Library/Application Support/Chromium",
+)
+# Chrome 在 macOS 用 Keychain 里的这条通用密码加密 Cookie，服务名随发行版不同
+CHROME_SAFE_STORAGE_SERVICES = (
+    ("Chrome Safe Storage", "Chrome"),
+    ("Chromium Safe Storage", "Chromium"),
+    ("Chrome Beta Safe Storage", "Chrome Beta"),
+)
+
+
+def _chrome_profile_dirs(roots=None):
+    """Chrome 的用户资料目录（Default / Profile 1 / …）。"""
+    out = []
+    for raw in (roots or CHROME_PROFILE_ROOTS):
+        root = Path(raw).expanduser()
+        if not root.is_dir():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            # 新版把库放在 <profile>/Network/Cookies，老版在 <profile>/Cookies
+            for rel in ("Network/Cookies", "Cookies"):
+                candidate = entry / rel
+                if candidate.is_file():
+                    out.append(candidate)
+    return out
+
+
+def _chrome_safe_storage_password():
+    """从 Keychain 取 Chrome 的加密口令。取不到只报原因，不打印值。"""
+    for service, account in CHROME_SAFE_STORAGE_SERVICES:
+        try:
+            proc = subprocess.run(
+                ["security", "find-generic-password", "-w",
+                 "-s", service, "-a", account],
+                capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0:
+            password = proc.stdout.decode("utf-8", "replace").rstrip("\n")
+            if password:
+                return password
+    raise CookieError(
+        "读不到 Chrome 的 Keychain 条目（%s）。第一次会弹窗，选「始终允许」；"
+        "没弹窗就是当前程序没有访问权限，用运行它的程序重试一次"
+        % "、".join(service for service, _ in CHROME_SAFE_STORAGE_SERVICES))
+
+
+def _aes128_cbc_decrypt(key, blob):
+    """AES-128-CBC 解密（IV 是 16 个空格，Chrome 的固定写法）。
+
+    标准库没有 AES，走系统自带的 openssl；只做解密，不落盘，密钥只在参数里出现。
+    """
+    if len(blob) % 16:
+        raise CookieError("Chrome Cookie 长度不是 16 的整数倍，版式变了")
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/openssl", "enc", "-aes-128-cbc", "-d", "-nopad",
+             "-K", key.hex(), "-iv", (b" " * 16).hex()],
+            input=blob, capture_output=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CookieError("调用 openssl 解密失败：%s" % exc)
+    if proc.returncode != 0:
+        raise CookieError("Chrome Cookie 解密失败（Keychain 口令可能变了）")
+    plain = proc.stdout
+    if plain and 1 <= plain[-1] <= 16:
+        pad = plain[-1]
+        if plain.endswith(bytes([pad]) * pad):
+            plain = plain[:-pad]
+    return plain
+
+
+def _cookie_plaintext(raw):
+    """解密结果必须像 Cookie 值：可打印 UTF-8，没有控制字符。
+
+    Keychain 口令不对时 AES 照样吐出 16 字节随机数，解成字符串看着"也有内容"；
+    不在这里挡掉，就会把乱码当 auth 发给控制台，报一个和真因无关的错。
+    """
+    if not raw:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not text or any(ch < " " or ch == "\x7f" for ch in text):
+        return None
+    return text
+
+
+def _chrome_cookie_key():
+    """PBKDF2-SHA1(口令, "saltysalt", 1003 轮, 16 字节)。"""
+    password = _chrome_safe_storage_password()
+    return hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"),
+                               b"saltysalt", 1003, 16)
+
+
+def _chrome_cookie_rows(path):
+    """把 Cookie 库拷一份再读：Chrome 开着时库是锁的，直接读会 database is locked。"""
+    path = Path(path).expanduser()
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as handle:
+            tmp = handle.name
+        shutil.copyfile(path, tmp)
+        con = sqlite3.connect("file:%s?mode=ro" % tmp, uri=True)
+        try:
+            rows = con.execute(
+                "select host_key, name, value, encrypted_value,"
+                " creation_utc from cookies").fetchall()
+        finally:
+            con.close()
+        return rows
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def read_chrome_opencode_cookie(paths=None):
+    """从 Chrome 的 Cookie 库里取 opencode.ai 的 auth 会话。值只出现在返回值里。"""
+    candidates = list(paths) if paths else _chrome_profile_dirs()
+    if not candidates:
+        raise CookieError(
+            "没找到 Chrome 的 Cookie 库（%s）。Chrome 开着但没登录过，"
+            "或者当前程序没有完全磁盘访问权限"
+            % "、".join(CHROME_PROFILE_ROOTS))
+    problems = []
+    key = None
+    best = None
+    for path in candidates:
+        try:
+            rows = _chrome_cookie_rows(path)
+        except PermissionError:
+            raise CookieError(
+                "没有权限读 Chrome Cookie：系统设置 → 隐私与安全性 → 完全磁盘访问权限，"
+                "给运行它的程序（终端或 TokenLensBar）授权后重试")
+        except (OSError, sqlite3.Error) as exc:
+            problems.append("%s：%s" % (Path(path).parent.parent.name, exc))
+            continue
+        for host, name, value, encrypted, created in rows:
+            if name not in OPENCODE_COOKIE_NAMES or not _opencode_host_ok(host):
+                continue
+            plain = value or ""
+            if not plain and encrypted:
+                if key is None:
+                    key = _chrome_cookie_key()
+                blob = encrypted
+                if blob[:3] in (b"v10", b"v11"):
+                    blob = blob[3:]
+                elif blob[:3] == b"v20":
+                    raise CookieError(
+                        "这条 Cookie 用了 v20（应用绑定加密），当前版 Chrome 在 macOS 上"
+                        "应该还是 v10；先在 Chrome 里重新登录 opencode.ai 再试")
+                try:
+                    plain = _cookie_plaintext(_aes128_cbc_decrypt(key, blob))
+                except CookieError as exc:
+                    problems.append("%s：%s" % (Path(path).parent.parent.name, exc))
+                    continue
+                if plain is None:
+                    problems.append(
+                        "%s：解出来的不是 Cookie 值（Keychain 口令可能变了）"
+                        % Path(path).parent.parent.name)
+            if not plain:
+                continue
+            stamp = created or 0
+            if best is None or stamp >= best[0]:
+                best = (stamp, "%s=%s" % (name, plain))
+    if best is not None:
+        return best[1]
+    raise CookieError("Chrome 里没找到 opencode.ai 的登录会话%s" % (
+        "（%s）" % "；".join(problems) if problems else
+        "（先在 Chrome 登录 opencode.ai 控制台）"))
+
+
 def _bc_records(data):
     """解析整个二进制 Cookie 库的所有记录。个别怪页/怪记录跳过，取认出记录最多的布局。"""
     best = []
@@ -3717,6 +4048,10 @@ def refresh_mimo_cookie(secrets_path=None, secret_name=None, paths=None):
 
 def _provider_key(secrets, entry):
     key = secrets.get(entry.get("secret") or entry["id"])
+    if not key and str(entry.get("credential") or "").strip():
+        # 点名了 DSH 凭证就只认它：下面的兜底用的都是「这个平台的全局那份」，
+        # 套到第二个号身上就是拿第一个号的 Key。
+        return entry_credential(entry).strip()
     if not key and entry["type"] in ("opencode", "opencode_go"):
         # 一个 provider 可能同时配了 Cookie 和 Key，两个都兜一下
         key = secrets.get(OPENCODE_KEY_SECRET) or secrets.get(OPENCODE_COOKIE_SECRET) or ""
@@ -3750,8 +4085,18 @@ def refresh_usage_days(db_path, config=None, secrets=None, now=None,
                 continue
             key = _provider_key(secrets, entry)
             # Key 可能只在 DSH 凭证库里，交给 opencode_api_key 兜底判断
-            if not opencode_api_key(entry, key):
+            api_key = opencode_api_key(entry, key)
+            cookie = (_opencode_cookie_for(entry)
+                      if entry.get("auto_cookie", True) else "")
+            if not api_key and not cookie:
                 continue
+            # 先按 Key 打，401/403 再换那条浏览器登录态：同一个号有的 Key 能推理
+            # 但读不了控制台，两条路的权限不一样。
+            attempts = []
+            if api_key:
+                attempts.append({"key": api_key, "cookie": ""})
+            if cookie:
+                attempts.append({"key": "", "cookie": cookie})
             known = {row[0]: row[1] for row in con.execute(
                 "select day, fetched_at from usage_days where provider=?",
                 (entry["id"],))}
@@ -3767,14 +4112,9 @@ def refresh_usage_days(db_path, config=None, secrets=None, now=None,
                     missing += 1
                     if missing >= backfill:
                         break
-            for day in wanted:
-                try:
-                    got = (fetcher(entry, day) if fetcher is not None
-                           else fetch_opencode_usage_day(entry, key, day))
-                except Exception:
-                    continue
-                if not got:
-                    continue
+            via_browser = []
+
+            def store(day, got):
                 con.execute(
                     "insert or replace into usage_days"
                     " (provider, day, currency, amount, requests, fetched_at)"
@@ -3782,7 +4122,35 @@ def refresh_usage_days(db_path, config=None, secrets=None, now=None,
                     (entry["id"], day, "USD", float(got.get("amount") or 0),
                      int(got.get("requests") or 0), now))
                 con.commit()
-                saved += 1
+
+            for day in wanted:
+                got = None
+                for attempt in attempts:
+                    try:
+                        got = (fetcher(entry, day) if fetcher is not None
+                               else fetch_opencode_usage_day(
+                                   entry, attempt["key"], day,
+                                   cookie=attempt["cookie"]))
+                    except Exception:
+                        got = None
+                        continue
+                    if got:
+                        break
+                if got:
+                    store(day, got)
+                    saved += 1
+                elif fetcher is None and entry.get("via_browser", True):
+                    # Key 和 Cookie 都不行，攒起来交给浏览器代查一次取回
+                    via_browser.append(day)
+            if via_browser:
+                try:
+                    batch = fetch_opencode_usage_days_via_browser(
+                        entry, via_browser)
+                except Exception:
+                    batch = {}
+                for day, got in batch.items():
+                    store(day, got)
+                    saved += 1
     finally:
         con.close()
     return saved
@@ -3979,7 +4347,12 @@ def _balance_hint(entry, error, age_hours):
     if ptype in ("mimo", "mimo_cookie"):
         tail = "Safari 开 MiMo 控制台页，或粘一次 Cookie（约一天一换）"
     else:
-        tail = "检查 opencode_key，或 Safari 开控制台页"
+        browser = str(entry.get("browser") or "safari").lower()
+        app = "Chrome" if browser == "chrome" else "Safari"
+        if app == "Chrome":
+            tail = ("Chrome 开控制台页，并勾「查看 → 开发者 → 允许 Apple 事件中的 JavaScript」")
+        else:
+            tail = "检查 opencode_key，或 Safari 开控制台页"
     return "%s · %s" % (head, tail)
 
 
@@ -4085,15 +4458,44 @@ def _usd_spend_total(db_path, since=0.0, now=None):
     return float(row[0] or 0.0)
 
 
-def currency_split(rows, prices, usd_total=0.0, since=0.0):
+def _usd_spend_by_provider(db_path, since=0.0):
+    """usage_days 里按 provider 分开的 USD 累计。
+
+    同一平台开两个号时，两个 provider 的官方美元是两笔独立的钱：合成一池再按
+    权重摊，1 号的美元会被摊到 2 号的事件上，而 2 号真正的花费（接口还取不到）
+    又整笔漏掉。所以按 provider 分开摊，各摊各的。
+    """
+    if not db_path.exists():
+        return {}
+    start_day = _local_day(since) if since else ""
+    con = connect(db_path)
+    try:
+        if start_day:
+            rows = con.execute(
+                "select provider, coalesce(sum(amount), 0) from usage_days"
+                " where upper(currency)=? and day>=? group by provider",
+                ("USD", start_day)).fetchall()
+        else:
+            rows = con.execute(
+                "select provider, coalesce(sum(amount), 0) from usage_days"
+                " where upper(currency)=? group by provider", ("USD",)).fetchall()
+    finally:
+        con.close()
+    return {provider: float(amount or 0.0) for provider, amount in rows}
+
+
+def currency_split(rows, prices, usd_total=0.0, since=0.0, usd_by_provider=None):
     """把「按模型 / 按 Agent」的金额拆成 {模型/Agent: {币种: 金额}}。
 
     人民币那边是本地单价表算出来的；OpenCode 那边官方只有整段美元总额，
     没有逐请求美元价，所以按该渠道内**人民币估算金额**的占比分摊官方美元，
     分摊后这些条目加起来正好等于 usage_days 的美元数。
+
+    `usd_by_provider` 给了的话，每个 provider 只摊自己那笔官方美元（多号必备）；
+    不给就退回老行为，所有 OpenCode 事件共用 `usd_total` 一池。
     """
     primary = (prices.get("currency") or "CNY").upper()
-    usd_weight = 0.0
+    usd_weight = {}
     per_model, per_agent = {}, {}
     staged = []
     for row in rows:
@@ -4102,17 +4504,23 @@ def currency_split(rows, prices, usd_total=0.0, since=0.0):
         cost, _, stored = row_cost(row, prices)
         model = model_label(row[3], row[0], prices)
         agent = agent_label(row[1])
-        currency = _event_currency(row[2], primary)
-        staged.append((model, agent, currency, cost))
+        provider = row[2] or ""
+        currency = _event_currency(provider, primary)
+        staged.append((model, agent, currency, cost, provider))
         if currency == "USD":
-            usd_weight += cost
+            usd_weight[provider] = usd_weight.get(provider, 0.0) + cost
 
     per_pair = {}
     split = {"models": {}, "agents": {}, "pairs": {},
              "totals": {primary: 0.0, "USD": 0.0}}
-    for model, agent, currency, cost in staged:
+    for model, agent, currency, cost, provider in staged:
         if currency == "USD":
-            amount = usd_total * (cost / usd_weight) if (usd_weight > 0 and usd_total > 0) else 0.0
+            if usd_by_provider is None:
+                pool, weight = usd_total, sum(usd_weight.values())
+            else:
+                pool = usd_by_provider.get(provider, 0.0)
+                weight = usd_weight.get(provider, 0.0)
+            amount = pool * (cost / weight) if (weight > 0 and pool > 0) else 0.0
         else:
             amount = cost
         for target, name in ((per_model, model), (per_agent, agent),
@@ -4724,17 +5132,26 @@ def cmd_cookie(args):
     return 0
 
 
-def _opencode_cookie_secret_name(config_path=None):
+def _opencode_cookie_secret_name(config_path=None, provider_id=None):
     config = load_balances_config(config_path)
     for entry in config["providers"]:
-        if entry.get("type") in ("opencode", "opencode_go"):
-            return entry.get("secret") or entry["id"], entry
+        if entry.get("type") not in ("opencode", "opencode_go"):
+            continue
+        if provider_id and entry.get("id") != provider_id:
+            continue
+        return entry.get("secret") or entry["id"], entry
     return OPENCODE_COOKIE_SECRET, None
 
 
 def _cookie_opencode(args):
-    """opencode.ai 的 auth Cookie：从 Safari 读，或从剪贴板粘。值不打印。"""
-    secret_name, entry = _opencode_cookie_secret_name()
+    """opencode.ai 的 auth Cookie：从 Safari/Chrome 读，或从剪贴板粘。值不打印。"""
+    provider_id = getattr(args, "id", None)
+    secret_name, entry = _opencode_cookie_secret_name(provider_id=provider_id)
+    # 显式 --chrome 优先，否则跟条目自己声明的浏览器走（体检时要照实报）
+    if getattr(args, "chrome", False):
+        browser = "chrome"
+    else:
+        browser = str((entry or {}).get("browser") or "safari").lower()
     if getattr(args, "probe", False):
         if getattr(args, "json", False):
             try:
@@ -4759,13 +5176,17 @@ def _cookie_opencode(args):
     if getattr(args, "check", False):
         stored, _secret_error = load_secrets()
         lines = ["opencode.ai 登录态体检",
+                 "  provider：%s（浏览器：%s）" % (
+                     (entry or {}).get("id") or "未配置", browser),
                  "  secrets 字段：%s（%s）" % (
                      secret_name, "已配置" if stored.get(secret_name) else "未配置")]
-        try:
-            read_safari_opencode_cookie()
-            lines.append("  Safari 里的 Cookie 库：找到 auth")
-        except CookieError as exc:
-            lines.append("  Safari 里的 Cookie 库：%s" % exc)
+        for name, reader in (("Safari", read_safari_opencode_cookie),
+                             ("Chrome", read_chrome_opencode_cookie)):
+            try:
+                reader()
+                lines.append("  %s 里的 Cookie 库：找到 auth" % name)
+            except CookieError as exc:
+                lines.append("  %s 里的 Cookie 库：%s" % (name, exc))
         try:
             items = fetch_opencode_balance_via_safari(
                 entry or {"type": "opencode", "window": "monthly"})
@@ -4789,6 +5210,8 @@ def _cookie_opencode(args):
         if getattr(args, "from_clipboard", False):
             proc = subprocess.run(["pbpaste"], capture_output=True, check=False)
             header = validate_opencode_cookie(proc.stdout.decode("utf-8", "replace"))
+        elif browser == "chrome":
+            header = read_chrome_opencode_cookie()
         else:
             header = read_safari_opencode_cookie()
     except (CookieError, BalanceError) as exc:
@@ -5129,7 +5552,8 @@ def api_payload(db_path, days, now=None, prices=None):
     try:
         costs = currency_split(rows, prices,
                                usd_total=_usd_spend_total(db_path, since),
-                               since=since)
+                               since=since,
+                               usd_by_provider=_usd_spend_by_provider(db_path, since))
     except Exception:
         costs = {"models": {}, "agents": {}, "pairs": {}, "totals": {}}
     matrix = breakdown(rows, prices, since)
@@ -5314,6 +5738,10 @@ def main(argv=None):
                                help="逐个探测 opencode 控制台路由，回报哪条页面有数据")
     cookie_parser.add_argument("--json", action="store_true",
                                help="配合 --probe：直接打印 go/status 等接口的原始 JSON")
+    cookie_parser.add_argument("--chrome", action="store_true",
+                               help="从 Chrome 读登录态（第二个号分在 Chrome 时用）")
+    cookie_parser.add_argument("--id",
+                               help="配合 --opencode：指定哪个 provider（多号时必填）")
 
     serve_parser = sub.add_parser("serve", help="启动本地看板")
     serve_parser.add_argument("--port", type=int, default=8787)

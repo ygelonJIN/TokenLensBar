@@ -286,6 +286,87 @@ def main():
         passed &= check("没有余额样本也能显示官方用量",
                         usd_bucket["providers"][0]["spent"], 1.23, 1e-9)
 
+        # 8.6 今日切片的金额按今日窗口截断：Token 是今日的，钱也必须是今日的
+        old = datetime(2026, 10, 1, 9, 0).timestamp()
+        db, prices, config = make_fixture(
+            tmp,
+            [("deepseek", "CNY", day_start, 95.0)],
+            [{"ts": day9, "agent": "hermes", "provider": "deepseek"},
+             {"ts": old, "agent": "hermes", "provider": "deepseek"},
+             {"ts": day9, "agent": "dsh", "provider": "opencode-go"}],
+        )
+        con = tl.connect(db)
+        con.execute(
+            "insert or replace into usage_days"
+            " (provider, day, currency, amount, requests, fetched_at)"
+            " values (?,?,?,?,?,?)",
+            ("opencode-go", "2026-10-25", "USD", 1.23, 1, now))
+        con.execute(
+            "insert or replace into usage_days"
+            " (provider, day, currency, amount, requests, fetched_at)"
+            " values (?,?,?,?,?,?)",
+            ("opencode-go", "2026-10-20", "USD", 5.0, 1, now))
+        con.commit()
+        con.close()
+        payload = tl.status_json(db, prices, now=now, config_path=config)
+
+        def amounts(costs):
+            return {item["currency"]: item["amount"] for item in costs or []}
+
+        today_slice = payload["models_today"][0]
+        all_slice = payload["models"][0]
+        passed &= check("今日切片带今日 Token", today_slice["tokens"], 2_000_000)
+        passed &= check("今日切片的 ¥ 只算今天", amounts(today_slice["costs"]).get("CNY"), 1.0)
+        passed &= check("今日切片的 $ 只取今日官方用量",
+                        amounts(today_slice["costs"]).get("USD"), 1.23, 1e-9)
+        passed &= check("历史切片的 ¥ 仍是全量", amounts(all_slice["costs"]).get("CNY"), 2.0)
+        passed &= check("历史切片的 $ 仍是全量",
+                        amounts(all_slice["costs"]).get("USD"), 6.23, 1e-9)
+        today_agent = {item["agent"]: item for item in payload["agents_today"]}
+        passed &= check("今日 Agent 切片同样按今天截断",
+                        amounts(today_agent[tl.agent_label("hermes")]["costs"]).get("CNY"), 1.0)
+
+        # 8.7 同一个平台两个号：各摊各的官方美元，不能合成一池
+        #     1 号官方 $1.00；2 号接口取不到（没有 usage_days）→ 2 号不能凭空多钱，
+        #     1 号的钱也不能被 2 号的事件稀释。用两个 Agent 分开看账：
+        #     hermes 跑在 1 号，dsh 跑在 2 号。
+        db, prices, config = make_fixture(
+            tmp,
+            [("deepseek", "CNY", day_start, 95.0)],
+            [{"ts": day9, "agent": "hermes", "provider": "opencode-go"},
+             {"ts": day9, "agent": "dsh", "provider": "opencode-go-1036"}],
+        )
+        con = tl.connect(db)
+        con.execute(
+            "insert or replace into usage_days"
+            " (provider, day, currency, amount, requests, fetched_at)"
+            " values (?,?,?,?,?,?)",
+            ("opencode-go", "2026-10-25", "USD", 1.0, 1, now))
+        con.commit()
+        con.close()
+        rows2 = tl.fetch_rows(db, 0)[0]
+        by_provider = tl._usd_spend_by_provider(db, since=day_start)
+        passed &= check("按 provider 分开的官方美元",
+                        by_provider.get("opencode-go"), 1.0)
+        passed &= check("取不到的号没有美元", by_provider.get("opencode-go-1036"), None)
+
+        h_agent, d_agent = tl.agent_label("hermes"), tl.agent_label("dsh")
+        split2 = tl.currency_split(rows2, prices, usd_total=1.0,
+                                   usd_by_provider=by_provider)
+        passed &= check("1 号那个 Agent 拿到全部官方美元",
+                        split2["agents"][h_agent]["USD"], 1.0, 1e-9)
+        passed &= check("2 号那个 Agent 分不到 1 号的钱",
+                        split2["agents"].get(d_agent, {}).get("USD", 0.0), 0.0)
+        passed &= check("分池后总额还是 1 号的官方数",
+                        split2["totals"]["USD"], 1.0, 1e-9)
+
+        # 老行为（共用一池）会把 1 号的钱摊一半给 2 号 —— 这就是要避免的
+        pooled = tl.currency_split(rows2, prices, usd_total=1.0)
+        passed &= check("共用一池时 1 号被摊掉一半（反向验证）",
+                        pooled["agents"][h_agent]["USD"], 0.5, 1e-9)
+        passed &= check("共用一池时 2 号凭空拿到一半（反向验证）",
+                        pooled["agents"][d_agent]["USD"], 0.5, 1e-9)
+
         # 9. 命令行补记
         #    必须显式 --date：tl.main 拿不到测试里的假 now，
         #    不传就按真实的今天记账，钉错那天会误判成上一条（Baz）。
